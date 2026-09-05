@@ -186,6 +186,7 @@ class Integration(unittest.TestCase):
         self.assertEqual(db.read_bytes(), before)
 
     def test_collision_bucket_partitioned_by_exact_comparison(self):
+        self.config(queue_capacity=4)
         for name, content in (("a1", b"AAAA"), ("a2", b"AAAA"),
                               ("b1", b"BBBB"), ("b2", b"BBBB"), ("c", b"CCCC")):
             self.file(name, content)
@@ -223,6 +224,22 @@ class Integration(unittest.TestCase):
         self.assertEqual(groups, {frozenset(names)})
         self.assertEqual(stats["cached"], 50)
 
+    def test_parallel_buckets_and_collisions(self):
+        self.config(workers=4, queue_capacity=5)
+        expected = set()
+        for group in range(6):
+            names = {f"g{group}-{member}" for member in range(7)}
+            for name in names:
+                self.file(name, bytes([group]) * (1024 + group % 3))
+            expected.add(frozenset(names))
+        self.assertEqual(self.run_same()[0], expected)
+        with closing(sqlite3.connect(self.root / ".same/state.db")) as db:
+            db.execute("UPDATE files SET digest=?", (b"\x11" * 32,))
+            db.commit()
+        groups, stats = self.run_same()
+        self.assertEqual(groups, expected)
+        self.assertEqual(stats["cached"], 42)
+
     @unittest.skipUnless(os.environ.get("SAME_REQUIRE_CUDA") == "1", "Opt-in real CUDA device regression")
     def test_cuda_end_to_end_across_worker_threads(self):
         self.config(backend="cuda", workers=3, block_bytes=65536,
@@ -230,16 +247,18 @@ class Integration(unittest.TestCase):
         content = (bytes(range(256)) * 4097)[:1048576 + 113]
         self.file("a", content)
         self.file("nested/b", content)
+        self.file("c", content)
+        self.file("d", content)
         self.file("distinct", content[:-1] + bytes([content[-1] ^ 1]))
         groups, stats = self.run_same()
-        self.assertEqual(groups, {frozenset({"a", "nested/b"})})
+        self.assertEqual(groups, {frozenset({"a", "nested/b", "c", "d"})})
         self.assertEqual(stats["gpu_workers"], 3)
         self.assertEqual(stats["cpu_fallbacks"], 0)
-        self.assertEqual(stats["hashed"], 3)
+        self.assertEqual(stats["hashed"], 5)
         groups, stats = self.run_same()
-        self.assertEqual(groups, {frozenset({"a", "nested/b"})})
+        self.assertEqual(groups, {frozenset({"a", "nested/b", "c", "d"})})
         self.assertEqual(stats["hashed"], 0)
-        self.assertEqual(stats["cached"], 3)
+        self.assertEqual(stats["cached"], 5)
         self.assertEqual(stats["gpu_workers"], 3)
         self.assertEqual(stats["cpu_fallbacks"], 0)
 

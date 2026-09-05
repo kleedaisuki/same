@@ -131,28 +131,61 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
     while (!pending.empty()) drain();
     store.end_scan();
 }
-void partition(const fs::path& root, Store& store, Resources& resources) {
-    std::optional<FileRecord> previous;
-    store.reset_matches();
-    store.visit_candidates([&](const FileRecord& record) {
-        if (!previous || previous->stamp.size != record.stamp.size || previous->digest != record.digest)
-            store.clear_representatives();
+class Partition {
+public:
+    Partition(const fs::path& root, Store& store, Resources& resources, std::size_t capacity)
+        : root_(root), store_(store), resources_(resources), capacity_(capacity) {}
+    void accept(const FileRecord& record) {
+        if (!first_ || first_->stamp.size != record.stamp.size || first_->digest != record.digest) {
+            flush();
+            store_.clear_representatives();
+            first_ = record;
+            add_representative(record);
+            return;
+        }
+        pending_.push_back({record, compare(*first_, record)});
+        if (pending_.size() >= capacity_) drain();
+    }
+    void flush() { while (!pending_.empty()) drain(); }
+private:
+    struct Pending { FileRecord record; std::future<bool> equal; };
+    std::future<bool> compare(const FileRecord& a, const FileRecord& b) {
+        return resources_.submit([root = root_, a, b](Worker& worker) {
+            return worker.execute([&] { return equal_files(root, a, b, worker); });
+        });
+    }
+    void add_representative(const FileRecord& record) {
+        store_.add_representative(record);
+        store_.add_match(record.path, record.path);
+    }
+    void drain() {
+        auto pending = std::move(pending_.front());
+        pending_.pop_front();
+        if (pending.equal.get()) { store_.add_match(first_->path, pending.record.path); return; }
+        // Only hash collisions take the ordered secondary-representative path.
+        // Normal buckets compare concurrently against their first member.
+        // 仅哈希碰撞按序检查其他代表；通常的桶并发比较首个成员。
         bool matched = false;
-        store.visit_representatives([&](const FileRecord& representative) {
-            auto result = resources.submit([root, record, representative](Worker& worker) {
-                return worker.execute([&] { return equal_files(root, representative, record, worker); });
-            });
-            if (!result.get()) return true;
-            store.add_match(representative.path, record.path);
+        store_.visit_representatives([&](const FileRecord& representative) {
+            if (representative.path == first_->path || !compare(representative, pending.record).get()) return true;
+            store_.add_match(representative.path, pending.record.path);
             matched = true;
             return false;
         });
-        if (!matched) {
-            store.add_representative(record);
-            store.add_match(record.path, record.path);
-        }
-        previous = record;
-    });
+        if (!matched) add_representative(pending.record);
+    }
+    fs::path root_;
+    Store& store_;
+    Resources& resources_;
+    std::size_t capacity_;
+    std::optional<FileRecord> first_;
+    std::deque<Pending> pending_;
+};
+void partition(const fs::path& root, Store& store, Resources& resources, std::size_t capacity) {
+    store.reset_matches();
+    Partition partitioner(root, store, resources, capacity);
+    store.visit_candidates([&](const FileRecord& record) { partitioner.accept(record); });
+    partitioner.flush();
 }
 }
 int run(const fs::path& root, const Config& config, std::ostream& output, std::ostream& diagnostics) {
@@ -162,7 +195,7 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
     Resources resources(config);
     Counters counters;
     scan(root, config, store, resources, counters);
-    partition(root, store, resources);
+    partition(root, store, resources, config.queue_capacity);
     // Validate every reported member before emitting anything. This detects ordinary
     // concurrent edits, but a live filesystem is not an atomic snapshot.
     // 输出前复核所有成员；这能检测通常的并发修改，但不构成原子文件系统快照。
