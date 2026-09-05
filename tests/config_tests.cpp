@@ -15,6 +15,16 @@ int main() {
     bool rejected = false;
     try { same::Config::load(root); } catch (...) { rejected = true; }
     if (!rejected) throw std::runtime_error("invalid config accepted");
+    for (const auto* invalid : {"workers = 2.0\n", "workers = true\n", "rehash = 1\n", "backend = 1\n", "unknown = 1\n"}) {
+        { std::ofstream file(root / ".same/config.toml"); file << invalid; }
+        rejected = false;
+        try { same::Config::load(root); } catch (...) { rejected = true; }
+        if (!rejected) throw std::runtime_error("wrong config type accepted");
+    }
+    { std::ofstream file(root / ".same/config.toml"); file << '#' << std::string(64 * 1024, 'x'); }
+    rejected = false;
+    try { same::Config::load(root); } catch (...) { rejected = true; }
+    if (!rejected) throw std::runtime_error("oversized config accepted");
     { std::ofstream file(root / ".same/ignore"); file << "# test\n*.tmp\nbuild/\n!build/keep.txt\n/root.txt\na/**/b?.dat\n!.same/state.db\n"; }
     same::Ignore ignore(root);
     if (ignore.can_prune("build")) throw std::runtime_error("negated children pruned");
@@ -23,7 +33,8 @@ int main() {
     check("build", true, true); check("build", false, false); check("build/x.txt", false, true);
     check("build/keep.txt", false, false); check("root.txt", false, true); check("sub/root.txt", false, false);
     check("a/b1.dat", false, true); check("a/x/y/b2.dat", false, true); check("a/x/b22.dat", false, false);
-    check(".same/state.db", false, true); check("normal", false, false);    { std::ofstream file(root / ".same/ignore"); file << "build/\n"; }
+    check(".same/state.db", false, true); check("normal", false, false);
+    { std::ofstream file(root / ".same/ignore"); file << "build/\n"; }
     if (!same::Ignore(root).can_prune("build") || same::Ignore(root).can_prune("source")) throw std::runtime_error("directory pruning");
     { std::ofstream file(root / ".same/ignore"); for (int i = 0; i < 200; ++i) file << "*a"; file << "z\n"; }
     if (same::Ignore(root).matches(std::string(400, 'a'), false)) throw std::runtime_error("adversarial glob mismatch");

@@ -2,19 +2,36 @@
 #include <toml++/toml.hpp>
 #include <algorithm>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <limits>
 #include <stdexcept>
 #include <thread>
 namespace same {
+namespace {
+std::optional<std::string> read_settings(const std::filesystem::path& path, std::size_t limit) {
+    if (!std::filesystem::exists(path)) return std::nullopt;
+    const auto name = path.filename().string();
+    if (std::filesystem::file_size(path) > limit) throw std::runtime_error(name + " exceeds byte limit");
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) throw std::runtime_error("cannot read " + name);
+    // Cap the read itself, not just a racy pre-read size check.
+    // 限制实际读取量，而不是仅依赖读取前可能失效的大小检查。
+    std::string contents(limit + 1, '\0');
+    stream.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+    const auto count = static_cast<std::size_t>(stream.gcount());
+    if (count > limit) throw std::runtime_error(name + " exceeds byte limit");
+    if (stream.bad()) throw std::runtime_error("error reading " + name);
+    contents.resize(count);
+    return contents;
+}
+}
 Config::Config() : workers(std::clamp<std::size_t>(std::thread::hardware_concurrency(), 1, 8)), queue_capacity(workers * 2) {}
 Config Config::load(const std::filesystem::path& root) {
     Config result;
-    const auto path = root / ".same" / "config.toml";
-    if (!std::filesystem::exists(path)) return result;
-    std::ifstream stream(path);
-    if (!stream) throw std::runtime_error("cannot read .same/config.toml");
-    const auto table = toml::parse(stream);
+    const auto contents = read_settings(root / ".same" / "config.toml", 64 * 1024);
+    if (!contents) return result;
+    const auto table = toml::parse(*contents);
     for (const auto& [key, node] : table) {
         const auto name = key.str();
         if (name != "workers" && name != "block_bytes" && name != "memory_bytes" && name != "device_memory_bytes" &&
@@ -22,7 +39,7 @@ Config Config::load(const std::filesystem::path& root) {
     }
     auto number = [&](const char* name, std::size_t& target) {
         if (!table.contains(name)) return;
-        auto value = table[name].value<std::int64_t>();
+        auto value = table[name].value_exact<std::int64_t>();
         if (!value || *value <= 0 || static_cast<std::uint64_t>(*value) > std::numeric_limits<std::size_t>::max())
             throw std::runtime_error(std::string("invalid positive integer: ") + name);
         target = static_cast<std::size_t>(*value);
@@ -32,12 +49,12 @@ Config Config::load(const std::filesystem::path& root) {
     number("block_bytes", result.block_bytes); number("memory_bytes", result.memory_bytes);
     number("device_memory_bytes", result.device_memory_bytes); number("queue_capacity", result.queue_capacity);
     if (table.contains("backend")) {
-        auto value = table["backend"].value<std::string>();
+        auto value = table["backend"].value_exact<std::string>();
         if (!value) throw std::runtime_error("backend must be a string");
         result.backend = *value;
     }
     if (table.contains("rehash")) {
-        auto value = table["rehash"].value<bool>();
+        auto value = table["rehash"].value_exact<bool>();
         if (!value) throw std::runtime_error("rehash must be boolean");
         result.rehash = *value;
     }
@@ -78,27 +95,16 @@ bool glob_match(std::string_view pattern, std::string_view path, bool directory_
         }
         previous.swap(current);
     }
-        for (std::size_t j = 0; j < path.size(); ++j) {
+    for (std::size_t j = 0; j < path.size(); ++j) {
         if (path[j] == '/' && previous[j]) return true;
     }
     return (!directory_rule || directory) && previous.back() != 0;
 }
 }
 Ignore::Ignore(const std::filesystem::path& root) {
-    const auto path = root / ".same" / "ignore";
-    if (!std::filesystem::exists(path)) return;
-    if (std::filesystem::file_size(path) > 1024 * 1024) throw std::runtime_error("ignore file exceeds 1 MiB");
-    std::ifstream stream(path);
-    if (!stream) throw std::runtime_error("cannot read .same/ignore");
-    // Read a capped snapshot, including concurrent growth after the size check.
-    // 有界读取快照，同时限制大小检查后的并发增长。
-    std::string contents(1024 * 1024 + 1, '\0');
-    stream.read(contents.data(), static_cast<std::streamsize>(contents.size()));
-    const auto count = static_cast<std::size_t>(stream.gcount());
-    if (count > 1024 * 1024) throw std::runtime_error("ignore file exceeds 1 MiB");
-    if (stream.bad()) throw std::runtime_error("error reading .same/ignore");
-    contents.resize(count);
-    std::istringstream lines(contents);
+    const auto contents = read_settings(root / ".same" / "ignore", 1024 * 1024);
+    if (!contents) return;
+    std::istringstream lines(*contents);
     std::string line;
     while (std::getline(lines, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -115,7 +121,6 @@ Ignore::Ignore(const std::filesystem::path& root) {
         has_negations_ = has_negations_ || negate;
         rules_.push_back({std::move(line), negate, directory});
     }
-    if (stream.bad()) throw std::runtime_error("error reading .same/ignore");
 }
 bool Ignore::can_prune(std::string_view relative) const {
     return !has_negations_ && matches(relative, true);
