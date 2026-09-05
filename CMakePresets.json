@@ -1,0 +1,35 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {"major": 3, "minor": 25, "patch": 0},
+  "configurePresets": [
+    {
+      "name": "release",
+      "displayName": "Release with optional CUDA",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "BUILD_TESTING": "ON"}
+    },
+    {
+      "name": "cpu",
+      "inherits": "release",
+      "displayName": "CPU-only Release",
+      "cacheVariables": {"SAME_ENABLE_CUDA": "OFF"}
+    },
+    {
+      "name": "asan",
+      "inherits": "cpu",
+      "displayName": "Host ASan/UBSan (supported Unix toolchains)",
+      "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug", "SAME_SANITIZERS": "ON"}
+    }
+  ],
+  "buildPresets": [
+    {"name": "release", "configurePreset": "release"},
+    {"name": "cpu", "configurePreset": "cpu"},
+    {"name": "asan", "configurePreset": "asan"}
+  ],
+  "testPresets": [
+    {"name": "release", "configurePreset": "release", "output": {"outputOnFailure": true}},
+    {"name": "cpu", "configurePreset": "cpu", "output": {"outputOnFailure": true}},
+    {"name": "asan", "configurePreset": "asan", "output": {"outputOnFailure": true}}
+  ]
+}
