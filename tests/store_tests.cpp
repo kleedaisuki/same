@@ -84,11 +84,20 @@ int main() {
         }
         sqlite3* raw{};
         check(sqlite3_open(db.string().c_str(), &raw) == SQLITE_OK, "raw database open");
-        check(sqlite3_exec(raw, "PRAGMA user_version=999", nullptr, nullptr, nullptr) == SQLITE_OK, "set future version");
+        check(sqlite3_exec(raw, "PRAGMA journal_mode=WAL; PRAGMA user_version=999", nullptr, nullptr, nullptr) == SQLITE_OK, "set future version");
         sqlite3_close(raw);
         bool rejected = false;
         try { same::Store store(db); } catch (const std::runtime_error&) { rejected = true; }
         check(rejected, "future schema rejected");
+        check(sqlite3_open(db.string().c_str(), &raw) == SQLITE_OK, "reopen future database");
+        std::string mode;
+        auto capture = [](void* context, int, char** values, char**) {
+            *static_cast<std::string*>(context) = values[0];
+            return 0;
+        };
+        check(sqlite3_exec(raw, "PRAGMA journal_mode", capture, &mode, nullptr) == SQLITE_OK, "query preserved journal mode");
+        sqlite3_close(raw);
+        check(mode == "wal", "future database journal mode modified");
         std::filesystem::remove_all(root);
         std::cout << "store tests passed\n";
         return 0;

@@ -90,15 +90,19 @@ Store::Store(const std::filesystem::path& path, std::size_t cache_bytes) : impl_
         fail(impl_->db, "Open state database");
     auto* db = impl_->db;
     sqlite3_busy_timeout(db, 5000);
+    // Reject future schemas before even changing their journal mode.
+    // 拒绝未来版本时，连日志模式也不能修改。
+    {
+        Statement version(db, "PRAGMA user_version");
+        if (!version.step()) throw std::runtime_error("Missing SQLite schema version");
+        const auto schema = version.integer(0);
+        if (schema != 0 && schema != 1) throw std::runtime_error("Unsupported state database schema version");
+    }
     exec(db, "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA temp_store=FILE; PRAGMA mmap_size=0;");
     const auto cache_kib = std::clamp<std::size_t>(cache_bytes / 1024, 16, 1024 * 1024);
     const auto pragmas = "PRAGMA cache_size=-" + std::to_string(cache_kib) +
                          "; PRAGMA temp.cache_size=-" + std::to_string(cache_kib) + ";";
     exec(db, pragmas.c_str());
-    Statement version(db, "PRAGMA user_version");
-    if (!version.step()) throw std::runtime_error("Missing SQLite schema version");
-    const auto schema = version.integer(0);
-    if (schema != 0 && schema != 1) throw std::runtime_error("Unsupported state database schema version");
     exec(db, "BEGIN IMMEDIATE;");
     try {
         exec(db, "CREATE TABLE IF NOT EXISTS files("
