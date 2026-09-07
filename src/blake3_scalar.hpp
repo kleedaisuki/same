@@ -71,6 +71,11 @@ SAME_HD inline void compress(const Output& o, std::uint32_t* out, bool root = fa
     for (int i = 0; i < 16; ++i)
         m[i] = o.block[i];
     const int permutation[16] = {2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8};
+    // 固定轮数展开避免 CUDA 消息调度落入线程本地内存。 / Unroll fixed rounds to keep
+    // CUDA message scheduling out of thread-local memory.
+#ifdef __CUDA_ARCH__
+#pragma unroll
+#endif
     for (int r = 0; r < 7; ++r) {
         g(v, 0, 4, 8, 12, m[0], m[1]);
         g(v, 1, 5, 9, 13, m[2], m[3]);
@@ -123,7 +128,7 @@ SAME_HD inline Output chunk(const unsigned char* data, unsigned len, std::uint64
 }
 /// 左右各八字链值依序组成父节点，长度 64、计数 0、仅置 PARENT 标志。 / Join two ordered eight-word
 /// child values into a 64-byte, counter-zero PARENT node.
-inline Output parent(const std::uint32_t* left, const std::uint32_t* right) {
+SAME_HD inline Output parent(const std::uint32_t* left, const std::uint32_t* right) {
     Output o{};
     for (int i = 0; i < 8; ++i) {
         o.cv[i] = initial(i);

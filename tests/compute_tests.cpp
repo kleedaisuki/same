@@ -121,6 +121,45 @@ int main() {
             }
             require(hash(*gpu, bytes, 3917) == hash(*cpu, bytes, 7001),
                     "large random CPU/GPU mismatch");
+            // 跨融合子树边界、非对齐增量和容量边界。 / Fused subtree, unaligned streaming,
+            // and device capacity boundaries must match the independent official CPU library.
+            auto bulk = same::try_cuda_compute(1048576, 4194304);
+            require(static_cast<bool>(bulk), "bulk CUDA allocation");
+            test(*bulk);
+            for (auto step : {std::size_t(32767), std::size_t(32768), std::size_t(32769),
+                              std::size_t(65537), std::size_t(1048576), bytes.size()})
+                require(hash(*bulk, bytes, step) == hash(*cpu, bytes, bytes.size()),
+                        "fused subtree CPU/GPU mismatch");
+            // 稳定输入先于后端创建，最后释放；Hasher 可延长注册生命周期。 / Stable storage is
+            // created first and destroyed last; Hasher may outlive the Compute registration owner.
+            std::vector<std::byte> stable(1048576 + 113, std::byte{37});
+            auto prepared = same::try_cuda_compute(1048576, 4194304);
+            require(static_cast<bool>(prepared), "prepared CUDA allocation");
+            cpu->prepare_input(stable);
+            prepared->prepare_input({});
+            prepared->prepare_input(stable);
+            prepared->prepare_input(stable);
+            bool rejected = false;
+            try {
+                prepared->prepare_input(std::span(stable).first(1024));
+            } catch (const same::ComputeError&) {
+                rejected = true;
+            }
+            require(rejected, "different prepared range must be rejected");
+            require(hash(*prepared, stable, stable.size()) == hash(*cpu, stable, 7001),
+                    "registered input CPU/GPU mismatch");
+            auto retained = prepared->hasher();
+            retained->update(stable);
+            prepared.reset();
+            require(retained->finish() == hash(*cpu, stable, 7001),
+                    "hasher must retain registration lifetime");
+            retained.reset();
+            // 最后所有者析构应取消注册，同一范围现在可以重新注册。 / Last-owner destruction
+            // must unregister, permitting a new owner to register the exact same range.
+            prepared = same::try_cuda_compute(1048576, 4194304);
+            require(static_cast<bool>(prepared), "reprepared CUDA allocation");
+            prepared->prepare_input(stable);
+            prepared.reset();
             auto minimal = same::try_cuda_compute(1024, 2196);
             require(static_cast<bool>(minimal), "minimal CUDA budget");
             require(hash(*minimal, bytes, 65536) == hash(*cpu, bytes, 7001),

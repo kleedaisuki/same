@@ -44,6 +44,30 @@ class Compute {
 public:
     /// 释放后端持有的资源。 / Release resources owned by the backend.
     virtual ~Compute() = default;
+    /**
+     * @brief 可选地准备调用方拥有的稳定输入缓冲；默认无操作。 / Optionally prepare a caller-owned
+     * stable input buffer; the default implementation does nothing.
+     * CUDA 对非空范围仅注册一次，相同范围重复调用幂等；不同范围抛 ComputeError。
+     * CUDA registers one nonempty range once; repeated identical ranges are idempotent, while a
+     * different range throws ComputeError. Empty ranges are no-ops. Registration failure also
+     * throws ComputeError, allowing the caller to replace this backend with CPU safely.
+     * 空范围无操作；注册失败同样抛 ComputeError，供调用方安全替换成 CPU 后端。
+     * 缓冲地址和容量必须保持稳定且存活至本 Compute 及其所有 Hasher 都析构；不得 resize、move
+     * 或释放其存储。可在同步 update 返回后改写内容。无需为未注册输入调用此方法。
+     * Storage must remain stable and alive until this Compute AND all its Hashers are destroyed;
+     * do not resize, move, or free it. Contents may change after synchronous update returns.
+     * Unregistered inputs remain supported. Call only when no backend operation is in flight.
+     * 只能在没有后端操作进行时调用；不增加额外输入容量或转移缓冲所有权。
+     * @code
+     * std::vector<std::byte> input(block_bytes); // Must outlive compute and hashers.
+     * auto compute = try_cuda_compute(block_bytes, budget);
+     * if (!compute) compute =
+     * make_cpu_compute();
+     * compute->prepare_input(input); auto hasher = compute->hasher();
+     * hasher->update(input);
+     * @endcode
+     */
+    virtual void prepare_input(std::span<std::byte>) {}
     /// 创建空输入状态；摘要对象可能共享后端临时缓冲。 / Create empty state; hashers may share
     /// backend scratch buffers.
     virtual std::unique_ptr<Hasher> hasher() = 0;

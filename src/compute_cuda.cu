@@ -14,29 +14,51 @@ void check(cudaError_t status) {
     if (status != cudaSuccess)
         throw ComputeError(std::string("CUDA: ") + cudaGetErrorString(status));
 }
-/// 每线程处理一个完整 1024 字节叶块，输出八字链值；first 保持全局块索引。 / One full 1024-byte
-/// chunk per thread; emit eight-word values using global indices from first.
-__global__ void leaf_kernel(const unsigned char* input, std::uint32_t* cvs, std::size_t count,
-                            std::uint64_t first) {
-    auto i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+/// 完整叶按对齐小端字读取，避免通用逐字节组装的动态数组索引。 / Load aligned little-endian
+/// words for full chunks, avoiding dynamic array indexing in the general byte assembly path.
+__device__ void full_chunk(const unsigned char* input, std::uint64_t counter, std::uint32_t* cv) {
+    b3::Output output{};
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        output.cv[i] = b3::initial(i);
+    output.counter = counter;
+    output.len = 64;
+    const auto* words = reinterpret_cast<const std::uint32_t*>(input);
+    for (unsigned block = 0; block < 16; ++block) {
+#pragma unroll
+        for (int i = 0; i < 16; ++i)
+            output.block[i] = words[block * 16 + i];
+        output.flags = (block == 0 ? 1 : 0) | (block == 15 ? 2 : 0);
+        b3::compress(output, output.cv);
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        cv[i] = output.cv[i];
+}
+/// 完整块归并 32 叶，末个非完整块回传独立叶；所有屏障分支在块内一致。 / Full blocks reduce
+/// 32 leaves; the partial final block returns individual leaves. Barrier branches are
+/// block-uniform.
+__global__ void subtree_kernel(const unsigned char* input, std::uint32_t* cvs, std::uint64_t first,
+                               std::size_t count) {
+    // 九字步长使相邻叶映射到不同共享内存bank。 / Nine-word stride avoids shared bank conflicts.
+    __shared__ std::uint32_t tree[32][9];
+    const auto lane = threadIdx.x;
+    const auto i = static_cast<std::size_t>(blockIdx.x) * 32 + lane;
     if (i < count)
-        b3::compress(b3::chunk(input + i * 1024, 1024, first + i), cvs + i * 8);
-}
-/// 仅以一个线程启动，保留最终叶块 Output 以便主机应用 ROOT。 / Launch with exactly one thread and
-/// retain final leaf Output for host ROOT processing.
-__global__ void final_kernel(const unsigned char* input, unsigned length, std::uint64_t index,
-                             b3::Output* output) {
-    *output = b3::chunk(input, length, index);
-}
-/// 网格步进覆盖全部字节；不相等标志只能以原子操作从 0 变为 1。 / Grid-stride traversal covers all
-/// bytes; atomics only change the mismatch flag from 0 to 1.
-__global__ void equal_kernel(const unsigned char* a, const unsigned char* b, std::size_t length,
-                             int* different) {
-    auto i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    auto stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
-    for (; i < length; i += stride)
-        if (a[i] != b[i])
-            atomicExch(different, 1);
+        full_chunk(input + i * 1024, first + i, tree[lane]);
+    __syncthreads();
+    if (blockIdx.x < count / 32) {
+        for (unsigned stride = 1; stride < 32; stride *= 2) {
+            if (lane % (stride * 2) == 0)
+                b3::compress(b3::parent(tree[lane], tree[lane + stride]), tree[lane]);
+            __syncthreads();
+        }
+        if (lane < 8)
+            cvs[static_cast<std::size_t>(blockIdx.x) * 8 + lane] = tree[0][lane];
+    } else if (i < count) {
+        for (unsigned word = 0; word < 8; ++word)
+            cvs[(count / 32 + lane) * 8 + word] = tree[lane][word];
+    }
 }
 /**
  * @brief 单个工作线程独占的 CUDA 暂存区。 / CUDA scratch storage exclusive to one worker thread.
@@ -46,18 +68,18 @@ __global__ void equal_kernel(const unsigned char* a, const unsigned char* b, std
  * from construction so destruction cleans up partial allocation failures.
  */
 struct Device {
-    /// 两份输入设备缓冲，均含 capacity 字节。 / Two device input buffers, each capacity bytes.
-    unsigned char *a = nullptr, *b = nullptr;
-    /// 批量叶节点链值，每 1024 输入字节占 32 字节。 / Batched leaf chaining values: 32 bytes per
-    /// 1024 input bytes.
+    /// 输入设备缓冲，含 capacity 字节。 / Device input buffer containing capacity bytes.
+    unsigned char* a = nullptr;
+    /// 完整子树及至多 31 个尾叶链值。 / Full-subtree CVs plus up to 31 trailing leaf CVs.
     std::uint32_t* cvs = nullptr;
-    /// 最终叶块的未压缩输出描述。 / Uncompressed final-leaf output descriptor.
-    b3::Output* output = nullptr;
-    /// 比较内核共享的原子不相等标志。 / Atomic mismatch flag shared by comparison threads.
-    int* different = nullptr;
     /// 显式非阻塞流；所有传输和内核按流顺序提交。 / Explicit nonblocking stream ordering all
     /// transfers and kernels.
     cudaStream_t stream = nullptr;
+    /// 调用方拥有的已注册范围，存活至最后一个 Device 所有者析构。 / Caller-owned registered
+    /// range, alive until the final Device owner is destroyed; null means no registration.
+    void* registered_input = nullptr;
+    /// 注册字节数，用于同范围幂等检查。 / Registered bytes for identical-range idempotence.
+    std::size_t registered_bytes = 0;
     /// 输入容量，至少 1024 且为 1024 的倍数。 / Input capacity, at least 1024 and a multiple of
     /// 1024.
     std::size_t capacity;
@@ -66,17 +88,17 @@ struct Device {
     std::vector<std::array<std::uint32_t, 8>> host_cvs;
     /// 仅分配主机容器；设备申请由 allocate 完成。 / Allocate only the host container; allocate
     /// handles device storage.
-    explicit Device(std::size_t cap) : capacity(cap), host_cvs(cap / 1024) {}
+    explicit Device(std::size_t cap)
+        : capacity(cap), host_cvs(std::min(cap / 1024, cap / 32768 + 31)) {}
     /// 清理前等待在途操作；析构不传播 CUDA 错误。 / Wait for in-flight work before cleanup;
     /// destruction does not propagate CUDA errors.
     ~Device() {
         if (stream)
             cudaStreamSynchronize(stream);
+        if (registered_input)
+            cudaHostUnregister(registered_input);
         cudaFree(a);
-        cudaFree(b);
         cudaFree(cvs);
-        cudaFree(output);
-        cudaFree(different);
         if (stream)
             cudaStreamDestroy(stream);
     }
@@ -85,10 +107,21 @@ struct Device {
     void allocate() {
         check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         check(cudaMalloc(reinterpret_cast<void**>(&a), capacity));
-        check(cudaMalloc(reinterpret_cast<void**>(&b), capacity));
         check(cudaMalloc(reinterpret_cast<void**>(&cvs), host_cvs.size() * 32));
-        check(cudaMalloc(reinterpret_cast<void**>(&output), sizeof(b3::Output)));
-        check(cudaMalloc(reinterpret_cast<void**>(&different), sizeof(int)));
+    }
+    /// 只锁定现有缓冲，不增设暂存区；成功后才记录所有权以安全处理失败。 / Pin existing
+    /// storage without staging; record registration only after success for safe failure cleanup.
+    void prepare(std::span<std::byte> input) {
+        if (input.empty())
+            return;
+        if (registered_input) {
+            if (registered_input != input.data() || registered_bytes != input.size())
+                throw ComputeError("CUDA: input buffer already prepared with a different range");
+            return;
+        }
+        check(cudaHostRegister(input.data(), input.size(), cudaHostRegisterDefault));
+        registered_input = input.data();
+        registered_bytes = input.size();
     }
     /// 检查启动错误并等待流完成，使主机结果和输入复用安全。 / Check launch errors and await
     /// completion for safe host results and input reuse.
@@ -97,7 +130,7 @@ struct Device {
         check(cudaStreamSynchronize(stream));
     }
 };
-/// GPU 计算叶节点、CPU 维护有界二叉树的增量摘要。 / Incremental digest with GPU leaves and a
+/// GPU 融合计算子树、CPU 维护有界二叉树的增量摘要。 / Incremental digest with GPU subtrees and a
 /// bounded CPU binary tree.
 class CudaHasher final : public Hasher {
     /// 共享生命周期的工作线程私有暂存区，不提供互斥。 / Worker-private scratch with shared
@@ -115,27 +148,49 @@ class CudaHasher final : public Hasher {
     /// heights follow set bits of chunks_, bounded by counter width.
     std::array<std::array<std::uint32_t, 8>, 64> stack_{};
     /// 按二进制进位归并等高子树，保持左旧右新顺序。 / Merge equal-height subtrees like binary
-    /// carries, preserving old-left/new-right order.
-    void push(std::array<std::uint32_t, 8> cv) {
-        auto total = ++chunks_;
+    /// carries, preserving old-left/new-right order. count is an aligned power-of-two subtree.
+    /// count 为对齐的二次幂子树叶数。
+    void push(std::array<std::uint32_t, 8> cv, std::uint64_t count = 1) {
+        chunks_ += count;
+        auto total = chunks_ / count;
         while ((total & 1) == 0) {
             b3::compress(b3::parent(stack_[--depth_].data(), cv.data()), cv.data());
             total >>= 1;
         }
         stack_[depth_++] = cv;
     }
-    /// count 必须在 [1, capacity / 1024]；同步后按顺序压栈。 / count must be in [1, capacity /
-    /// 1024]; synchronize then push in order.
+    /// 主机处理小批量及子树边界，避免微小传输。 / Handle small batches and subtree edges on
+    /// the host, avoiding tiny transfers; index always matches the committed chunk count.
+    void host_leaf(const unsigned char* bytes) {
+        std::array<std::uint32_t, 8> cv{};
+        b3::compress(b3::chunk(bytes, 1024, chunks_), cv.data());
+        push(cv);
+    }
+    /// 前缀对齐后，完整子树和尾叶在同次 GPU 调用计算；微小批量留在主机。 / After prefix
+    /// alignment, fuse full subtrees and trailing leaves in one launch; tiny batches stay on host.
     void leaves(const unsigned char* bytes, std::size_t count) {
+        while (count && chunks_ % 32) {
+            host_leaf(bytes);
+            bytes += 1024;
+            --count;
+        }
         auto& d = *device_;
-        check(cudaMemcpyAsync(d.a, bytes, count * 1024, cudaMemcpyHostToDevice, d.stream));
-        leaf_kernel<<<static_cast<unsigned>((count + 127) / 128), 128, 0, d.stream>>>(
-            d.a, d.cvs, count, chunks_);
-        check(cudaMemcpyAsync(d.host_cvs.data(), d.cvs, count * 32, cudaMemcpyDeviceToHost,
-                              d.stream));
-        d.sync();
+        const auto trees = count / 32;
+        if (trees) {
+            check(cudaMemcpyAsync(d.a, bytes, count * 1024, cudaMemcpyHostToDevice, d.stream));
+            subtree_kernel<<<static_cast<unsigned>((count + 31) / 32), 32, 0, d.stream>>>(
+                d.a, d.cvs, chunks_, count);
+            check(cudaMemcpyAsync(d.host_cvs.data(), d.cvs, (trees + count % 32) * 32,
+                                  cudaMemcpyDeviceToHost, d.stream));
+            d.sync();
+            for (std::size_t i = 0; i < trees; ++i)
+                push(d.host_cvs[i], 32);
+            for (std::size_t i = 0; i < count % 32; ++i)
+                push(d.host_cvs[trees + i]);
+            return;
+        }
         for (std::size_t i = 0; i < count; ++i)
-            push(d.host_cvs[i]);
+            host_leaf(bytes + i * 1024);
     }
 
 public:
@@ -170,13 +225,8 @@ public:
     /// 不修改摘要栈；由最终叶块向左归并，再以 ROOT 输出小端 32 字节。 / Preserve the stack, fold
     /// left subtrees into the final leaf, then emit 32 little-endian ROOT bytes.
     Digest finish() override {
-        auto& d = *device_;
-        if (length_)
-            check(cudaMemcpyAsync(d.a, pending_.data(), length_, cudaMemcpyHostToDevice, d.stream));
-        final_kernel<<<1, 1, 0, d.stream>>>(d.a, static_cast<unsigned>(length_), chunks_, d.output);
-        b3::Output output{};
-        check(cudaMemcpyAsync(&output, d.output, sizeof(output), cudaMemcpyDeviceToHost, d.stream));
-        d.sync();
+        // 最终叶已经在主机，无需单线程 GPU 往返。 / Final leaf is already host-resident.
+        auto output = b3::chunk(pending_.data(), static_cast<unsigned>(length_), chunks_);
         std::array<std::uint32_t, 8> cv{};
         for (auto depth = depth_; depth; --depth) {
             b3::compress(output, cv.data());
@@ -189,8 +239,8 @@ public:
         return result;
     }
 };
-/// 单工作线程同步接口；摘要与比较复用同一设备缓冲。 / Single-worker synchronous interface sharing
-/// device buffers between hashing and comparison.
+/// 单工作线程同步接口；摘要使用设备，比较保留在主机。 / Single-worker synchronous interface;
+/// hashing uses device scratch and comparison stays on the host.
 class CudaCompute final : public Compute {
     /// 共享生命周期的工作线程私有暂存区，不提供互斥。 / Worker-private scratch with shared
     /// lifetime, without mutual exclusion.
@@ -200,6 +250,11 @@ public:
     /// 接管已成功申请的设备资源共享所有权。 / Retain shared ownership of successfully allocated
     /// device resources.
     explicit CudaCompute(std::shared_ptr<Device> device) : device_(std::move(device)) {}
+    /// 注册稳定的调用方输入；Device 与存活的 Hasher 共同持有注册生命周期。 / Register stable
+    /// caller input; Device and surviving Hashers jointly retain registration lifetime.
+    void prepare_input(std::span<std::byte> input) override {
+        device_->prepare(input);
+    }
     /// 创建独立树状态，但共享设备暂存区，不能并行调用。 / Create independent tree state but shared
     /// scratch; calls must not overlap.
     std::unique_ptr<Hasher> hasher() override {
@@ -209,28 +264,11 @@ public:
     std::string name() const override {
         return "cuda";
     }
-    /// 先比较长度，再按设备容量分批精确比较；空输入直接相等。 / Check lengths, then compare exact
-    /// bytes in capacity-sized batches; empty inputs match.
+    /// 主机已有两份输入，直接比较以避免两次 H2D 和同步。 / Compare host-resident inputs
+    /// directly, avoiding two H2D transfers and synchronization; empty spans need no pointers.
     bool equal(std::span<const std::byte> a, std::span<const std::byte> b) override {
-        if (a.size() != b.size())
-            return false;
-        auto& d = *device_;
-        for (std::size_t offset = 0; offset < a.size();) {
-            auto size = std::min(d.capacity, a.size() - offset);
-            check(cudaMemcpyAsync(d.a, a.data() + offset, size, cudaMemcpyHostToDevice, d.stream));
-            check(cudaMemcpyAsync(d.b, b.data() + offset, size, cudaMemcpyHostToDevice, d.stream));
-            check(cudaMemsetAsync(d.different, 0, sizeof(int), d.stream));
-            auto blocks = static_cast<unsigned>(std::min<std::size_t>((size + 255) / 256, 65535));
-            equal_kernel<<<blocks, 256, 0, d.stream>>>(d.a, d.b, size, d.different);
-            int different = 0;
-            check(cudaMemcpyAsync(&different, d.different, sizeof(int), cudaMemcpyDeviceToHost,
-                                  d.stream));
-            d.sync();
-            if (different)
-                return false;
-            offset += size;
-        }
-        return true;
+        return a.size() == b.size() &&
+               (a.empty() || std::memcmp(a.data(), b.data(), a.size()) == 0);
     }
 };
 } // namespace
@@ -238,8 +276,9 @@ public:
 /// device payload bytes per chunk; allocation failure returns null for CPU fallback.
 std::unique_ptr<Compute> try_cuda_compute(std::size_t block_bytes, std::size_t device_budget) {
     constexpr auto overhead = sizeof(b3::Output) + sizeof(int);
-    // 2 input bytes + 1/32 CV byte per byte; allocation accounting excludes driver context.
-    // 每字节两份输入及 1/32 字节链值；预算不包含驱动上下文。
+    // Preserve historical capacity selection for configured budgets; actual allocation is now
+    // one input buffer plus subtree/tail CVs, below this conservative bound.
+    // 保留旧预算容量语义；实际分配输入及子树/尾叶链值，低于该保守上界。
     if (block_bytes < 1024 || device_budget < overhead + 2080)
         return {};
     auto chunks = std::min(block_bytes / 1024, (device_budget - overhead) / 2080);
