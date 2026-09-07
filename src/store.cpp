@@ -34,6 +34,19 @@ public:
     }
     Statement(const Statement&) = delete;
     Statement& operator=(const Statement&) = delete;
+    /// 重置执行并释放绑定副本；成功路径检查延迟错误。 / Reset execution and free
+    /// bound copies; successful paths check delayed errors.
+    void reset() {
+        const int result = sqlite3_reset(stmt_);
+        sqlite3_clear_bindings(stmt_);
+        if (result != SQLITE_OK)
+            fail(db_, "SQLite reset");
+    }
+    /// 异常路径保留原始错误并释放游标。 / Preserve the original error during unwinding.
+    void reset_noexcept() noexcept {
+        sqlite3_reset(stmt_);
+        sqlite3_clear_bindings(stmt_);
+    }
     /// 参数索引从 1 开始；SQLITE_TRANSIENT 复制字节，不借用调用方内存。
     /// Parameters are one-based; SQLITE_TRANSIENT copies bytes instead of borrowing caller memory.
     void bytes(int index, const void* data, std::size_t length) {
@@ -111,6 +124,29 @@ private:
     /// 唯一拥有的语句/游标。 / Exclusively owned statement/cursor.
     sqlite3_stmt* stmt_{};
 };
+/// 每次借用均关闭游标，不将读锁带入下一次操作。 / Each use closes its cursor,
+/// preventing a read lock from escaping into the next operation.
+class StatementUse {
+public:
+    /// 借用连接所有的语句。 / Borrow a connection-owned statement.
+    explicit StatementUse(Statement& statement) : statement_(statement) {}
+    /// 异常期间仍清理绑定和执行状态。 / Clean bindings and execution even on exceptions.
+    ~StatementUse() {
+        if (active_)
+            statement_.reset_noexcept();
+    }
+    /// 正常返回前检查 reset 的结果。 / Check reset before successful return.
+    void finish() {
+        statement_.reset();
+        active_ = false;
+    }
+
+private:
+    /// 借用的非并发语句。 / Borrowed, non-concurrent statement.
+    Statement& statement_;
+    /// 正常完成后无需二次重置。 / Avoid a second reset after normal completion.
+    bool active_{true};
+};
 } // namespace
 /// 连接级事务状态；临时比较表随连接消失，文件缓存持久化。
 /// Connection-level transaction state; comparison tables are temporary, file cache persists.
@@ -123,9 +159,21 @@ struct Store::Impl {
     /// 本轮已见标记，仅在扫描事务中写入。 / This scan's seen marker, written within its
     /// transaction.
     sqlite3_int64 generation{};
+    /// 固定热路径语句，数量不随文件数增长。 / Fixed hot-path statements, independent of file count.
+    std::unique_ptr<Statement> lookup;
+    /// 缓存命中仅修改非索引列。 / Cache hits update only the non-indexed generation.
+    std::unique_ptr<Statement> seen;
+    std::unique_ptr<Statement> upsert;
+    std::unique_ptr<Statement> representative;
+    std::unique_ptr<Statement> match;
     /// Store 构造失败时同样关闭已打开的连接。 / Close the connection even if Store construction
     /// fails.
     ~Impl() {
+        match.reset();
+        representative.reset();
+        upsert.reset();
+        lookup.reset();
+        seen.reset();
         if (db)
             sqlite3_close_v2(db);
     }
@@ -178,6 +226,17 @@ Store::Store(const std::filesystem::path& path, std::size_t cache_bytes)
              "modified BLOB NOT NULL,changed BLOB NOT NULL,digest BLOB NOT NULL) WITHOUT ROWID;"
              "CREATE TEMP TABLE matches(representative BLOB NOT NULL,member BLOB NOT NULL,"
              "PRIMARY KEY(representative,member)) WITHOUT ROWID;");
+    impl_->lookup = std::make_unique<Statement>(
+        db, "SELECT path,size,identity,modified,changed,digest FROM files WHERE path=?1");
+    impl_->seen = std::make_unique<Statement>(db, "UPDATE files SET generation=?2 WHERE path=?1");
+    impl_->upsert = std::make_unique<Statement>(
+        db, "INSERT INTO files(path,size,identity,modified,changed,digest,generation)"
+            " VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(path) DO UPDATE SET "
+            "size=excluded.size,identity=excluded.identity,modified=excluded.modified,"
+            "changed=excluded.changed,digest=excluded.digest,generation=excluded.generation");
+    impl_->representative =
+        std::make_unique<Statement>(db, "INSERT INTO representatives VALUES(?1,?2,?3,?4,?5,?6)");
+    impl_->match = std::make_unique<Statement>(db, "INSERT OR IGNORE INTO matches VALUES(?1,?2)");
 }
 Store::~Store() {
     rollback_scan();
@@ -210,25 +269,36 @@ void Store::begin_scan() {
     }
 }
 std::optional<FileRecord> Store::cached(std::string_view path) {
-    Statement query(impl_->db,
-                    "SELECT path,size,identity,modified,changed,digest FROM files WHERE path=?1");
+    auto& query = *impl_->lookup;
+    StatementUse use(query);
     query.string(1, path);
-    if (!query.step())
-        return std::nullopt;
-    return query.record();
+    std::optional<FileRecord> result;
+    if (query.step())
+        result = query.record();
+    use.finish();
+    return result;
 }
 void Store::save(const FileRecord& record) {
     if (!impl_->scanning)
         throw std::logic_error("No active scan");
-    Statement insert(
-        impl_->db,
-        "INSERT INTO files(path,size,identity,modified,changed,digest,generation)"
-        " VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(path) DO UPDATE SET "
-        "size=excluded.size,identity=excluded.identity,modified=excluded.modified,"
-        "changed=excluded.changed,digest=excluded.digest,generation=excluded.generation");
+    auto& insert = *impl_->upsert;
+    StatementUse use(insert);
     insert.bind_record(record);
     insert.integer(7, impl_->generation);
     insert.step();
+    use.finish();
+}
+void Store::mark_seen(std::string_view path) {
+    if (!impl_->scanning)
+        throw std::logic_error("No active scan");
+    auto& update = *impl_->seen;
+    StatementUse use(update);
+    update.string(1, path);
+    update.integer(2, impl_->generation);
+    update.step();
+    if (sqlite3_changes(impl_->db) != 1)
+        throw std::logic_error("Cannot mark missing cache entry seen");
+    use.finish();
 }
 void Store::end_scan() {
     if (!impl_->scanning)
@@ -259,9 +329,11 @@ void Store::clear_representatives() {
     exec(impl_->db, "DELETE FROM representatives");
 }
 void Store::add_representative(const FileRecord& record) {
-    Statement insert(impl_->db, "INSERT INTO representatives VALUES(?1,?2,?3,?4,?5,?6)");
+    auto& insert = *impl_->representative;
+    StatementUse use(insert);
     insert.bind_record(record);
     insert.step();
+    use.finish();
 }
 void Store::visit_representatives(const std::function<bool(const FileRecord&)>& visitor) {
     Statement query(
@@ -275,10 +347,12 @@ void Store::reset_matches() {
     exec(impl_->db, "DELETE FROM matches");
 }
 void Store::add_match(std::string_view representative, std::string_view member) {
-    Statement insert(impl_->db, "INSERT OR IGNORE INTO matches VALUES(?1,?2)");
+    auto& insert = *impl_->match;
+    StatementUse use(insert);
     insert.string(1, representative);
     insert.string(2, member);
     insert.step();
+    use.finish();
 }
 void Store::visit_matches(const std::function<void(std::string_view, std::string_view)>& visitor) {
     Statement query(

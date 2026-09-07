@@ -42,9 +42,13 @@ public:
     /// 返回路径对应的缓存副本；不验证 stamp，也不将该文件标为本轮已见。
     /// Return an owned cache entry; neither validate its stamp nor mark it seen in this scan.
     std::optional<FileRecord> cached(std::string_view path);
-    /// 在活动扫描中插入/更新记录并标记本轮已见；缓存命中也必须调用。
-    /// Upsert and mark seen in the active scan; cached hits must also be saved.
+    /// 在活动扫描中插入/更新记录并标记本轮已见；缓存命中可改用 mark_seen。
+    /// Upsert and mark seen in the active scan; cache hits may use mark_seen instead.
     void save(const FileRecord& record);
+    /// 已验证缓存命中后仅更新扫描代次；路径必须存在且扫描必须活动。
+    /// After validating a cache hit, update only its generation; requires an existing path
+    /// and active scan. Example: if (cached(path)->stamp == stamp) mark_seen(path).
+    void mark_seen(std::string_view path);
     /// 删除本轮未见记录，与所有更新一并提交；必须有活动扫描。
     /// Delete unseen entries and commit them atomically with updates; requires an active scan.
     void end_scan();

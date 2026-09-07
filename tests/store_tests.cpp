@@ -67,6 +67,18 @@ int main() {
             store.clear_representatives();
             store.add_representative(b);
             store.add_representative(a);
+            // 重复键失败后，复用语句必须可重新绑定。 / A failed reused statement must
+            // accept fresh bindings after a constraint error.
+            bool duplicate_rejected = false;
+            try {
+                store.add_representative(a);
+            } catch (const std::runtime_error&) {
+                duplicate_rejected = true;
+            }
+            check(duplicate_rejected, "duplicate representative rejected");
+            store.add_representative(c);
+            check(!store.cached("missing"), "reused lookup miss");
+            check(store.cached(binary.path)->stamp == binary.stamp, "lookup bindings refreshed");
             int visited = 0;
             store.visit_representatives([&](const auto& item) {
                 ++visited;
@@ -87,8 +99,17 @@ int main() {
             check(paths == std::vector<std::string>{"a", "b"},
                   "exact matches deduplicated ordered");
             store.begin_scan();
-            store.save(a);
+            bool missing_rejected = false;
+            try {
+                store.mark_seen("missing");
+            } catch (const std::logic_error&) {
+                missing_rejected = true;
+            }
+            check(missing_rejected, "mark_seen rejects absent records");
+            store.mark_seen(a.path);
             store.end_scan();
+            check(store.cached(a.path)->stamp == a.stamp, "mark_seen preserves metadata");
+            check(store.cached(a.path)->digest == a.digest, "mark_seen preserves digest");
             check(!store.cached("b") && !store.cached("c"), "unseen files removed");
             store.begin_scan();
             store.save(record("a", 777));
