@@ -17,6 +17,12 @@ struct OutputOptions {
     /// Human-readable units on stderr; false preserves raw key=value metrics.
     /// 标准错误使用可读单位；false 保留原始 key=value 统计。
     bool diagnostics_pretty{false};
+    /// Descend into subdirectories; CLI explicitly opts out unless -r is supplied.
+    /// 下降进入子目录；CLI 仅在提供 -r 时显式开启。
+    bool recursive{true};
+    /// Emit summary, database and profiling panels; warnings remain independent.
+    /// 输出汇总、数据库与性能面板；警告不受此选项影响。
+    bool summary{true};
 };
 /// Run with explicit presentation; e.g. run(root, config, out, err, {true, false}).
 /// 使用显式展示策略运行；示例为无色可读输出。

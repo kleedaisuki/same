@@ -58,7 +58,7 @@ target_link_libraries(same PRIVATE same_core)
 install(TARGETS same RUNTIME DESTINATION bin)
 
 if(BUILD_TESTING)
-  foreach(test compute files config store resources run_lock terminal dispatch walk completion workspace)
+  foreach(test compute files config store resources run_lock terminal dispatch walk completion workspace hash_retry)
     add_executable(${test}_tests tests/${test}_tests.cpp)
     target_link_libraries(${test}_tests PRIVATE same_core)
     add_test(NAME ${test} COMMAND ${test}_tests)

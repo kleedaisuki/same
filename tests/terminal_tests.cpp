@@ -97,17 +97,13 @@ void reports() {
     check(out.str().find("[UNIQUE]") == std::string::npos &&
               out.str().find("\"unique\"") == std::string::npos,
           "unique files not folded");
-    check(out.str().find("1 unique files (hidden; --unique-files to show)") != std::string::npos,
-          "hidden unique summary");
+    check(out.str().find("Summary") == std::string::npos &&
+              out.str().find("exact duplicate report") == std::string::npos,
+          "removed banners");
     out.str("");
     err.str("");
     same::run(f.root, config, out, err, {true, false, true});
     const auto plain = out.str();
-    check(plain.find("Database | .same/state.db | " +
-                     same::human_bytes(static_cast<double>(
-                         std::filesystem::file_size(f.root / ".same/state.db"))) +
-                     " | 3 records | committed") != std::string::npos,
-          "database summary");
     check(plain.find("[SAME] Group 1") != std::string::npos, "same heading");
     check(plain.find("[UNIQUE]") != std::string::npos &&
               plain.find("\"unique\"") != std::string::npos,
@@ -121,9 +117,18 @@ void reports() {
     err.str("");
     same::run(f.root, config, out, err, {true, true, true, true, true});
     auto colored = out.str();
-    check(colored.find("\033[1;36mDatabase\033[0m") != std::string::npos, "database color");
-    check(colored.find("\033[1;36mSummary\033[0m") != std::string::npos, "summary color");
-    check(err.str().find("\033[1;36mProfile\033[0m") != std::string::npos, "profile color");
+    check(colored.find("Summary") == std::string::npos, "summary leaked to results");
+    check(err.str().find("\033[1;36mSummary\033[0m\n") != std::string::npos, "summary heading");
+    check(err.str().find("Database") != std::string::npos &&
+              err.str().find("3 records | committed") != std::string::npos,
+          "database table row");
+    check(err.str().find("Matching files") != std::string::npos &&
+              err.str().find("Unique files") != std::string::npos &&
+              err.str().find("Groups") != std::string::npos,
+          "result table rows");
+    check(err.str().find("wall time / logical reads") == std::string::npos &&
+              err.str().find("Profile") == std::string::npos,
+          "removed profile title");
     check(err.str().find(" B") != std::string::npos && err.str().find("/s") != std::string::npos,
           "human profile units");
     check(err.str().find("Hash work") != std::string::npos &&
@@ -148,13 +153,22 @@ void reports() {
     err.str("");
     same::run(f.root, config, out, err, {true, true, false, false, true});
     check(err.str().find('\033') == std::string::npos &&
-              err.str().find("Profile") != std::string::npos,
+              err.str().find("Summary") != std::string::npos,
           "independent plain diagnostic stream");
     out.str("");
     err.str("");
     same::run(f.root, config, out, err, {false, false, false, true, true});
     check(out.str() == "1\t\"a\"\n1\t\"b\"\n" && err.str().find('\033') != std::string::npos,
           "independent colored diagnostic stream");
+    out.str("");
+    err.str("");
+    same::run(f.root, config, out, err, {true, false, false, false, true});
+    check(err.str().find("1 (hidden; --unique-files to show)") != std::string::npos,
+          "hidden unique hint in summary table");
+    check(err.str().find(".same/state.db | " +
+                         same::human_bytes(static_cast<double>(std::filesystem::file_size(
+                             f.root / ".same/state.db")))) != std::string::npos,
+          "actual database size in summary table");
     Fixture empty;
     out.str("");
     err.str("");
@@ -162,13 +176,13 @@ void reports() {
     check(counter(err.str(), "read_bytes") == 0, "empty read bytes");
     check(counter(err.str(), "database_records") == 0 && counter(err.str(), "database_bytes") > 0,
           "empty database metadata");
-    check(out.str().find("0 records | committed") != std::string::npos, "empty database summary");
+    check(out.str().empty(), "empty pretty output has no banner");
     std::filesystem::remove(f.root / "unique");
     out.str("");
     err.str("");
     same::run(f.root, config, out, err, {true, false});
     check(counter(err.str(), "database_records") == 2 &&
-              out.str().find("2 records | committed") != std::string::npos,
+              out.str().find("Database") == std::string::npos,
           "deleted database record");
     check(err.str().find("nan") == std::string::npos && err.str().find("inf") == std::string::npos,
           "nonfinite rate");

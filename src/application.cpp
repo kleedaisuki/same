@@ -1,15 +1,18 @@
 #include "same/application.hpp"
+#include "same/detail/completion_jobs.hpp"
 #include "same/files.hpp"
 #include "same/resources.hpp"
 #include "same/run_lock.hpp"
 #include "same/store.hpp"
 #include "same/terminal.hpp"
+#include "same/walk.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <deque>
 #include <future>
 #include <iomanip>
+#include <limits>
 #include <locale>
 #include <numeric>
 #include <optional>
@@ -60,11 +63,23 @@ std::size_t read_block(FileReader& reader, std::span<std::byte> buffer, std::uin
 }
 /// Hash from a fresh handle; reject size/stamp changes before publishing the digest.
 /// 从新句柄计算哈希；发布摘要前拒绝大小或文件戳变化。
-FileRecord hash_file(const fs::path& root, FileRecord record, Worker& worker) {
+FileRecord hash_file(const fs::path& root, FileRecord record, Worker& worker,
+                     std::size_t gpu_min_bytes, std::unique_ptr<FileReader> opened = {}) {
     const auto path = native_path(root, record.path);
-    FileReader reader(path);
+    // 元数据句柄仅首次尝试复用；重试必须从新句柄的起点读取。
+    // Reuse the metadata handle only on the first attempt; retries reopen at offset zero.
+    auto owned = opened ? std::move(opened) : std::make_unique<FileReader>(path);
+    auto& reader = *owned;
     unchanged(path, reader, record.stamp);
-    auto hasher = worker.compute->hasher();
+    const bool small = record.stamp.size < std::max(gpu_min_bytes, worker.gpu_floor);
+    if (small)
+        ++worker.cpu_routed_hashes;
+    auto& selected = small ? worker.cpu_compute : worker.compute;
+    if (selected->name() == "cuda")
+        ++worker.gpu_hashes;
+    else
+        ++worker.cpu_hashes;
+    auto hasher = selected->hasher();
     std::uint64_t total = 0;
     for (;;) {
         const auto count = reader.read(worker.first);
@@ -158,6 +173,16 @@ struct Counters {
     /// Sum of worker hash-job wall times, including reads and CPU fallback retries.
     /// 工作线程哈希任务墙钟耗时之和，包含读取及 CPU 回退重试。
     double hash_work_ms = 0;
+    /// 协调线程等待元数据结果的时间，可能与哈希重叠。
+    /// Coordinator wait for metadata results, potentially overlapping hashing.
+    double walk_wait_ms = 0;
+    /// 目录/元数据工作线程累计耗时，不得与关键路径相加。
+    /// Summed directory/metadata worker time, not additive to critical-path duration.
+    double enumerate_work_ms = 0, metadata_work_ms = 0;
+    /// 协调线程数据库查询、更新及提交耗时。 / Coordinator database query/update/commit time.
+    double database_work_ms = 0;
+    /// 遍历任务和结果队列的峰值。 / Peak traversal task and result queue lengths.
+    std::size_t walk_task_peak = 0, walk_result_peak = 0;
     /// Records reused after matching stamps. 文件戳匹配后复用的记录数。
     std::size_t cached = 0;
     /// Emitted duplicate equivalence classes. 输出的重复文件等价类数量。
@@ -176,56 +201,116 @@ struct HashResult {
 /// Stream the tree into bounded worker jobs; keep every SQLite mutation on this thread.
 /// 流式遍历目录并提交有界任务；所有 SQLite 修改留在当前线程。
 void scan(const fs::path& root, const Config& config, Store& store, Resources& resources,
-          Counters& counters) {
-    Ignore ignore(root);
-    std::deque<std::future<HashResult>> pending;
+          Counters& counters, bool recursive) {
+    detail::CompletionJobs<HashResult> pending(resources, config.queue_capacity);
+    auto save = [&](const FileRecord& record) {
+        const auto start = Clock::now();
+        store.save(record);
+        counters.database_work_ms += milliseconds(start, Clock::now());
+    };
     auto drain = [&] {
         const auto start = Clock::now();
-        auto result = pending.front().get();
+        auto result = pending.next();
         counters.hash_wait_ms += milliseconds(start, Clock::now());
         counters.hash_work_ms += result.work_ms;
-        store.save(result.record);
-        pending.pop_front();
+        save(result.record);
+    };
+    // 只保留句柄与记录，不预读大文件内容；暂存数量与任务容量同阶。
+    // Retain handles/records only, not file payloads; buffering is bounded by task capacity.
+    struct HashInput {
+        /// 待处理的缓存记录。 / Pending cache record.
+        FileRecord record;
+        /// 从元数据阶段移交的未读取句柄。 / Unread handle from metadata work.
+        std::unique_ptr<FileReader> reader;
+    };
+    std::vector<HashInput> deferred;
+    std::uint64_t deferred_bytes = 0;
+    bool probed = config.backend != "auto";
+    auto submit = [&](HashInput input, bool prefer_gpu = false) {
+        const auto submitted = Clock::now();
+        pending.submit(
+            [root, gpu_min_bytes = config.gpu_min_bytes, record = std::move(input.record),
+             opened = std::move(input.reader)](Worker& worker) mutable {
+                const auto start = Clock::now();
+                auto hashed = worker.execute([&] {
+                    return hash_file(root, record, worker, gpu_min_bytes, std::move(opened));
+                });
+                return HashResult{std::move(hashed), milliseconds(start, Clock::now())};
+            },
+            prefer_gpu);
+        counters.hash_wait_ms += milliseconds(submitted, Clock::now());
+        if (pending.pending() >= config.queue_capacity)
+            drain();
+    };
+    auto flush = [&](bool explore) {
+        bool prefer_gpu = false;
+        if (explore && !probed) {
+            while (pending.pending())
+                drain();
+            resources.prepare_auto(config, deferred_bytes, deferred.size());
+            probed = true;
+            prefer_gpu = resources.gpu_workers() != 0;
+        }
+        if (prefer_gpu)
+            std::sort(deferred.begin(), deferred.end(), [](const auto& a, const auto& b) {
+                return a.record.stamp.size > b.record.stamp.size;
+            });
+        for (auto& input : deferred) {
+            submit(std::move(input), prefer_gpu);
+            prefer_gpu = false;
+        }
+        deferred.clear();
+        deferred_bytes = 0;
     };
     store.begin_scan();
-    for (fs::recursive_directory_iterator it(root), end; it != end; ++it) {
-        const auto key = path_key(it->path().lexically_relative(root));
-        const auto status = it->symlink_status();
-        if (is_reparse_point(it->path()) ||
-            (fs::is_directory(status) &&
-             (fs::equivalent(it->path(), root / ".same") || ignore.can_prune(key)))) {
-            it.disable_recursion_pending();
-            continue;
-        }
-        if (!fs::is_regular_file(status) || ignore.matches(key, false))
-            continue;
+    ParallelWalk walk(root, config.metadata_workers, config.queue_capacity, recursive);
+    for (;;) {
+        const auto waited = Clock::now();
+        auto entry = walk.next();
+        counters.walk_wait_ms += milliseconds(waited, Clock::now());
+        if (!entry)
+            break;
         ++counters.scanned;
-        FileRecord record{key, stamp_path(it->path()), {}};
+        FileRecord record{std::move(entry->path), std::move(entry->stamp), {}};
         counters.scanned_bytes += record.stamp.size;
-        const auto cached = store.cached(key);
-        if (!config.rehash && cached && cached->stamp == record.stamp) {
-            store.save(*cached);
+        const auto queried = Clock::now();
+        const auto cached = config.rehash ? std::nullopt : store.cached(record.path);
+        counters.database_work_ms += milliseconds(queried, Clock::now());
+        if (cached && cached->stamp == record.stamp) {
+            const auto marked = Clock::now();
+            store.mark_seen(cached->path);
+            counters.database_work_ms += milliseconds(marked, Clock::now());
             ++counters.cached;
             counters.cached_bytes += record.stamp.size;
             continue;
         }
         ++counters.hashed;
-        const auto submitted = Clock::now();
-        pending.push_back(resources.submit([root, record = std::move(record)](Worker& worker) {
-            const auto start = Clock::now();
-            auto hashed = worker.execute([&] { return hash_file(root, record, worker); });
-            return HashResult{std::move(hashed), milliseconds(start, Clock::now())};
-        }));
-        counters.hash_wait_ms += milliseconds(submitted, Clock::now());
-        // Futures, as well as executable jobs, are bounded: slow early files cannot
-        // let completed results accumulate without limit.
-        // future 同样有界，避免前面的慢文件导致后续已完成结果无限堆积。
-        if (pending.size() >= config.queue_capacity)
-            drain();
+        if (!probed && record.stamp.size >= std::max(config.gpu_min_bytes, config.block_bytes)) {
+            deferred_bytes += std::min(record.stamp.size,
+                                       std::numeric_limits<std::uint64_t>::max() - deferred_bytes);
+            deferred.push_back({std::move(record), std::move(entry->reader)});
+            if (deferred_bytes >= config.gpu_probe_bytes)
+                flush(true);
+            else if (deferred.size() >= config.queue_capacity)
+                flush(false);
+        } else {
+            submit({std::move(record), std::move(entry->reader)});
+        }
     }
-    while (!pending.empty())
+    flush(false);
+    while (pending.pending())
         drain();
+    const auto stats = walk.stats();
+    counters.enumerate_work_ms = stats.enumerate_ms;
+    counters.metadata_work_ms = stats.metadata_ms;
+    counters.walk_task_peak = stats.task_peak;
+    counters.walk_result_peak = stats.result_peak;
+    const auto committed = Clock::now();
+    // 淘汰未访问记录，也隔离从递归扫描切换到浅扫描后留下的子目录缓存。
+    // Prune unseen records, including child-directory cache entries after switching to shallow
+    // mode.
     store.end_scan();
+    counters.database_work_ms += milliseconds(committed, Clock::now());
 }
 /// Refine each size/digest bucket into byte-equal classes without trusting hash uniqueness.
 /// 将每个大小/摘要桶细分为字节相等等价类，不假设哈希绝无碰撞。
@@ -341,16 +426,14 @@ void render_results(Store& store, Counters& counters, std::ostream& output, Outp
     const auto green = options.color ? "\033[32m" : "";
     const auto yellow = options.color ? "\033[33m" : "";
     const auto reset = options.color ? "\033[0m" : "";
-    if (options.pretty)
-        output << "same | exact duplicate report\n"
-                  "-----------------------------\n";
     std::string previous;
     store.visit_matches([&](std::string_view representative, std::string_view member) {
         if (representative != previous) {
             previous = representative;
             ++counters.groups;
             if (options.pretty)
-                output << green << "\n[SAME] Group " << counters.groups << reset << '\n';
+                output << (counters.groups > 1 ? "\n" : "") << green << "[SAME] Group "
+                       << counters.groups << reset << '\n';
         }
         ++counters.matches;
         if (options.pretty)
@@ -369,29 +452,33 @@ void render_results(Store& store, Counters& counters, std::ostream& output, Outp
             output << reset << '\n';
         });
     }
-    if (options.pretty) {
-        const auto heading = options.color ? "\033[1;36m" : "";
-        output << '\n'
-               << heading << "Summary" << reset << " | " << green << counters.groups << " groups"
-               << reset << " | " << green << counters.matches << " matching files" << reset << " | "
-               << yellow << counters.scanned - counters.matches << " unique files" << reset;
-        if (!options.unique_files && counters.scanned != counters.matches)
-            output << " (hidden; --unique-files to show)";
-        output << '\n';
-        output << "  " << heading << "Database" << reset << " | .same/state.db | " << green
-               << human_bytes(static_cast<double>(counters.database_bytes)) << reset << " | "
-               << counters.scanned << " records | " << green << "committed" << reset << '\n';
-    }
     output.flush();
     if (!output)
         throw std::runtime_error("cannot write results");
+}
+/// 稳定的自动分派诊断名称。 / Stable automatic-dispatch diagnostic names.
+std::string_view dispatch_name(detail::DispatchEvidence::Decision decision) {
+    using Decision = detail::DispatchEvidence::Decision;
+    switch (decision) {
+    case Decision::untested:
+        return "explicit";
+    case Decision::deferred:
+        return "cpu-unprobed";
+    case Decision::cpu:
+        return "cpu";
+    case Decision::gpu:
+        return "cuda";
+    case Decision::failed:
+        return "cpu-probe-failed";
+    }
+    return "invalid";
 }
 /// Human-facing profile; machine metrics use a separate unchanged renderer.
 /// 面向人的统计展示；机器统计使用独立且保持不变的渲染器。
 void render_pretty_profile(const Counters& counters, const Resources& resources,
                            const std::array<double, 5>& phases, double elapsed,
                            std::uint64_t hashed, std::uint64_t compared, std::ostream& out,
-                           bool color) {
+                           bool color, bool unique_files) {
     const auto heading = color ? "\033[1;36m" : "";
     const auto value = color ? "\033[36m" : "";
     const auto reset = color ? "\033[0m" : "";
@@ -399,8 +486,19 @@ void render_pretty_profile(const Counters& counters, const Resources& resources,
         out << "  " << std::left << std::setw(16) << label << value << text << reset << '\n';
     };
     out << '\n'
-        << heading << "Profile" << reset << " | wall time / logical reads\n"
+        << heading << "Summary" << reset << "\n"
         << "-----------------------------------------\n";
+    // Consolidate result counts and state metadata into the opt-in diagnostic table.
+    // 将结果计数与状态元数据统一放入显式启用的诊断表。
+    row("Groups", std::to_string(counters.groups));
+    row("Matching files", std::to_string(counters.matches));
+    row("Unique files", std::to_string(counters.scanned - counters.matches) +
+                            (!unique_files && counters.scanned != counters.matches
+                                 ? " (hidden; --unique-files to show)"
+                                 : ""));
+    row("Database", ".same/state.db | " +
+                        human_bytes(static_cast<double>(counters.database_bytes)) + " | " +
+                        std::to_string(counters.scanned) + " records | committed");
     row("Files", std::to_string(counters.scanned) + " scanned | " +
                      std::to_string(counters.hashed) + " hashed | " +
                      std::to_string(counters.cached) + " cached");
@@ -410,10 +508,14 @@ void render_pretty_profile(const Counters& counters, const Resources& resources,
                     " total | " + human_bytes(static_cast<double>(hashed)) + " hash | " +
                     human_bytes(static_cast<double>(compared)) + " compare");
     row("Initialize", human_duration(phases[0]));
-    row("Scan",
-        human_duration(std::max(0.0, phases[1] - counters.hash_wait_ms)) + " (main-thread work)");
+    row("Scan", human_duration(std::max(0.0, phases[1] - counters.hash_wait_ms)) +
+                    " (coordinator incl. walk wait)");
     row("Hash wait", human_duration(counters.hash_wait_ms) + " (submit + join)");
     row("Hash work", human_duration(counters.hash_work_ms) + " (summed workers; overlaps scan)");
+    row("Walk wait", human_duration(counters.walk_wait_ms) + " (coordinator wait)");
+    row("Enumerate work", human_duration(counters.enumerate_work_ms) + " (summed workers)");
+    row("Metadata work", human_duration(counters.metadata_work_ms) + " (summed workers)");
+    row("Database work", human_duration(counters.database_work_ms) + " (coordinator)");
     row("Pipeline", human_duration(phases[1]) + " (Scan + Hash wait; excludes Hash work sum)");
     row("Compare", human_duration(phases[2]));
     row("Validate", human_duration(phases[3]));
@@ -425,6 +527,20 @@ void render_pretty_profile(const Counters& counters, const Resources& resources,
     row("Read rate", human_bytes(rate) + "/s");
     row("Backend", std::to_string(resources.gpu_workers()) + " GPU workers | " +
                        std::to_string(resources.fallbacks()) + " CPU fallbacks");
+    row("CPU size route",
+        std::to_string(resources.cpu_routed_hashes()) + " hash attempts (policy, not failure)");
+    const auto& dispatch = resources.dispatch_evidence();
+    const auto [cpu_attempts, gpu_attempts] = resources.hash_attempts();
+    row("Hash backends",
+        std::to_string(cpu_attempts) + " CPU | " + std::to_string(gpu_attempts) + " GPU attempts");
+    row("Auto dispatch", std::string(dispatch_name(dispatch.decision)) + " | " +
+                             human_duration(dispatch.setup_ms) + " setup (included in scan)");
+    if (dispatch.elapsed_ms > 0) {
+        row("Probe block", human_duration(dispatch.cpu_block_ms) + " CPU | " +
+                               human_duration(dispatch.gpu_block_ms) + " GPU");
+        row("Probe stream", human_duration(dispatch.cpu_stream_ms) + " CPU | " +
+                                human_duration(dispatch.gpu_stream_ms) + " GPU");
+    }
 }
 /// Print phase wall times and successful read bytes, not CPU time or physical I/O.
 /// 输出各阶段墙钟耗时及成功读取字节，不代表 CPU 时间或物理 I/O。
@@ -444,7 +560,7 @@ void render_profile(const Counters& counters, const Resources& resources,
     profile << std::fixed << std::setprecision(3);
     if (options.diagnostics_pretty) {
         render_pretty_profile(counters, resources, phases, elapsed, hash_bytes, compare_bytes,
-                              profile, options.diagnostics_color);
+                              profile, options.diagnostics_color, options.unique_files);
         diagnostics << profile.str();
         return;
     }
@@ -466,6 +582,26 @@ void render_profile(const Counters& counters, const Resources& resources,
     profile << "scan_work_ms=" << std::max(0.0, phases[1] - counters.hash_wait_ms)
             << " hash_wait_ms=" << counters.hash_wait_ms
             << " hash_work_ms=" << counters.hash_work_ms << '\n';
+    profile << "walk_wait_ms=" << counters.walk_wait_ms
+            << " enumerate_work_ms=" << counters.enumerate_work_ms
+            << " metadata_work_ms=" << counters.metadata_work_ms
+            << " database_work_ms=" << counters.database_work_ms
+            << " walk_task_peak=" << counters.walk_task_peak
+            << " walk_result_peak=" << counters.walk_result_peak << '\n';
+    profile << "cpu_routed_hashes=" << resources.cpu_routed_hashes() << '\n';
+    const auto& dispatch = resources.dispatch_evidence();
+    const auto [cpu_attempts, gpu_attempts] = resources.hash_attempts();
+    profile << "cpu_hashes=" << cpu_attempts << " gpu_hashes=" << gpu_attempts
+            << " auto_backend=" << dispatch_name(dispatch.decision)
+            << " gpu_setup_ms=" << dispatch.setup_ms
+            << " probe_mixed_cpu_ms=" << dispatch.mixed_cpu_ms
+            << " probe_mixed_gpu_ms=" << dispatch.mixed_gpu_ms
+            << " expected_gpu_saving_ms=" << dispatch.expected_saving_ms
+            << " calibration_ms=" << dispatch.elapsed_ms
+            << " probe_cpu_block_ms=" << dispatch.cpu_block_ms
+            << " probe_gpu_block_ms=" << dispatch.gpu_block_ms
+            << " probe_cpu_stream_ms=" << dispatch.cpu_stream_ms
+            << " probe_gpu_stream_ms=" << dispatch.gpu_stream_ms << '\n';
     diagnostics << profile.str();
 }
 } // namespace
@@ -483,7 +619,7 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
     Resources resources(config);
     Counters counters;
     const auto initialized = Clock::now();
-    scan(root, config, store, resources, counters);
+    scan(root, config, store, resources, counters, options.recursive);
     const auto scanned = Clock::now();
     partition(root, store, resources, config.queue_capacity);
     const auto compared = Clock::now();
@@ -494,14 +630,17 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
     const auto validated = Clock::now();
     render_results(store, counters, output, options);
     const auto finished = Clock::now();
-    render_profile(counters, resources,
-                   {milliseconds(start, initialized), milliseconds(initialized, scanned),
-                    milliseconds(scanned, compared), milliseconds(compared, validated),
-                    milliseconds(validated, finished)},
-                   diagnostics, options);
-    if (config.backend != "cpu" && resources.gpu_workers() < config.workers)
-        diagnostics << "CUDA unavailable or device budget insufficient for some workers; using CPU "
-                       "fallback.\n";
+    if (options.summary)
+        render_profile(counters, resources,
+                       {milliseconds(start, initialized), milliseconds(initialized, scanned),
+                        milliseconds(scanned, compared), milliseconds(compared, validated),
+                        milliseconds(validated, finished)},
+                       diagnostics, options);
+    if (config.backend == "cuda" && resources.gpu_workers() < config.workers)
+        diagnostics << "CUDA initialization or input registration failed for some workers; using "
+                       "CPU fallback.\n";
+    if (resources.dispatch_evidence().decision == detail::DispatchEvidence::Decision::failed)
+        diagnostics << "CUDA probe failed; auto selected CPU.\n";
     return 0;
 }
 } // namespace same
