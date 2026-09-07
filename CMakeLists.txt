@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 option(SAME_ENABLE_CUDA "Build CUDA backend when a supported compiler is available" ON)
 option(SAME_SANITIZERS "Enable address and undefined behavior sanitizers" OFF)
+option(SAME_REQUIRE_CUDA "Fail configuration unless CUDA is usable" OFF)
+include(cmake/Cuda.cmake)
 include(CTest)
 include(FetchContent)
 find_package(Threads REQUIRED)
@@ -29,18 +31,6 @@ target_include_directories(sqlite3 PUBLIC "${sqlite_source_SOURCE_DIR}")
 target_compile_definitions(sqlite3 PRIVATE SQLITE_THREADSAFE=1 SQLITE_DQS=0
   SQLITE_DEFAULT_MEMSTATUS=0 SQLITE_OMIT_LOAD_EXTENSION)
 target_link_libraries(sqlite3 PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
-
-set(SAME_CUDA OFF)
-if(SAME_ENABLE_CUDA)
-  include(CheckLanguage)
-  check_language(CUDA)
-  if(CMAKE_CUDA_COMPILER)
-    enable_language(CUDA)
-    set(SAME_CUDA ON)
-  else()
-    message(STATUS "CUDA compiler unavailable: building CPU fallback")
-  endif()
-endif()
 
 add_library(same_core
   src/config.cpp src/files.cpp src/store.cpp src/compute_cpu.cpp
@@ -76,6 +66,8 @@ if(BUILD_TESTING)
   endforeach()
   find_package(Python3 COMPONENTS Interpreter)
   if(Python3_FOUND)
+    add_test(NAME build_policy COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/build_policy.py")
     add_test(NAME integration COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration.py" "$<TARGET_FILE:same>")
     set_tests_properties(integration PROPERTIES TIMEOUT 120)

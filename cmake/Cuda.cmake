@@ -1,0 +1,46 @@
+# Validate before fetching dependencies; never replace an already selected compiler.
+# 下载依赖前验证；绝不替换已经选定的编译器。
+set(SAME_CUDA OFF)
+if(SAME_ENABLE_CUDA AND CMAKE_GENERATOR MATCHES "^Visual Studio")
+  message(FATAL_ERROR
+    "same uses direct CUDA compiler invocation, not Visual Studio CUDA/MSBuild integration. "
+    "Run: python tools/build.py --cuda on --test (automatic MSVC environment + Ninja + nvcc). "
+    "For native CMake, initialize the MSVC developer environment and use -G Ninja with a fresh build directory. "
+    "For a Visual Studio CPU-only build, set -DSAME_ENABLE_CUDA=OFF. "
+    "Do not install a CUDA Visual Studio extension to resolve this error.")
+endif()
+if(SAME_REQUIRE_CUDA AND NOT SAME_ENABLE_CUDA)
+  message(FATAL_ERROR "SAME_REQUIRE_CUDA conflicts with SAME_ENABLE_CUDA=OFF")
+endif()
+set(_same_cuda_reason "disabled by SAME_ENABLE_CUDA=OFF")
+if(SAME_ENABLE_CUDA)
+  if(WIN32 AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    set(_same_cuda_reason "Windows nvcc backend requires MSVC C/C++; selected ${CMAKE_CXX_COMPILER_ID}. Use python tools/build.py in a fresh directory for automatic MSVC discovery")
+  elseif(APPLE)
+    set(_same_cuda_reason "the CUDA backend is not supported on macOS")
+  else()
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+      enable_language(CUDA)
+      set(SAME_CUDA ON)
+    else()
+      find_program(_same_nvcc NAMES nvcc HINTS "${CUDAToolkit_ROOT}/bin"
+        "$ENV{CUDAToolkit_ROOT}/bin" "$ENV{CUDA_PATH}/bin" NO_CACHE)
+      set(_same_cuda_reason "no usable CUDA compiler was detected")
+      if(_same_nvcc OR DEFINED ENV{CUDACXX})
+        set(_same_cuda_reason "CUDA compiler candidate exists (${_same_nvcc}; CUDACXX=$ENV{CUDACXX}), but the toolchain probe failed or has a cached failure")
+        message(WARNING "${_same_cuda_reason}")
+      endif()
+      string(APPEND _same_cuda_reason ". Inspect ${CMAKE_BINARY_DIR}/CMakeFiles/CheckCUDA/CMakeFiles/ and CMakeFiles/CMakeConfigureLog.yaml (CMakeError.log on older CMake). Probe results are cached; use a fresh build directory after changing toolchains")
+    endif()
+  endif()
+endif()
+message(STATUS "same host: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} (${CMAKE_CXX_COMPILER})")
+if(SAME_CUDA)
+  message(STATUS "same backend: CUDA (${CMAKE_CUDA_COMPILER}) with CPU fallback")
+elseif(SAME_REQUIRE_CUDA)
+  message(FATAL_ERROR "CUDA required: ${_same_cuda_reason}")
+else()
+  message(STATUS "same backend: CPU; ${_same_cuda_reason}")
+endif()
