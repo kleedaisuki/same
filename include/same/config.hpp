@@ -25,9 +25,14 @@ public:
     // Negated children may require access to an otherwise ignored directory.
     // 否定规则可能需要访问原本被忽略的目录。
     bool can_prune(std::string_view relative) const;
+
 private:
-    struct Rule { std::string pattern; bool negate; bool directory; };
+    struct Rule {
+        std::string pattern;
+        bool negate;
+        bool directory;
+    };
     std::vector<Rule> rules_;
     bool has_negations_{false};
 };
-}
+} // namespace same

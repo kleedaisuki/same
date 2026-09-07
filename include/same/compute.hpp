@@ -4,12 +4,13 @@
 #include <cstdint>
 #include <memory>
 #include <span>
-#include <string>
 #include <stdexcept>
+#include <string>
 
 namespace same {
 class ComputeError : public std::runtime_error {
-public: using std::runtime_error::runtime_error;
+public:
+    using std::runtime_error::runtime_error;
 };
 using Digest = std::array<std::uint8_t, 32>;
 // One instance per worker. Input spans are bounded by the configured block size.
@@ -32,4 +33,4 @@ std::unique_ptr<Compute> make_cpu_compute();
 // CUDA 不可用时返回空；每个工作线程的显存分配不得超过预算。
 std::unique_ptr<Compute> try_cuda_compute(std::size_t block_bytes, std::size_t device_budget);
 std::string hex_digest(const Digest& digest);
-}
+} // namespace same

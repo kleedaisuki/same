@@ -25,10 +25,11 @@ public:
     FileReader& operator=(const FileReader&) = delete;
     FileStamp stamp() const;
     std::size_t read(std::span<std::byte> destination);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 bool is_reparse_point(const std::filesystem::path& path);
 FileStamp stamp_path(const std::filesystem::path& path);
-}
+} // namespace same

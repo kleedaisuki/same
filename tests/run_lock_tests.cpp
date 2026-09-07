@@ -11,16 +11,22 @@
 #endif
 namespace {
 void check(bool condition, const char* message) {
-    if (!condition) throw std::runtime_error(message);
+    if (!condition)
+        throw std::runtime_error(message);
 }
 bool rejected(const std::filesystem::path& path) {
-    try { same::RunLock lock(path); } catch (const std::exception&) { return true; }
+    try {
+        same::RunLock lock(path);
+    } catch (const std::exception&) {
+        return true;
+    }
     return false;
 }
-}
+} // namespace
 int main() {
     const auto root = std::filesystem::temp_directory_path() /
-        ("same-lock-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+                      ("same-lock-test-" +
+                       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directories(root);
     try {
         const auto path = root / "run.lock";
@@ -30,7 +36,8 @@ int main() {
 #ifndef _WIN32
             const auto child = fork();
             check(child >= 0, "fork lock contender");
-            if (child == 0) _exit(rejected(path) ? 0 : 1);
+            if (child == 0)
+                _exit(rejected(path) ? 0 : 1);
             int status{};
             check(waitpid(child, &status, 0) == child, "wait lock contender");
             check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "second process must be rejected");
@@ -39,11 +46,15 @@ int main() {
         check(std::filesystem::is_regular_file(path), "release must preserve lock inode");
         check(!rejected(path), "released lock can be acquired again");
         const auto target = root / "target";
-        { std::ofstream file(target); file << "untouched"; }
+        {
+            std::ofstream file(target);
+            file << "untouched";
+        }
         const auto link = root / "link";
         std::error_code error;
         std::filesystem::create_symlink(target, link, error);
-        if (!error) check(rejected(link), "symlink lock must be rejected");
+        if (!error)
+            check(rejected(link), "symlink lock must be rejected");
         check(std::filesystem::file_size(target) == 9, "lock must not truncate link target");
         check(rejected(root), "directory lock must be rejected");
 #ifndef _WIN32

@@ -5,7 +5,10 @@
 #include <stdexcept>
 #include <vector>
 namespace {
-struct Vector { std::size_t size; const char* hex; };
+struct Vector {
+    std::size_t size;
+    const char* hex;
+};
 // Official unkeyed vectors, BLAKE3 1.8.2 (CC0 / Apache-2.0).
 // 官方无密钥测试向量。
 // https://github.com/BLAKE3-team/BLAKE3/blob/1.8.2/test_vectors/test_vectors.json
@@ -46,7 +49,10 @@ const Vector vectors[] = {
     {31744, "62b6960e1a44bcc1eb1a611a8d6235b6b4b78f32e7abc4fb4c6cdcce94895c47"},
     {102400, "bc3e3d41a1146b069abffad3c0d44860cf664390afce4d9661f7902e7943e085"},
 };
-void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
+void require(bool ok, const char* message) {
+    if (!ok)
+        throw std::runtime_error(message);
+}
 same::Digest hash(same::Compute& compute, std::span<const std::byte> bytes, std::size_t step) {
     auto hasher = compute.hasher();
     hasher->update({});
@@ -59,14 +65,18 @@ same::Digest hash(same::Compute& compute, std::span<const std::byte> bytes, std:
 void test(same::Compute& compute) {
     for (const auto& v : vectors) {
         std::vector<std::byte> input(v.size);
-        for (std::size_t i = 0; i < input.size(); ++i) input[i] = static_cast<std::byte>(i % 251);
-        for (auto step : {std::size_t(63), std::size_t(1024), std::size_t(4097), std::size_t(1048576)})
-            require(same::hex_digest(hash(compute, input, step)) == v.hex, "official BLAKE3 vector mismatch");
+        for (std::size_t i = 0; i < input.size(); ++i)
+            input[i] = static_cast<std::byte>(i % 251);
+        for (auto step :
+             {std::size_t(63), std::size_t(1024), std::size_t(4097), std::size_t(1048576)})
+            require(same::hex_digest(hash(compute, input, step)) == v.hex,
+                    "official BLAKE3 vector mismatch");
     }
     std::vector<std::byte> a(100003, std::byte{123}), b = a;
     require(compute.equal({}, {}), "empty equality");
     require(compute.equal(a, b), "equal buffers");
-    require(!compute.equal(a, std::span<const std::byte>(b).first(b.size() - 1)), "unequal lengths");
+    require(!compute.equal(a, std::span<const std::byte>(b).first(b.size() - 1)),
+            "unequal lengths");
     for (auto offset : {std::size_t(0), std::size_t(4096), a.size() - 1}) {
         b[offset] = std::byte{12};
         require(!compute.equal(a, b), "different byte");
@@ -75,30 +85,40 @@ void test(same::Compute& compute) {
     // Non-destructive finish permits continuing incremental updates.
     // finish 不破坏状态，之后可以继续增量输入。
     auto h = compute.hasher();
-    h->update(std::span<const std::byte>(a).first(1024)); h->finish();
+    h->update(std::span<const std::byte>(a).first(1024));
+    h->finish();
     h->update(std::span<const std::byte>(a).subspan(1024));
     require(h->finish() == hash(compute, a, 137), "update after finish");
 }
-}
+} // namespace
 int main() {
     try {
-        auto cpu = same::make_cpu_compute(); test(*cpu);
+        auto cpu = same::make_cpu_compute();
+        test(*cpu);
         require(!same::try_cuda_compute(4096, 0), "zero device budget");
         auto gpu = same::try_cuda_compute(4096, 65536);
         if (gpu) {
             test(*gpu);
             std::vector<std::byte> bytes(4 * 1024 * 1024 + 113);
             std::uint32_t random = 17;
-            for (auto& b : bytes) { random = random * 1664525U + 1013904223U; b = static_cast<std::byte>(random >> 24); }
-            require(hash(*gpu, bytes, 3917) == hash(*cpu, bytes, 7001), "large random CPU/GPU mismatch");
+            for (auto& b : bytes) {
+                random = random * 1664525U + 1013904223U;
+                b = static_cast<std::byte>(random >> 24);
+            }
+            require(hash(*gpu, bytes, 3917) == hash(*cpu, bytes, 7001),
+                    "large random CPU/GPU mismatch");
             auto minimal = same::try_cuda_compute(1024, 2196);
             require(static_cast<bool>(minimal), "minimal CUDA budget");
-            require(hash(*minimal, bytes, 65536) == hash(*cpu, bytes, 7001), "minimal budget hashing");
+            require(hash(*minimal, bytes, 65536) == hash(*cpu, bytes, 7001),
+                    "minimal budget hashing");
             std::cout << "CPU + CUDA official vectors, streaming and equality passed\n";
         } else {
             require(std::getenv("SAME_REQUIRE_CUDA") == nullptr, "CUDA required but unavailable");
             std::cout << "CPU passed; CUDA unavailable (skipped)\n";
         }
         return 0;
-    } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << '\n';
+        return 1;
+    }
 }

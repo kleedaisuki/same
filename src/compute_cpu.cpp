@@ -1,14 +1,18 @@
 #include "same/compute.hpp"
-#include <blake3.h>
 #include <algorithm>
+#include <blake3.h>
 namespace same {
 namespace {
 class CpuHasher final : public Hasher {
     blake3_hasher state_{};
+
 public:
-    CpuHasher() { blake3_hasher_init(&state_); }
+    CpuHasher() {
+        blake3_hasher_init(&state_);
+    }
     void update(std::span<const std::byte> bytes) override {
-        if (!bytes.empty()) blake3_hasher_update(&state_, bytes.data(), bytes.size());
+        if (!bytes.empty())
+            blake3_hasher_update(&state_, bytes.data(), bytes.size());
     }
     Digest finish() override {
         Digest result{};
@@ -18,14 +22,20 @@ public:
 };
 class CpuCompute final : public Compute {
 public:
-    std::unique_ptr<Hasher> hasher() override { return std::make_unique<CpuHasher>(); }
+    std::unique_ptr<Hasher> hasher() override {
+        return std::make_unique<CpuHasher>();
+    }
     bool equal(std::span<const std::byte> a, std::span<const std::byte> b) override {
         return std::equal(a.begin(), a.end(), b.begin(), b.end());
     }
-    std::string name() const override { return "cpu"; }
+    std::string name() const override {
+        return "cpu";
+    }
 };
+} // namespace
+std::unique_ptr<Compute> make_cpu_compute() {
+    return std::make_unique<CpuCompute>();
 }
-std::unique_ptr<Compute> make_cpu_compute() { return std::make_unique<CpuCompute>(); }
 std::string hex_digest(const Digest& digest) {
     constexpr char digits[] = "0123456789abcdef";
     std::string result(64, '0');
@@ -35,4 +45,4 @@ std::string hex_digest(const Digest& digest) {
     }
     return result;
 }
-}
+} // namespace same

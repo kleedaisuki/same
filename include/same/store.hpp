@@ -40,8 +40,9 @@ public:
     // Only exact groups with >=2 members. Paths refer to root-relative UTF-8 strings.
     // 仅输出至少两个成员的精确相同组；路径为相对根目录的 UTF-8 字符串。
     void visit_matches(const std::function<void(std::string_view, std::string_view)>& visitor);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-}
+} // namespace same

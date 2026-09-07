@@ -1,0 +1,12 @@
+# Keep declarations readable without compressing control flow.
+# 保持声明易读，不把控制流压缩到单行；仅格式化项目自身源码。
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+BreakBeforeBraces: Attach
+PointerAlignment: Left
+SortIncludes: CaseSensitive

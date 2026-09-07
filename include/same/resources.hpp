@@ -19,9 +19,10 @@ struct Worker {
 
     // Retry the complete operation, never continue a partially computed digest.
     // 整体重试操作，绝不继续使用计算失败后的部分摘要。
-    template<class F> auto execute(F&& operation) -> std::invoke_result_t<F> {
-        try { return operation(); }
-        catch (const ComputeError&) {
+    template <class F> auto execute(F&& operation) -> std::invoke_result_t<F> {
+        try {
+            return operation();
+        } catch (const ComputeError&) {
             compute = make_cpu_compute();
             ++*fallbacks;
             return operation();
@@ -39,15 +40,20 @@ public:
     Resources(const Resources&) = delete;
     Resources& operator=(const Resources&) = delete;
 
-    template<class F> auto submit(F&& operation) -> std::future<std::invoke_result_t<F, Worker&>> {
+    template <class F> auto submit(F&& operation) -> std::future<std::invoke_result_t<F, Worker&>> {
         using Task = std::packaged_task<std::invoke_result_t<F, Worker&>(Worker&)>;
         auto task = std::make_shared<Task>(std::forward<F>(operation));
         auto future = task->get_future();
         enqueue([task](Worker& worker) { (*task)(worker); });
         return future;
     }
-    std::size_t gpu_workers() const { return gpu_workers_; }
-    std::size_t fallbacks() const { return fallbacks_.load(); }
+    std::size_t gpu_workers() const {
+        return gpu_workers_;
+    }
+    std::size_t fallbacks() const {
+        return fallbacks_.load();
+    }
+
 private:
     void enqueue(std::function<void(Worker&)> task);
     void run(Worker& worker);
@@ -62,4 +68,4 @@ private:
     std::condition_variable ready_, space_;
     bool closed_{false};
 };
-}
+} // namespace same

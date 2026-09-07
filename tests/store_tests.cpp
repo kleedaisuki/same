@@ -1,14 +1,15 @@
 #include "same/store.hpp"
-#include <sqlite3.h>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <sqlite3.h>
 #include <stdexcept>
 #include <vector>
 
 namespace {
 void check(bool condition, const char* message) {
-    if (!condition) throw std::runtime_error(message);
+    if (!condition)
+        throw std::runtime_error(message);
 }
 same::FileRecord record(std::string path, std::uint64_t size, unsigned char hash = 42) {
     same::FileRecord result;
@@ -17,10 +18,11 @@ same::FileRecord record(std::string path, std::uint64_t size, unsigned char hash
     result.digest.fill(hash);
     return result;
 }
-}
+} // namespace
 int main() {
     const auto root = std::filesystem::temp_directory_path() /
-        ("same-store-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+                      ("same-store-test-" +
+                       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directories(root);
     try {
         const auto db = root / "state.db";
@@ -36,7 +38,8 @@ int main() {
             store.save(a);
             store.save(binary);
             store.end_scan();
-            check(store.cached(binary.path)->stamp == binary.stamp, "64-bit size / binary path roundtrip");
+            check(store.cached(binary.path)->stamp == binary.stamp,
+                  "64-bit size / binary path roundtrip");
             std::vector<std::string> paths;
             store.visit_candidates([&](const auto& item) { paths.push_back(item.path); });
             check(paths == std::vector<std::string>{"a", "b"}, "candidate order and filtering");
@@ -56,7 +59,11 @@ int main() {
             store.add_representative(b);
             store.add_representative(a);
             int visited = 0;
-            store.visit_representatives([&](const auto& item) { ++visited; check(item.path == "a", "representative ordering"); return false; });
+            store.visit_representatives([&](const auto& item) {
+                ++visited;
+                check(item.path == "a", "representative ordering");
+                return false;
+            });
             check(visited == 1, "representative early stop");
             store.reset_matches();
             store.add_match("a", "b");
@@ -64,8 +71,12 @@ int main() {
             store.add_match("a", "a");
             store.add_match("c", "c");
             paths.clear();
-            store.visit_matches([&](auto rep, auto member) { check(rep == "a", "singleton exact group filtered"); paths.emplace_back(member); });
-            check(paths == std::vector<std::string>{"a", "b"}, "exact matches deduplicated ordered");
+            store.visit_matches([&](auto rep, auto member) {
+                check(rep == "a", "singleton exact group filtered");
+                paths.emplace_back(member);
+            });
+            check(paths == std::vector<std::string>{"a", "b"},
+                  "exact matches deduplicated ordered");
             store.begin_scan();
             store.save(a);
             store.end_scan();
@@ -84,10 +95,16 @@ int main() {
         }
         sqlite3* raw{};
         check(sqlite3_open(db.string().c_str(), &raw) == SQLITE_OK, "raw database open");
-        check(sqlite3_exec(raw, "PRAGMA journal_mode=WAL; PRAGMA user_version=999", nullptr, nullptr, nullptr) == SQLITE_OK, "set future version");
+        check(sqlite3_exec(raw, "PRAGMA journal_mode=WAL; PRAGMA user_version=999", nullptr,
+                           nullptr, nullptr) == SQLITE_OK,
+              "set future version");
         sqlite3_close(raw);
         bool rejected = false;
-        try { same::Store store(db); } catch (const std::runtime_error&) { rejected = true; }
+        try {
+            same::Store store(db);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
         check(rejected, "future schema rejected");
         check(sqlite3_open(db.string().c_str(), &raw) == SQLITE_OK, "reopen future database");
         std::string mode;
@@ -95,7 +112,8 @@ int main() {
             *static_cast<std::string*>(context) = values[0];
             return 0;
         };
-        check(sqlite3_exec(raw, "PRAGMA journal_mode", capture, &mode, nullptr) == SQLITE_OK, "query preserved journal mode");
+        check(sqlite3_exec(raw, "PRAGMA journal_mode", capture, &mode, nullptr) == SQLITE_OK,
+              "query preserved journal mode");
         sqlite3_close(raw);
         check(mode == "wal", "future database journal mode modified");
         std::filesystem::remove_all(root);

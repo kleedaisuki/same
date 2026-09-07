@@ -11,8 +11,9 @@ public:
     ~RunLock();
     RunLock(const RunLock&) = delete;
     RunLock& operator=(const RunLock&) = delete;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-}
+} // namespace same
