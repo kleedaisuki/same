@@ -1,8 +1,8 @@
 # same
 
-**在当前工作目录查找字节完全相同的文件；不会删除或改写用户文件。**
+**在当前工作目录查找字节完全相同的文件；扫描不会删除或改写输入文件。**
 
-**Find byte-identical files below the working directory; never delete or rewrite user files.**
+**Find byte-identical files in the working directory; scanning never deletes or rewrites input files.**
 
 C++23 · BLAKE3 · SQLite · optional CUDA。扫描目录 → 只为新增或元数据变化的文件计算 BLAKE3 → 对相同大小和摘要的候选文件逐字节比较。相同摘要不是相同内容的证明。
 
@@ -53,17 +53,36 @@ Native configuration preserves the chosen generator. Use the script above for cr
 Run the installed executable **from the directory to scan**:
 
 ```sh
-same
-same --cpu
-same --rehash
-same --cpu --rehash
+same                            # 等同 same scan，仅当前目录 / same scan, root files only
+same scan -r                    # 递归子目录 / include subdirectories
+same scan --cpu --rehash         # CPU 强制重新哈希 / CPU, bypass digest cache
+same scan -r --summary           # 显示汇总、数据库与性能统计 / show all statistics
+same new                        # 生成标准配置与推荐忽略规则 / deploy defaults and ignore
+same clean                      # 删除当前 .same / remove this directory's .same
+same clean -r                   # 也删除子目录中的 .same / remove descendant states too
 same --help
 same --version
 ```
 
-`--cpu` 覆盖后端配置；`--rehash` 忽略本次扫描的摘要缓存。没有目录参数。
+`same` 默认分发到 `same scan`；未写子命令的扫描选项仍有效，如 `same -r --cpu`。扫描默认**不进入子目录**，仅 `-r` / `--recursive` 开启递归。`--cpu` 覆盖后端配置，`--rehash` 忽略本轮摘要缓存。所有子命令以当前工作目录为根，没有目录参数。递归扫描后执行浅扫描会淘汰本轮未访问的子目录缓存；再次递归时重新建立这些缓存，旧子目录结果不会混入浅扫描。
 
-`--cpu` overrides the backend; `--rehash` bypasses cached digests for this run. There is no directory argument.
+`same` dispatches to `same scan`; implicit scan options such as `same -r --cpu` remain valid. Scans are **nonrecursive by default**; `-r` / `--recursive` enables descent. CPU overrides the backend; rehash bypasses this run's digest cache. Commands use the current directory, without a directory argument. A shallow scan prunes unseen descendant cache records from an earlier recursive scan; a later recursive scan rebuilds them rather than leaking stale results.
+
+### 初始化与清理 / Initialize and clean
+
+`same new` 创建 `.same/config.toml`（写全本机实际默认值）与 `.same/ignore`（推荐规则），**保留已有文件，不覆盖用户设置**。推荐规则排除版本控制元数据与操作系统目录元数据；`build/`、`node_modules/`、`.venv/` 仅以注释提供，不默认隐藏可能需要去重的内容。无需先运行 `new` 才能扫描：缺少配置时扫描使用内建默认值。
+
+`same new` writes all host-resolved defaults and a recommended ignore file, **preserving existing files**. Recommendations exclude version-control and OS metadata; build/dependency directory rules are commented opt-ins. Initialization is optional: scans use built-in defaults when configuration is absent.
+
+**`same clean` 会删除配置、忽略规则和缓存，不只是数据库；需要保留自定义配置时请先备份。** 默认仅删除当前目录的 `.same`；`-r` / `--recursive` 同时清理普通子目录中的所有 `.same`，不受扫描 ignore 限制。不跟随符号链接或 Windows 重解析点（reparse point）；链接形式的 `.same` 会被拒绝，不会跳转删除其目标。运行锁冲突会失败。递归清理不是事务：后续目录失败时，先前完成的清理不会回滚。
+
+**Clean removes configuration, ignore rules and cache, not only the database; back up custom settings first.** Default clean targets the root state only; recursive clean finds descendant states independently of scan ignore rules. It does not follow symlinks/reparse points and refuses a linked `.same`. Lock conflicts fail. Recursive cleanup is not transactional: an error does not restore states already removed.
+
+清理使用原生目录句柄固定删除范围；目录被并发替换时允许安全失败，而不会沿替换链接删除外部目标。POSIX 扫描、初始化与清理共同锁住工作目录本身，删除 `.same` 不会解除互斥。请先停止旧版进程再升级使用 `clean`：旧版 POSIX 进程不遵守新增生命周期锁协议。
+
+Cleanup uses native directory capabilities to prevent link-redirection. Concurrent changes may fail safely. POSIX scan, initialization and cleanup lock the surviving workspace directory itself; deleting `.same` does not split lock identity. Stop older processes before using the upgraded cleaner: older POSIX versions lack this lifecycle protocol.
+
+输出遵循结果与诊断分离、显式选择详细统计的原则，参考 [Command Line Interface Guidelines](https://clig.dev/)。 / Results and diagnostics remain separate, with detailed statistics opt-in, informed by the CLI guidelines.
 
 重定向或 `--format=tsv` 时，标准输出每行是 `组号<TAB>带双引号的相对路径`，只输出至少两个成员的精确重复组。路径使用 `/`，引号和反斜杠转义，控制字节表示为 `\u00xx`。组号仅属于本次结果，不是稳定标识。
 
@@ -76,15 +95,15 @@ When redirected or using `--format=tsv`, each stdout line is `group-number<TAB>q
 2	"empty-b"
 ```
 
-上述列之间实际为制表符。统计信息和诊断写入 stderr：`scanned`、`hashed`、`cached`、`groups`、`matches`、`gpu_workers`、`cpu_fallbacks`。退出码 **0** 表示扫描完成，无论是否发现重复；**2** 表示失败。输出设备故障可能留下部分输出，必须检查退出码。
+上述列之间实际为制表符。只有 `--summary` 才输出统计信息，写入 stderr：`scanned`、`hashed`、`cached`、`groups`、`matches`、`gpu_workers`、`cpu_fallbacks`。退出码 **0** 表示扫描完成，无论是否发现重复；**2** 表示失败。输出设备故障可能留下部分输出，必须检查退出码。
 
-Columns above are separated by actual tabs. Statistics and diagnostics go to stderr. Exit **0** means a completed scan, with or without duplicates; **2** means failure. Output-device failure can leave partial output; always check the exit code.
+Columns above are separated by actual tabs. Statistics require `--summary` and go to stderr; warnings and errors remain visible without it. Exit **0** means a completed scan, with or without duplicates; **2** means failure. Output-device failure can leave partial output; always check the exit code.
 
 ### 终端展示与着色 / Terminal presentation and color
 
-交互终端默认只按组展示绿色 `[SAME]` 文件，并显示彩色 Summary 与 Profile。未找到副本的文件默认折叠，只有加上 `--unique-files` 才展开黄色 `[UNIQUE]` 列表；Summary 仍显示其数量和展开提示。`UNIQUE` 仅表示**本次扫描范围内未找到副本**，不是错误，也不是与某个指定文件的差异报告。忽略规则排除的文件不参与判断；摘要缓存仍遵循下文的信任边界。所有路径沿用 TSV 的转义规则，文件名中的控制字符不会变成终端指令。
+交互终端默认只按组展示绿色 `[SAME]` 文件；仅 `--summary` 显示 Summary、Database 与 Profile。未找到副本的文件默认折叠，只有加上 `--unique-files` 才展开黄色 `[UNIQUE]` 列表；开启 Summary 时显示其数量和展开提示。`UNIQUE` 仅表示**本次扫描范围内未找到副本**，不是错误，也不是与某个指定文件的差异报告。忽略规则排除的文件不参与判断；摘要缓存仍遵循下文的信任边界。所有路径沿用 TSV 的转义规则，文件名中的控制字符不会变成终端指令。
 
-Interactive terminals show green `[SAME]` groups and colored Summary/Profile sections. Unmatched paths are hidden by default; `--unique-files` expands the yellow `[UNIQUE]` list. Summary retains the unmatched count and expansion hint. UNIQUE means **no duplicate found within this scan**, not an error or a pairwise diff. Ignored files are outside the comparison scope; the cache trust boundary below still applies. Paths use the same escaping as TSV, including terminal control characters.
+Interactive terminals show green `[SAME]` groups; `--summary` opts into Summary, Database and Profile sections. Unmatched paths are hidden by default; `--unique-files` expands the yellow `[UNIQUE]` list. When enabled, Summary retains the unmatched count and expansion hint. UNIQUE means **no duplicate found within this scan**, not an error or a pairwise diff. Ignored files are outside the comparison scope; the cache trust boundary below still applies. Paths use the same escaping as TSV, including terminal control characters.
 
 ```sh
 same --unique-files               # 展开未找到副本的文件 / expand unmatched paths
@@ -93,19 +112,18 @@ same --color=never                # 无色，但保留终端排版 / plain termi
 same --format=pretty --color=never # 在日志中保留可读排版 / readable plain logs
 same --format=tsv --color=never    # 固定脚本格式 / stable script format
 same --color=always               # 显式强制 ANSI / explicitly force ANSI
-same > matches.tsv 2> profile.log # 结果与统计分离 / separate results and statistics
+same --summary > matches.tsv 2> profile.log # 结果与统计分离 / separate results and statistics
 ```
+
+Summary、Database、Profile 以及下文所有性能字段均须 `--summary` 才输出；该开关不隐藏警告或错误。 / All statistics below require `--summary`; warnings and errors remain independent.
 
 `--format=auto|pretty|tsv` 与 `--color=auto|always|never` 相互独立，均为命令行选项，不写入 TOML。自动颜色遵循非空 `NO_COLOR`、`TERM=dumb` 和各标准流是否连接终端；重定向默认无色并保留原 TSV。Windows 自动尝试启用虚拟终端（Virtual Terminal, VT）处理，不支持时降级无色，退出时恢复控制台模式。显式 `always` 会覆盖环境提示，即使重定向也输出 ANSI 控制码；`never` 始终无色。stdout 与 stderr 独立检测：自动模式下，重定向结果不影响终端中的 Profile，重定向统计也不会带入颜色。`--format=tsv` 始终保留原始统计字段；`--format=pretty` 显式选择可读报告与智能单位，重定向时默认仍无色。
 
 Format and color are independent CLI-only options. Auto color honors nonempty `NO_COLOR`, `TERM=dumb`, and independent stdout/stderr terminal detection. Redirected output stays plain legacy TSV. Windows enables VT processing when supported and restores the console mode on exit. Explicit `always` overrides environment hints, including redirection; `never` suppresses all color. Auto mode formats/colors each stream independently: redirecting results does not disable a terminal Profile, and redirecting diagnostics keeps raw uncolored metrics. `--format=tsv` preserves raw profile fields; `--format=pretty` explicitly selects human-readable units, still uncolored by default under redirection.
 
-下面示例使用 `same --unique-files`；默认不显示 UNIQUE 段。 / This example uses `same --unique-files`; the UNIQUE section is hidden by default.
+下面示例使用 `same scan -r --unique-files --summary --format=pretty`；默认不显示 UNIQUE 与统计段。 / This example explicitly enables recursive scan, unmatched paths and statistics in pretty format.
 
 ```text
-same | exact duplicate report
------------------------------
-
 [SAME] Group 1
   "copies/a.txt"
   "original.txt"
@@ -113,23 +131,29 @@ same | exact duplicate report
 [UNIQUE] No duplicate in this scan
   "notes.txt"
 
-Summary | 1 groups | 2 matching files | 1 unique files
-  Database | .same/state.db | 32.00 KiB | 3 records | committed
+Summary
+-----------------------------------------
+  Groups          1
+  Matching files  2
+  Unique files    1
+  Database        .same/state.db | 32.00 KiB | 3 records | committed
+  Files           3 scanned | 3 hashed | 0 cached
+  ...
 ```
 
-Summary 下的彩色 `Database` 行显示 `.same/state.db` 主文件长度、本轮提交后的文件记录数和 `committed` 状态。示例中的大小仅为示意，实际值动态读取，包含数据库内部可复用空间，不含日志、临时数据库或物理磁盘分配开销。`committed` 表示扫描事务成功提交，不表示执行过完整性检查。机器统计在 stderr 另起一行输出 `database_bytes` 和 `database_records`，默认 TSV 结果不变。
+Summary 表中的 `Database` 行显示 `.same/state.db` 主文件长度、本轮提交后的文件记录数和 `committed` 状态。示例中的大小仅为示意，实际值动态读取，包含数据库内部可复用空间，不含日志、临时数据库或物理磁盘分配开销。`committed` 表示扫描事务成功提交，不表示执行过完整性检查。机器统计在 stderr 另起一行输出 `database_bytes` 和 `database_records`，默认 TSV 结果不变。
 
-The colored Database row shows the main `.same/state.db` file length, committed file-record count, and `committed` status. The example size is illustrative; the actual size is measured, includes internal reusable space, and excludes journals, temporary databases and physical allocation overhead. Committed means the scan transaction succeeded, not that an integrity check was performed. Machine diagnostics add `database_bytes` and `database_records` on a separate stderr line; default TSV results remain unchanged.
+The Database table row shows the main `.same/state.db` file length, committed file-record count, and `committed` status. The example size is illustrative; the actual size is measured, includes internal reusable space, and excludes journals, temporary databases and physical allocation overhead. Committed means the scan transaction succeeded, not that an integrity check was performed. Machine diagnostics add `database_bytes` and `database_records` on a separate stderr line; default TSV results remain unchanged.
 
 在 TSV 模式下显式使用 `--unique-files`，会在正常重复组后追加 `0<TAB>quoted-path` 行，组号 **0** 表示未找到副本，不表示这些文件彼此相同。默认 TSV 完全不变。
 
 With explicit `--unique-files` in TSV mode, unmatched paths follow the duplicate groups as `0<TAB>quoted-path`. Reserved group **0** means unmatched, not equality among those paths. Default TSV is unchanged.
 
-### 性能统计 / Profiling
+### 汇总与性能统计 / Summary
 
-每次成功扫描都在 stderr 输出统计；重定向到扫描根目录之外即可保存。机器模式的旧计数行保持不变，新增 `key=value` 字段另起一行；可读模式使用对齐的标签、彩色标题/数值与自适应单位，不再混排原始字段。字节与速率自动使用 B、KiB、MiB、GiB 等二进制单位，耗时自动使用 ns、us、ms、s、min 或 h；机器字段仍是精确字节数和固定毫秒。无需高频计时或每块原子操作：读取量由各工作线程独占累计，所有任务完成后求和。
+只有添加 `--summary` 的成功扫描才在 stderr 输出统计；重定向到扫描根目录之外即可保存。机器模式的旧计数行保持不变，新增 `key=value` 字段另起一行；可读模式使用对齐的标签、彩色标题/数值与自适应单位，不再混排原始字段。字节与速率自动使用 B、KiB、MiB、GiB 等二进制单位，耗时自动使用 ns、us、ms、s、min 或 h；机器字段仍是精确字节数和固定毫秒。无需高频计时或每块原子操作：读取量由各工作线程独占累计，所有任务完成后求和。
 
-Successful scans emit statistics to stderr; redirect outside the scan root to retain a log. Machine mode retains the legacy counter line and new `key=value` metrics on a separate line. Pretty mode uses aligned labels, colored headings/values and adaptive units instead of raw fields: B/KiB/MiB/GiB and higher binary units for data/rates, ns/us/ms/s/min/h for durations. Machine metrics retain exact byte counts and milliseconds. Workers accumulate read bytes locally, then totals are collected after all jobs finish; there are no per-block atomic operations or timers.
+Successful scans emit statistics to stderr only with `--summary`; redirect outside the scan root to retain a log. Machine mode retains the legacy counter line and new `key=value` metrics on a separate line. Pretty mode uses aligned labels, colored headings/values and adaptive units instead of raw fields: B/KiB/MiB/GiB and higher binary units for data/rates, ns/us/ms/s/min/h for durations. Machine metrics retain exact byte counts and milliseconds. Workers accumulate read bytes locally, then totals are collected after all jobs finish; there are no per-block atomic operations or timers.
 
 | 字段 / Field | 口径 / Meaning |
 |---|---|
@@ -171,7 +195,11 @@ Precedence: defaults → TOML → CLI. Unknown keys, wrong types, and invalid bu
 The configuration file is capped at 64 KiB; integer settings reject implicit conversions such as `2.0` or booleans.
 
 ```toml
+# 示例为 4 个内容线程；same new 写入本机实际默认值。 / Four-worker example; new resolves host defaults.
 workers = 4
+metadata_workers = 4
+gpu_probe_bytes = 4294967296
+gpu_min_bytes = 16777216
 block_bytes = 1048576
 memory_bytes = 67108864
 device_memory_bytes = 67108864
@@ -183,6 +211,9 @@ rehash = false
 | 字段 / Field | 默认 / Default | 约束 / Constraint |
 |---|---|---|
 | `workers` | 硬件并发数限制在 1–8 / hardware concurrency clamped to 1–8 | 1–256 |
+| `metadata_workers` | `min(workers, 4)` | 1–256；独立的目录与元数据线程 / separate directory and metadata workers |
+| `gpu_probe_bytes` | 4294967296 (4 GiB) | 自动探测所需未处理逻辑字节；非RAM分配，0仅供对照 / Pending bytes before auto exploration, not RAM; zero for ablation |
+| `gpu_min_bytes` | 16777216 (16 MiB) | 非负整数；小于阈值走 CPU SIMD，0 禁用大小路由 / smaller files use CPU SIMD; 0 disables size routing |
 | `block_bytes` | 1048576 (1 MiB) | 1024 的正整数倍，最大 64 MiB / positive multiple of 1024, ≤64 MiB |
 | `memory_bytes` | 67108864 (64 MiB) | ≥ `workers * (2*block_bytes + block_bytes/32 + 4096)` |
 | `device_memory_bytes` | 67108864 (64 MiB) | 正整数 / positive integer |
@@ -190,9 +221,37 @@ rehash = false
 | `backend` | `"auto"` | `"auto"`, `"cpu"`, `"cuda"` |
 | `rehash` | `false` | 布尔值 / boolean |
 
-`auto` 和 `cuda` 都尝试 CUDA，并在不可用、预算不足或计算失败时回退 CPU；`cuda` **不是强制成功、否则退出的模式**。计算失败会从头重试整个文件操作，不会拼接 CPU/GPU 的部分摘要。GPU 不保证更快：传输、启动和同步成本可能超过计算收益，应在真实文件分布上测量。
+`auto` 默认只启动CPU，暂存的大文件逻辑字节达到 `gpu_probe_bytes`（默认4GiB）才探索GPU。小文件、短扫描及全缓存扫描不付CUDA初始化费用。实际块/显存预算下，串行配对样本须GPU至少快20%，多文件还测真实CPU/混合池；预计收益须覆盖两倍设置和探测费用，才启用一路GPU，其余线程仍CPU。`cuda` 保留显式CUDA请求和大小下界；二者计算失败仍完整重试CPU，不混用半个摘要。
 
-Both `auto` and `cuda` attempt CUDA and fall back on unavailability, insufficient budget, or compute failure. `cuda` is **not** a strict GPU-required mode. A failed operation is retried from the beginning. GPU acceleration is not a speed guarantee; transfers, launches, and synchronization may dominate.
+Auto starts CPU-only and explores GPU only when bounded, unprocessed large-file work reaches the 4GiB default trigger. Serial probes must win by 20%; multi-file work also measures the real mixed pool, and estimated savings must cover twice the setup/probe cost. At most one GPU worker is enabled. Explicit CUDA keeps its user-selected size floor and full CPU error retry.
+
+### 有界扫描流水线 / Bounded scanning pipeline
+
+目录枚举与文件元数据构成动态任务图：`metadata_workers` 个线程共享有界任务队列，满时就地深度优先处理，不等待递归提交。结果流入单线程数据库协调器，缓存未命中交给 `workers` 个内容工作线程。哈希按完成顺序收取，慢首任务不阻塞后完成结果。`queue_capacity` 分别约束遍历任务、遍历结果和未收取哈希任务；它不是所有队列合计的容量。
+
+Directory and file-metadata work form a dynamic task graph. Metadata workers share a bounded queue and process overflow depth-first instead of blocking on recursive submission. A single-owner database coordinator checks cache records and sends misses to content workers. Hash results are consumed in completion order. `queue_capacity` independently bounds traversal tasks, traversal results and unconsumed hash jobs, not their aggregate sum.
+
+元数据取得的打开句柄直接移交给哈希，缓存命中则关闭，减少重复打开；读取前后的新鲜文件戳与路径绑定检查仍保留。每个结果最多携带一个打开句柄；队列之外还包括执行中的线程及深度优先目录游标，因此预算不是句柄数或进程内存的硬限制。
+
+Metadata handles transfer directly to hashing or close on cache hits, avoiding a duplicate open while retaining fresh pre/post-read object and path-binding checks. Each result carries at most one open file; active workers and depth-first directory cursors add resources outside queue lengths. Budgets are not hard handle/process-memory limits.
+
+小文件默认走 CPU SIMD，`cpu_routed_hashes` 统计此策略的哈希尝试数，不算错误回退。`gpu_min_bytes` 是用户下界而非保证 GPU 更快的交叉点；自动模式还要求至少一个完整配置块，`gpu_min_bytes=0` 不会关闭自动收益检查，显式 `backend="cuda"` 才绕过性能门槛。精确字节比较始终使用主机缓冲区。
+
+Small files use CPU SIMD; policy counts are separate from error fallbacks. The user size floor is not a proven crossover. Auto also requires at least one full configured block, and `gpu_min_bytes=0` does not bypass its profitability gate; explicit `backend="cuda"` does. Exact comparisons remain host-side.
+
+分界取决于文件大小、单次块大小、显存预算和并发。新的 ncu 驱动优化后，同样 64 MiB 输入，16 MiB 更新块可让 GPU 胜过 CPU，而 1 MiB 更新块不具相同优势。旧的固定 16 MiB 文件阈值不能表达这个差异。探测使用2秒软预算，完整操作后检查，不强行中断驱动；费用计入Scan/Elapsed，摘要不一致直接失败。
+
+The decision depends on file size, update block size, device budget and concurrency. After ncu-driven optimization, 64 MiB input with 16 MiB updates can favor GPU while 1 MiB updates do not show the same benefit. Auto uses a two-second soft probe budget, charged to Scan/Elapsed; it checks after complete operations and never suppresses digest mismatches.
+
+`cpu_hashes` / `gpu_hashes` 报告实际文件哈希尝试数，不含校准；`auto_backend`、`gpu_setup_ms`、`calibration_ms` 和 `probe_*_ms` 字段展示决策证据。单实例校准不是整盘加速证明；短扫描或全缓存扫描可显式选择 CPU 避免探测费用。详见[自动分派契约](docs/auto-dispatch.md)、[ncu 证据](docs/gpu-profiling.md)与[实测分派基准](docs/dispatch-benchmark.md)。
+
+Actual CPU/GPU hash attempts exclude calibration; `auto_backend`, `calibration_ms`, and four `probe_*_ms` fields expose the decision evidence. A single-instance probe does not prove whole-drive speedup. Explicit CPU avoids probing for short or fully cached scans.
+
+新增统计：`walk_wait_ms` 是协调线程等待遍历结果的时间；`enumerate_work_ms`、`metadata_work_ms` 是各工作线程累计时间，不应与总耗时相加；`database_work_ms` 为扫描协调器数据库操作时间。旧 `scan_work_ms` 字段仍为 `scan_ms - hash_wait_ms`，现在包含等待元数据的时间，不是 CPU 工作时间。`walk_task_peak`、`walk_result_peak` 显示队列峰值。
+
+New metrics separate coordinator walk wait, summed enumeration/metadata worker time, coordinator database work, and traversal queue peaks. Legacy `scan_work_ms = scan_ms - hash_wait_ms` is retained and includes metadata waiting, not CPU execution time. Summed worker times overlap and must not be added to elapsed time.
+
+研究、实现与复现实验 / Research and reproducibility: [遍历调度](docs/traversal-optimization.md)、[小文件 I/O](docs/small-file-io.md)、[GPU 融合](docs/gpu-optimization.md)、[数据库](docs/store-optimization.md)、[扫描基准](docs/scan-benchmark.md)。
 
 **预算不是进程内存硬上限。** `memory_bytes` 约束工作线程的数据缓冲和计算暂存；SQLite 主/临时缓存各配置约 2 MiB，任务路径等元数据受队列数量约束，但不包含在该预算中。线程栈、驱动上下文、分配器和操作系统文件缓存也不包含。显存预算仅约束程序显式设备分配，不包含驱动开销。详见设计文档。
 
@@ -200,27 +259,34 @@ Both `auto` and `cuda` attempt CUDA and fall back on unavailability, insufficien
 
 ## 忽略规则 / Ignore rules
 
-这是明确界定的 glob 子集，**不是完整 `.gitignore` 兼容实现**。按大小写敏感的路径字节匹配，即使在 Windows 上也是如此。
+忽略文件固定为扫描根目录下的 `.same/ignore`，采用 [Git 官方 gitignore 模式语法](https://git-scm.com/docs/gitignore)。规则相对于**扫描根目录**，不是 `.same` 内部。不会加载根目录或子目录中的 `.gitignore`、Git 全局配置或索引；这是模式语义兼容，不是 Git 多来源规则发现机制。匹配区分大小写（Windows 也一样），以路径字节为单位。
 
-This is a defined glob subset, **not full `.gitignore` compatibility**. Matching is case-sensitive over path bytes, including on Windows.
+The sole source is root `.same/ignore`, using Git's pattern syntax relative to the **scan root**. Root/nested `.gitignore` files, global Git configuration and the Git index are not loaded. Matching is case-sensitive over path bytes, including on Windows; pattern compatibility does not imply Git's multi-source discovery.
 
 ```text
-# build outputs / 构建输出
+# 构建产物 / Build outputs
 build/
 *.tmp
 /cache/**
 !important.tmp
+# 保留父目录，才能恢复其中文件 / Keep the parent traversable to restore a child
+scratch/*
+!scratch/keep.txt
+# 字面井号与字符类 / Literal hash and character class
+\#notes
+log[0-9].txt
 ```
 
-- `#` 开头为注释，空行忽略；不剥离空格，不提供反斜杠转义或 `[]` 字符类。 / Leading `#` comments and empty lines are ignored; spaces are literal; no backslash escaping or `[]` classes.
-- `*` 匹配不含 `/` 的任意字节串，`?` 匹配一个非 `/` 字节，`**` 可跨目录，`**/` 也可匹配零层目录。 / `*` stays within a component, `?` matches one non-slash byte, `**` crosses directories, and `**/` can match zero directories.
-- 前导 `/` 锚定根目录；没有 `/` 的未锚定规则匹配任意层级的名称；包含 `/` 的规则相对根目录。尾部 `/` 限定目录及其后代。 / Leading `/` anchors at root; unanchored slash-free patterns match names at any depth; patterns containing `/` are root-relative; trailing `/` selects directories and descendants.
-- `!` 重新包含匹配项，最后匹配的规则胜出。存在任何否定规则时保守遍历被忽略目录，以发现可重新包含的子项；否则可剪枝。 / `!` re-includes; the last matching rule wins. With any negation, ignored directories are traversed conservatively; otherwise they may be pruned.
-- `.same` 始终排除，不能重新包含。忽略文件最大 1 MiB、最多 4096 条有效规则。 / `.same` is always excluded and cannot be re-included. Limits: 1 MiB ignore file and 4096 effective rules.
+- 空行忽略，前导 `#` 为注释；`\#`、`\!` 匹配字面字符；反斜杠转义，未转义的尾部空格剥离。 / Empty lines and leading comments are ignored; backslashes escape characters and unescaped trailing spaces are stripped.
+- `*`、`?` 不跨 `/`；支持 `[]` 字符类及范围；`**/`、`/**/`、`/**` 表达跨目录匹配。 / Wildcards stay within components; bracket classes/ranges and directory globstars are supported.
+- 前导或中间 `/` 使模式相对于根；无此分隔符的模式匹配任意层级名称；尾部 `/` 仅匹配目录。 / Leading/interior slashes anchor patterns; slash-free names match any depth; trailing slashes restrict matches to directories.
+- 最后匹配规则胜出；`!` 取消忽略，但**不能恢复仍被忽略的父目录内的文件**。例如 `scratch/` 后跟 `!scratch/keep.txt` 无效，应改为上面的 `scratch/*`，或先恢复父目录。被忽略目录直接剪枝。 / Last match wins, but negation cannot restore children of an excluded parent; excluded directories are pruned.
+- `.same` 始终排除且不可重新包含。忽略文件最大 1 MiB、最多 4096 条有效规则。 / `.same` cannot be re-included; limits are 1 MiB and 4096 effective rules.
 
 ## 正确性边界 / Correctness boundaries
 
 - 只处理普通文件，不跟随符号链接或 Windows 重解析点（reparse point）；状态目录必须是真实目录，其等价路径也排除。 / Only regular files are processed; symlinks and Windows reparse points are not followed; the real state directory and equivalent paths are excluded.
+- Windows 长路径：可执行文件声明 `longPathAware`，原生属性查询、读取及运行锁使用扩展长度路径；输出与缓存路径保持不变。完整扫描仍要求 Windows 启用 `LongPathsEnabled`，以覆盖 CRT/STL 文件操作；程序不会修改系统策略。 / Windows long paths: executables declare `longPathAware`; native attribute queries, reads and run locks use extended-length paths without changing output or cache keys. Full scans still require Windows `LongPathsEnabled` for CRT/STL operations; the program never modifies system policy.
 - 硬链接（hard link）的不同路径可以出现在同一组；成员数不是可回收空间估计。 / Multiple hard-link paths may be reported; member counts do not estimate reclaimable bytes.
 - 增量缓存依赖大小、文件身份、修改和变更时间。这是元数据启发式（metadata heuristic），不是对抗性内容认证；异常时间语义可能导致漏报。 / Incremental reuse uses size, identity, modification/change timestamps. This is a metadata heuristic, not adversarial content authentication; unusual timestamp semantics can cause missed candidates.
 - 候选文件即使全部命中缓存，每次仍精确比较。因此重复扫描不是零内容读取。 / Even fully cached duplicate candidates are byte-compared on every run; repeat scans are not zero-content-I/O.

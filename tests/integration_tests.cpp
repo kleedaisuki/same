@@ -242,8 +242,9 @@ struct Fixture {
     }
     /// 校验退出码、组编号、统计字段与输出一致性。 / Validate exit status, group IDs and
     /// output/counter consistency.
-    Groups run(int code = 0) {
-        const auto actual = execute(exe, root, base / "stdout", base / "stderr");
+    Groups run(int code = 0,
+               const std::vector<std::string>& arguments = {"scan", "-r", "--summary"}) {
+        const auto actual = execute(exe, root, base / "stdout", base / "stderr", arguments);
         const auto output = read(base / "stdout");
         const auto errors = read(base / "stderr");
         check(actual == code, "exit code " + std::to_string(actual) + ": " + errors);
@@ -406,6 +407,26 @@ void paths(const fs::path& exe) {
     unicode.file(chinese, "unicode");
     unicode.file(japanese, "unicode");
     unicode.expect({group({chinese, japanese})});
+#ifdef _WIN32
+    // 长目录与中文文件名必须贯穿扫描、哈希、输出及缓存复用。
+    // Long directories and Unicode names must survive scanning, hashing, output and cache reuse.
+    Fixture long_paths(exe);
+    const std::string deep = std::string(100, 'a') + "/" + std::string(100, 'b') + "/论文资料/" +
+                             std::string(60, 'c') + ".pdf";
+    const fs::path extended(L"\\\\?\\" +
+                            (long_paths.root / native_path(deep)).make_preferred().native());
+    fs::create_directories(extended.parent_path());
+    {
+        std::ofstream file(extended, std::ios::binary);
+        file << "long path content";
+        check(bool(file), "create long path fixture");
+    }
+    long_paths.file("copy.pdf", "long path content");
+    long_paths.expect({group({deep, "copy.pdf"})});
+    check(long_paths.stats["hashed"] == 2, "long path cold scan");
+    long_paths.expect({group({deep, "copy.pdf"})});
+    check(long_paths.stats["cached"] == 2, "long path warm scan");
+#endif
 #ifndef _WIN32
     Fixture controls(exe);
     for (auto name : {"line\nbreak", "tab\tand\"quote", "back\\slash"})
@@ -538,7 +559,8 @@ void presentation(const fs::path& exe) {
           "explicit TSV failed");
     check(read(f.base / "stdout") == legacy, "explicit TSV changed bytes");
     check(execute(exe, f.root, f.base / "stdout", f.base / "stderr",
-                  {"--color=always", "--format=pretty", "--unique-files"}) == 0,
+                  {"scan", "-r", "--summary", "--color=always", "--format=pretty",
+                   "--unique-files"}) == 0,
           "forced pretty failed");
     const auto colored = read(f.base / "stdout");
     check(colored.find("\033[32m") != std::string::npos &&
@@ -547,7 +569,7 @@ void presentation(const fs::path& exe) {
     check(colored.find("[UNIQUE]") != std::string::npos &&
               colored.find("\"unique\"") != std::string::npos,
           "unique file missing");
-    check(read(f.base / "stderr").find("\033[1;36mProfile") != std::string::npos,
+    check(read(f.base / "stderr").find("\033[1;36mSummary") != std::string::npos,
           "profile color missing");
     check(execute(exe, f.root, f.base / "stdout", f.base / "stderr",
                   {"--color=never", "--format=pretty"}) == 0,
@@ -559,21 +581,123 @@ void presentation(const fs::path& exe) {
           "unique not folded by default");
     check(read(f.base / "stderr").find('\033') == std::string::npos, "never colored profile");
     check(execute(exe, f.root, f.base / "stdout", f.base / "stderr",
-                  {"--unique-files", "--format=tsv", "--color=never"}) == 0,
+                  {"scan", "-r", "--summary", "--unique-files", "--format=tsv", "--color=never"}) ==
+              0,
           "unique TSV failed");
     check(read(f.base / "stdout").find("0\t\"unique\"") != std::string::npos, "unique TSV missing");
     check(read(f.base / "stderr").find("elapsed_ms=") != std::string::npos, "raw profile changed");
+}
+
+/// 默认浅扫描、显式递归和诊断开关必须保持独立。 / Keep shallow defaults, recursion and diagnostics
+/// independent.
+void scan_commands(const fs::path& exe) {
+    Fixture f(exe);
+    f.file("a", "same");
+    f.file("b", "same");
+    f.file("nested/c", "same");
+    f.file("nested/deeper/d", "same");
+    check(execute(exe, f.root, f.base / "stdout", f.base / "stderr") == 0, "default scan failed");
+    const auto shallow = read(f.base / "stdout");
+    check(shallow == "1\t\"a\"\n1\t\"b\"\n" || shallow == "1\t\"a\"\r\n1\t\"b\"\r\n",
+          "default scan must omit nested files");
+    check(read(f.base / "stderr").empty(), "default emitted diagnostics");
+    check(execute(exe, f.root, f.base / "stdout", f.base / "stderr", {"scan"}) == 0,
+          "explicit shallow scan failed");
+    check(read(f.base / "stdout") == shallow && read(f.base / "stderr").empty(),
+          "same differs from same scan");
+    check(f.run(0, {"scan", "-r", "--summary"}) ==
+              Groups{group({"a", "b", "nested/c", "nested/deeper/d"})},
+          "recursive scan omitted descendants");
+    check(f.stats["scanned"] == 4, "recursive scan count");
+    check(f.run(0, {"scan", "--summary"}) == Groups{group({"a", "b"})},
+          "recursive cache leaked into shallow result");
+    check(f.stats["scanned"] == 2, "shallow cache scan count");
+    check(f.run(0, {"scan", "-r", "--summary"}) ==
+              Groups{group({"a", "b", "nested/c", "nested/deeper/d"})},
+          "recursive rescan failed");
+    for (const auto& arguments : std::vector<std::vector<std::string>>{
+             {"scan", "-r"}, {"scan", "--format=pretty", "--color=never"}}) {
+        check(execute(exe, f.root, f.base / "stdout", f.base / "stderr", arguments) == 0,
+              "quiet scan failed");
+        check(read(f.base / "stderr").empty(), "scan without summary emitted diagnostic panels");
+    }
+}
+
+/// 初始化及清理命令实际分发至生命周期实现。 / Dispatch initialization and cleanup to lifecycle
+/// operations.
+void lifecycle_commands(const fs::path& exe) {
+    Fixture f(exe);
+    fs::remove_all(f.root / ".same");
+    check(execute(exe, f.root, f.base / "stdout", f.base / "stderr", {"new"}) == 0,
+          "new command failed");
+    const auto config = read(f.root / ".same/config.toml");
+    for (const auto* key :
+         {"workers", "metadata_workers", "gpu_min_bytes", "gpu_probe_bytes", "block_bytes",
+          "memory_bytes", "device_memory_bytes", "queue_capacity", "backend", "rehash"})
+        check(config.find(std::string(key) + " =") != std::string::npos,
+              "new omitted default " + std::string(key));
+    check(!read(f.root / ".same/ignore").empty(), "new omitted recommended ignore");
+    f.file(".same/config.toml", "# custom configuration\n");
+    f.file(".same/ignore", "custom-ignore\n");
+    const auto repeated = execute(exe, f.root, f.base / "stdout", f.base / "stderr", {"new"});
+    check(repeated == 0, "repeated new must succeed without replacing files");
+    check(read(f.root / ".same/config.toml") == "# custom configuration\n" &&
+              read(f.root / ".same/ignore") == "custom-ignore\n",
+          "new overwrote existing files");
+    f.file("child/.same/marker", "nested state");
+    f.file("child/data", "keep user data");
+    check(execute(exe, f.root, f.base / "stdout", f.base / "stderr", {"clean"}) == 0,
+          "clean command failed");
+    check(!fs::exists(f.root / ".same") && fs::exists(f.root / "child/.same/marker"),
+          "shallow clean removed nested state or retained root state");
+    check(execute(exe, f.root, f.base / "stdout", f.base / "stderr", {"clean", "-r"}) == 0,
+          "recursive clean command failed");
+    check(!fs::exists(f.root / "child/.same") && read(f.root / "child/data") == "keep user data",
+          "recursive clean omitted state or removed user data");
+}
+
+/// 子命令拒绝无效组合且不隐式创建状态。 / Reject invalid command combinations without creating
+/// state.
+void command_validation(const fs::path& exe) {
+    Fixture f(exe);
+    fs::remove_all(f.root / ".same");
+    for (const auto& arguments : std::vector<std::vector<std::string>>{{"unknown"},
+                                                                       {"scan", "new"},
+                                                                       {"new", "-r"},
+                                                                       {"clean", "--summary"},
+                                                                       {"scan", "--unknown"},
+                                                                       {"scan", "--sumary"},
+                                                                       {"clean", "--cpu"}}) {
+        check(execute(exe, f.root, f.base / "stdout", f.base / "stderr", arguments) == 2,
+              "invalid command accepted");
+        check(!fs::exists(f.root / ".same"), "invalid command created state");
+    }
+    for (const auto& arguments : std::vector<std::vector<std::string>>{{"--help"},
+                                                                       {"scan", "--help"},
+                                                                       {"new", "--help"},
+                                                                       {"clean", "--help"},
+                                                                       {"--version"}}) {
+        check(execute(exe, f.root, f.base / "stdout", f.base / "stderr", arguments) == 0,
+              "help/version failed");
+        check(!read(f.base / "stdout").empty() && !fs::exists(f.root / ".same"),
+              "help/version mutated state or omitted output");
+    }
 }
 
 /// 自动模式在设备预算不足时回退；显式环境变量开启真实 GPU 回归。 / Auto mode falls back on
 /// insufficient device budget; an environment opt-in exercises a real GPU.
 void backends(const fs::path& exe) {
     Fixture f(exe);
-    f.config({{"backend", "\"auto\""}, {"device_memory_bytes", "1"}});
+    f.config({{"backend", "\"auto\""},
+              {"device_memory_bytes", "1"},
+              {"gpu_min_bytes", "0"},
+              {"gpu_probe_bytes", "0"}});
     f.file("a", std::string(8192, 'f'));
     f.file("b", std::string(8192, 'f'));
     f.expect({group({"a", "b"})});
     check(f.stats["gpu_workers"] == 0, "tiny device budget");
+    check(f.stats["gpu_hashes"] == 0 && f.stats["cpu_hashes"] == 2,
+          "unavailable auto must use CPU");
     const char* required = std::getenv("SAME_REQUIRE_CUDA");
     if (!required || std::string_view(required) != "1") {
         std::cout << "SKIP real CUDA (set SAME_REQUIRE_CUDA=1)\n";
@@ -581,6 +705,7 @@ void backends(const fs::path& exe) {
     }
     Fixture gpu(exe);
     gpu.config({{"backend", "\"cuda\""},
+                {"gpu_min_bytes", "0"},
                 {"workers", "3"},
                 {"block_bytes", "65536"},
                 {"queue_capacity", "2"}});
@@ -593,12 +718,50 @@ void backends(const fs::path& exe) {
     gpu.file("distinct", content);
     gpu.expect({group({"a", "nested/b", "c", "d"})});
     check(gpu.stats["gpu_workers"] == 3 && gpu.stats["cpu_fallbacks"] == 0 &&
-              gpu.stats["hashed"] == 5,
+              gpu.stats["hashed"] == 5 && gpu.stats["gpu_hashes"] == 5 &&
+              gpu.stats["cpu_hashes"] == 0,
           "CUDA cold scan");
     gpu.expect({group({"a", "nested/b", "c", "d"})});
     check(gpu.stats["gpu_workers"] == 3 && gpu.stats["cpu_fallbacks"] == 0 &&
               gpu.stats["hashed"] == 0 && gpu.stats["cached"] == 5,
           "CUDA warm scan");
+    // 自动选择结果依赖硬件；无论选择如何，摘要/输出必须保持不变。
+    // Auto decisions depend on hardware; digest/output correctness must not depend on the decision.
+    gpu.config({{"backend", "\"auto\""},
+                {"gpu_probe_bytes", "0"},
+                {"gpu_min_bytes", "0"},
+                {"workers", "3"},
+                {"block_bytes", "65536"},
+                {"rehash", "true"}});
+    gpu.expect({group({"a", "nested/b", "c", "d"})});
+    check(gpu.stats["gpu_workers"] <= 1 && gpu.stats["cpu_hashes"] + gpu.stats["gpu_hashes"] == 5,
+          "auto must keep at most one calibrated GPU lane and account for real work");
+}
+
+/// 大小路由必须保留完整摘要/缓存语义，并能显式禁用。 / Size routing preserves hashes/cache and can
+/// be disabled.
+void size_routing(const fs::path& exe) {
+    Fixture f(exe);
+    f.config({{"gpu_min_bytes", "4096"}, {"metadata_workers", "4"}, {"queue_capacity", "3"}});
+    f.file("small-a", std::string(4095, 'a'));
+    f.file("small-b", std::string(4095, 'a'));
+    f.file("large-a", std::string(4096, 'b'));
+    f.file("large-b", std::string(4096, 'b'));
+    const Groups expected{group({"small-a", "small-b"}), group({"large-a", "large-b"})};
+    f.expect(expected);
+    check(f.stats["cpu_routed_hashes"] == 2, "size route threshold boundary");
+    f.expect(expected);
+    check(f.stats["cached"] == 4 && f.stats["cpu_routed_hashes"] == 0, "size route warm cache");
+    f.config({{"gpu_min_bytes", "0"}, {"rehash", "true"}});
+    f.expect(expected);
+    check(f.stats["cpu_routed_hashes"] == 0 && f.stats["hashed"] == 4, "size route disabled");
+    f.config({{"backend", "\"auto\""}, {"gpu_min_bytes", "0"}, {"rehash", "true"}});
+    f.expect(expected);
+    check(f.stats["gpu_workers"] == 0 && f.stats["calibration_ms"] == 0 &&
+              f.stats["gpu_setup_ms"] == 0 && f.stats["cpu_hashes"] == 4,
+          "small pending batch must not pay CUDA setup or calibration");
+    check(read(f.base / "stderr").find("using CPU fallback") == std::string::npos,
+          "intentional auto CPU policy must not report unavailable CUDA");
 }
 
 /// 跨进程锁必须拒绝第二个扫描器，Windows 状态目录大小写不敏感。 / Reject a competing scanner;
@@ -647,7 +810,11 @@ int main(int argc, char** argv) {
         {"invalid config", invalid_config},
         {"collisions and queue", collisions_and_queue},
         {"backends", backends},
+        {"size routing", size_routing},
         {"presentation", presentation},
+        {"scan commands", scan_commands},
+        {"command validation", command_validation},
+        {"lifecycle commands", lifecycle_commands},
         {"locking and state", locking_and_state}};
     for (const auto& [name, test] : cases) {
         try {
