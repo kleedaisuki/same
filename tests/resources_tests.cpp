@@ -4,6 +4,7 @@
  */
 #include "same/resources.hpp"
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -25,6 +26,10 @@ int main() {
         config.block_bytes = 1024;
         config.memory_bytes = 8192;
         same::Resources resources(config);
+        require(resources.gpu_workers() == 0 &&
+                    resources.dispatch_evidence().decision ==
+                        same::detail::DispatchEvidence::Decision::untested,
+                "explicit CPU must bypass CUDA calibration");
         std::promise<void> release, started;
         auto gate = release.get_future().share();
         auto first = resources.submit([&](same::Worker&) {
@@ -68,6 +73,45 @@ int main() {
             drained = temporary.submit([](same::Worker&) { return 9; });
         }
         require(drained.get() == 9, "destructor must drain jobs");
+        {
+            auto lazy_config = config;
+            lazy_config.backend = "auto";
+            same::Resources lazy(lazy_config);
+            require(lazy.gpu_workers() == 0 &&
+                        lazy.dispatch_evidence().decision ==
+                            same::detail::DispatchEvidence::Decision::deferred,
+                    "auto construction must not probe CUDA");
+            require(lazy.submit([](same::Worker& worker) { return worker.compute->name(); }, true)
+                            .get() == "cpu",
+                    "preferred submission before calibration must remain CPU");
+            lazy.prepare_auto(lazy_config, 0, 0);
+            require(lazy.dispatch_evidence().decision ==
+                        same::detail::DispatchEvidence::Decision::deferred,
+                    "empty work must not probe CUDA");
+        }
+        if (std::getenv("SAME_REQUIRE_CUDA")) {
+            same::Config probe;
+            probe.backend = "auto";
+            probe.workers = 4;
+            probe.queue_capacity = 1;
+            probe.block_bytes = 16 * 1024 * 1024;
+            probe.memory_bytes = 256 * 1024 * 1024;
+            probe.device_memory_bytes = 256 * 1024 * 1024;
+            same::Resources calibrated(probe);
+            calibrated.prepare_auto(probe, 64ULL * 1024 * 1024 * 1024, 8);
+            const auto evidence = calibrated.dispatch_evidence();
+            require(calibrated.gpu_workers() <= 1, "auto enabled multiple GPU lanes");
+            const auto selected =
+                calibrated.submit([](same::Worker& worker) { return worker.compute->name(); }, true)
+                    .get();
+            require(selected == (calibrated.gpu_workers() ? "cuda" : "cpu"),
+                    "preferred lane routing failed");
+            calibrated.prepare_auto(probe, 128ULL * 1024 * 1024 * 1024, 16);
+            require(calibrated.dispatch_evidence().setup_ms == evidence.setup_ms,
+                    "auto probed twice");
+            std::cout << "mixed probe capacity=1 cpu_ms=" << evidence.mixed_cpu_ms
+                      << " mixed_ms=" << evidence.mixed_gpu_ms << '\n';
+        }
         config.memory_bytes = 1;
         threw = false;
         try {

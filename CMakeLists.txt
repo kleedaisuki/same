@@ -13,7 +13,7 @@ include(cmake/Dependencies.cmake)
 
 add_library(same_core
   src/config.cpp src/files.cpp src/store.cpp src/compute_cpu.cpp
-  src/resources.cpp src/application.cpp src/run_lock.cpp src/terminal.cpp)
+  src/resources.cpp src/application.cpp src/run_lock.cpp src/terminal.cpp src/dispatch.cpp)
 # Propagate the public C++ contract without changing CUDA's separate standard.
 # 传播公开 C++ 契约，不改变 CUDA 独立语言标准；头文件集提供 IDE 元数据。
 target_compile_features(same_core PUBLIC cxx_std_23)
@@ -21,7 +21,7 @@ set_target_properties(same_core PROPERTIES CXX_EXTENSIONS OFF)
 target_sources(same_core PUBLIC FILE_SET HEADERS BASE_DIRS include FILES
   include/same/application.hpp include/same/compute.hpp include/same/config.hpp
   include/same/files.hpp include/same/resources.hpp include/same/run_lock.hpp
-  include/same/store.hpp include/same/terminal.hpp include/same/detail/windows_metadata.hpp include/same/detail/windows_path.hpp)
+  include/same/store.hpp include/same/terminal.hpp include/same/detail/windows_metadata.hpp include/same/detail/windows_path.hpp include/same/detail/dispatch.hpp)
 target_link_libraries(same_core PUBLIC sqlite3 BLAKE3::blake3 tomlplusplus::tomlplusplus Threads::Threads)
 if(WIN32)
   # Include the opt-in in every executable, including tests, for CRT/STL long paths.
@@ -58,7 +58,7 @@ target_link_libraries(same PRIVATE same_core)
 install(TARGETS same RUNTIME DESTINATION bin)
 
 if(BUILD_TESTING)
-  foreach(test compute files config store resources run_lock terminal)
+  foreach(test compute files config store resources run_lock terminal dispatch)
     add_executable(${test}_tests tests/${test}_tests.cpp)
     target_link_libraries(${test}_tests PRIVATE same_core)
     add_test(NAME ${test} COMMAND ${test}_tests)

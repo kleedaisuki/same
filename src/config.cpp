@@ -35,7 +35,7 @@ std::optional<std::string> read_settings(const std::filesystem::path& path, std:
 } // namespace
 Config::Config()
     : workers(std::clamp<std::size_t>(std::thread::hardware_concurrency(), 1, 8)),
-      queue_capacity(workers * 2) {}
+      metadata_workers(std::min<std::size_t>(workers, 4)), queue_capacity(workers * 2) {}
 Config Config::load(const std::filesystem::path& root) {
     Config result;
     const auto contents = read_settings(root / ".same" / "config.toml", 64 * 1024);
@@ -44,9 +44,10 @@ Config Config::load(const std::filesystem::path& root) {
     const auto table = toml::parse(*contents);
     for (const auto& [key, node] : table) {
         const auto name = key.str();
-        if (name != "workers" && name != "block_bytes" && name != "memory_bytes" &&
-            name != "device_memory_bytes" && name != "queue_capacity" && name != "backend" &&
-            name != "rehash")
+        if (name != "workers" && name != "metadata_workers" && name != "block_bytes" &&
+            name != "memory_bytes" && name != "device_memory_bytes" && name != "queue_capacity" &&
+            name != "backend" && name != "rehash" && name != "gpu_min_bytes" &&
+            name != "gpu_probe_bytes")
             throw std::runtime_error("unknown configuration key: " + std::string(name));
     }
     auto number = [&](const char* name, std::size_t& target) {
@@ -59,6 +60,21 @@ Config Config::load(const std::filesystem::path& root) {
         target = static_cast<std::size_t>(*value);
     };
     number("workers", result.workers);
+    result.metadata_workers = std::min<std::size_t>(result.workers, 4);
+    number("metadata_workers", result.metadata_workers);
+    if (table.contains("gpu_probe_bytes")) {
+        const auto value = table["gpu_probe_bytes"].value_exact<std::int64_t>();
+        if (!value || *value < 0)
+            throw std::runtime_error("gpu_probe_bytes must be a nonnegative integer");
+        result.gpu_probe_bytes = static_cast<std::uint64_t>(*value);
+    }
+    if (table.contains("gpu_min_bytes")) {
+        const auto value = table["gpu_min_bytes"].value_exact<std::int64_t>();
+        if (!value || *value < 0 ||
+            static_cast<std::uint64_t>(*value) > std::numeric_limits<std::size_t>::max())
+            throw std::runtime_error("gpu_min_bytes must be a nonnegative integer");
+        result.gpu_min_bytes = static_cast<std::size_t>(*value);
+    }
     result.queue_capacity = result.workers <= std::numeric_limits<std::size_t>::max() / 2
                                 ? result.workers * 2
                                 : result.workers;
@@ -84,6 +100,8 @@ Config Config::load(const std::filesystem::path& root) {
 void Config::validate() const {
     if (!workers || workers > 256)
         throw std::runtime_error("workers must be in [1, 256]");
+    if (!metadata_workers || metadata_workers > 256)
+        throw std::runtime_error("metadata_workers must be in [1, 256]");
     if (!block_bytes || block_bytes > 64 * 1024 * 1024 || block_bytes % 1024)
         throw std::runtime_error("block_bytes must be a positive multiple of 1024, at most 64 MiB");
     if (!queue_capacity || queue_capacity > 65536)
