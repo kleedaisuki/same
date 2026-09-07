@@ -15,7 +15,7 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) {
             const std::string_view arg = argv[i];
             if (arg == "--help" || arg == "-h") {
-                std::cout << "same 0.1.0 - exact duplicate files in the working directory\n"
+                std::cout << "same 0.2.0 - exact duplicate files in the working directory\n"
                              "Usage: same [--rehash] [--cpu] [--color=auto|always|never] "
                              "[--format=auto|pretty|tsv] [--unique-files]\n"
                              "  --rehash  ignore cached hashes for this scan\n"
@@ -29,7 +29,7 @@ int main(int argc, char** argv) {
                 return 0;
             }
             if (arg == "--version") {
-                std::cout << "same 0.1.0\n";
+                std::cout << "same 0.2.0\n";
                 return 0;
             }
             if (arg == "--rehash")

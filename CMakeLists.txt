@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(same VERSION 0.1.0 LANGUAGES C CXX)
+project(same VERSION 0.2.0 LANGUAGES C CXX)
 
 # Native language/target metadata is shared by builds and IDE code models.
 # 原生语言及目标元数据同时服务构建与 IDE 代码模型。
