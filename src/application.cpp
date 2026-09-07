@@ -13,18 +13,26 @@
 namespace same {
 namespace {
 namespace fs = std::filesystem;
+/// Persist paths as generic UTF-8 bytes, independent of native separators.
+/// 以通用 UTF-8 字节持久化路径，不依赖本机分隔符。
 std::string path_key(const fs::path& path) {
     const auto text = path.generic_u8string();
     return {reinterpret_cast<const char*>(text.data()), text.size()};
 }
+/// Decode an internal root-relative database key without locale conversion.
+/// 无需本地编码转换，将内部相对路径键还原为本机路径。
 fs::path native_path(const fs::path& root, const std::string& key) {
     return root /
            fs::path(std::u8string_view(reinterpret_cast<const char8_t*>(key.data()), key.size()));
 }
+/// Check the open object and its current path binding; this is not an atomic snapshot.
+/// 同时检查已打开对象及当前路径绑定；这不等同于原子快照。
 void unchanged(const fs::path& path, FileReader& reader, const FileStamp& expected) {
     if (reader.stamp() != expected || stamp_path(path) != expected)
         throw std::runtime_error("file changed while processing: " + path_key(path));
 }
+/// Coalesce short reads until the buffer is full or EOF is reached.
+/// 合并短读，直到缓冲区填满或遇到文件末尾。
 std::size_t read_block(FileReader& reader, std::span<std::byte> buffer) {
     std::size_t count = 0;
     while (count < buffer.size()) {
@@ -35,6 +43,8 @@ std::size_t read_block(FileReader& reader, std::span<std::byte> buffer) {
     }
     return count;
 }
+/// Hash from a fresh handle; reject size/stamp changes before publishing the digest.
+/// 从新句柄计算哈希；发布摘要前拒绝大小或文件戳变化。
 FileRecord hash_file(const fs::path& root, FileRecord record, Worker& worker) {
     const auto path = native_path(root, record.path);
     FileReader reader(path);
@@ -56,6 +66,8 @@ FileRecord hash_file(const fs::path& root, FileRecord record, Worker& worker) {
     unchanged(path, reader, record.stamp);
     return record;
 }
+/// Digest equality only selects candidates: establish equality from actual bytes.
+/// 摘要相等仅用于筛选候选：真正相等必须逐字节验证。
 bool equal_files(const fs::path& root, const FileRecord& a, const FileRecord& b, Worker& worker) {
     const auto path_a = native_path(root, a.path), path_b = native_path(root, b.path);
     FileReader first(path_a), second(path_b);
@@ -77,6 +89,8 @@ bool equal_files(const fs::path& root, const FileRecord& a, const FileRecord& b,
     unchanged(path_b, second, b.stamp);
     return equal;
 }
+/// Escape controls and delimiters so a filename cannot forge another output row.
+/// 转义控制字符和分隔符，防止文件名伪造额外输出行。
 void quoted_path(std::ostream& out, std::string_view path) {
     constexpr char digits[] = "0123456789abcdef";
     out << '"';
@@ -90,6 +104,9 @@ void quoted_path(std::ostream& out, std::string_view path) {
     }
     out << '"';
 }
+/// Reject linked state paths before opening SQLite; concurrent hostile replacement
+/// still requires filesystem-level isolation rather than these preflight checks.
+/// 打开 SQLite 前拒绝链接状态路径；恶意并发替换仍需文件系统隔离，不能仅靠预检查。
 void prepare_state(const fs::path& root) {
     const auto state = root / ".same";
     const auto status = fs::symlink_status(state);
@@ -107,9 +124,21 @@ void prepare_state(const fs::path& root) {
                                      path_key(path));
     }
 }
+/// Main-thread-only diagnostic totals. 仅由主线程维护的诊断统计。
 struct Counters {
-    std::size_t scanned = 0, hashed = 0, cached = 0, groups = 0, matches = 0;
+    /// Eligible regular files visited. 扫描到的合格普通文件数。
+    std::size_t scanned = 0;
+    /// Files submitted for hashing. 已提交哈希计算的文件数。
+    std::size_t hashed = 0;
+    /// Records reused after matching stamps. 文件戳匹配后复用的记录数。
+    std::size_t cached = 0;
+    /// Emitted duplicate equivalence classes. 输出的重复文件等价类数量。
+    std::size_t groups = 0;
+    /// Emitted members, including representatives. 输出成员数，包含代表文件。
+    std::size_t matches = 0;
 };
+/// Stream the tree into bounded worker jobs; keep every SQLite mutation on this thread.
+/// 流式遍历目录并提交有界任务；所有 SQLite 修改留在当前线程。
 void scan(const fs::path& root, const Config& config, Store& store, Resources& resources,
           Counters& counters) {
     Ignore ignore(root);
@@ -152,10 +181,16 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
         drain();
     store.end_scan();
 }
+/// Refine each size/digest bucket into byte-equal classes without trusting hash uniqueness.
+/// 将每个大小/摘要桶细分为字节相等等价类，不假设哈希绝无碰撞。
 class Partition {
 public:
+    /// Borrow run-scoped services; capacity bounds retained comparison futures.
+    /// 借用本轮服务；capacity 限制保留的比较 future 数量。
     Partition(const fs::path& root, Store& store, Resources& resources, std::size_t capacity)
         : root_(root), store_(store), resources_(resources), capacity_(capacity) {}
+    /// Input must be contiguous by size/digest; drain the old bucket before switching.
+    /// 输入必须按大小/摘要连续分桶；切换前排空旧桶。
     void accept(const FileRecord& record) {
         if (!first_ || first_->stamp.size != record.stamp.size || first_->digest != record.digest) {
             flush();
@@ -168,25 +203,37 @@ public:
         if (pending_.size() >= capacity_)
             drain();
     }
+    /// Join all comparisons before representatives are replaced or results consumed.
+    /// 替换代表或消费结果前等待所有比较结束。
     void flush() {
         while (!pending_.empty())
             drain();
     }
 
 private:
+    /// One candidate paired with its first-representative comparison.
+    /// 候选文件及其与首个代表的比较任务。
     struct Pending {
+        /// Own metadata until comparison completes. 持有元数据直至比较结束。
         FileRecord record;
+        /// Propagate worker failures on the main thread. 在主线程传播工作线程错误。
         std::future<bool> equal;
     };
+    /// Capture records by value so a later bucket transition cannot invalidate a job.
+    /// 按值捕获记录，防止后续换桶使任务引用失效。
     std::future<bool> compare(const FileRecord& a, const FileRecord& b) {
         return resources_.submit([root = root_, a, b](Worker& worker) {
             return worker.execute([&] { return equal_files(root, a, b, worker); });
         });
     }
+    /// Seed a class with itself; singleton classes are filtered by the store on output.
+    /// 将代表自身加入新类；单成员类由存储层在输出时过滤。
     void add_representative(const FileRecord& record) {
         store_.add_representative(record);
         store_.add_match(record.path, record.path);
     }
+    /// Resolve in input order, serializing rare collision-class creation deterministically.
+    /// 按输入顺序归并，确保罕见碰撞类的建立顺序确定。
     void drain() {
         auto pending = std::move(pending_.front());
         pending_.pop_front();
@@ -209,13 +256,21 @@ private:
         if (!matched)
             add_representative(pending.record);
     }
+    /// Root copied into asynchronous comparisons. 复制到异步比较中的根路径。
     fs::path root_;
+    /// Main-thread database owner outlives this partitioner. 生命周期更长的主线程数据库。
     Store& store_;
+    /// Worker pool outlives all retained futures. 生命周期覆盖所有保留 future 的工作池。
     Resources& resources_;
+    /// Maximum retained candidate comparisons. 最多保留的候选比较数。
     std::size_t capacity_;
+    /// First representative of the current size/digest bucket. 当前大小/摘要桶的首个代表。
     std::optional<FileRecord> first_;
+    /// FIFO preserves deterministic collision handling. 先进先出确保碰撞处理顺序确定。
     std::deque<Pending> pending_;
 };
+/// Rebuild byte-verified classes from the store's ordered candidate stream.
+/// 从存储层有序候选流重建逐字节验证的等价类。
 void partition(const fs::path& root, Store& store, Resources& resources, std::size_t capacity) {
     store.reset_matches();
     Partition partitioner(root, store, resources, capacity);

@@ -15,15 +15,25 @@
 #endif
 
 namespace same {
+/// 通过资源生命周期保持进程锁；关闭资源即可释放，无需删除锁文件。
+/// Hold the process lock through resource lifetime; closing releases it without deleting the lock
+/// file.
 struct RunLock::Impl {
 #ifdef _WIN32
+    /// 禁止共享打开的文件句柄即是 Windows 锁。 / A file handle opened without sharing is the
+    /// Windows lock.
     HANDLE handle{INVALID_HANDLE_VALUE};
+    /// 关闭句柄释放独占打开限制。 / Close the handle to release exclusive-open protection.
     ~Impl() {
         if (handle != INVALID_HANDLE_VALUE)
             CloseHandle(handle);
     }
 #else
+    /// flock 附着在此描述符引用的打开文件描述上。 / flock is attached to the open file description
+    /// referenced here.
     int fd{-1};
+    /// 关闭本对象唯一拥有的描述符以释放 flock。 / Close this object's owned descriptor to release
+    /// flock.
     ~Impl() {
         if (fd >= 0)
             close(fd);
@@ -32,6 +42,9 @@ struct RunLock::Impl {
 };
 RunLock::RunLock(const std::filesystem::path& path) : impl_(std::make_unique<Impl>()) {
 #ifdef _WIN32
+    /// 共享模式为零，因此已有不兼容打开会立刻失败；OPEN_ALWAYS 保留锁文件身份。
+    /// Zero sharing fails immediately on incompatible opens; OPEN_ALWAYS preserves lock-file
+    /// identity.
     impl_->handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
                                 FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (impl_->handle == INVALID_HANDLE_VALUE)
@@ -45,6 +58,9 @@ RunLock::RunLock(const std::filesystem::path& path) : impl_(std::make_unique<Imp
         GetFileType(impl_->handle) != FILE_TYPE_DISK)
         throw std::runtime_error("Run lock must be a regular non-reparse file");
 #else
+    /// NOFOLLOW 拒绝末级链接；先验证普通文件，再取得非阻塞协作式锁。
+    /// NOFOLLOW rejects final symlinks; validate a regular file before taking a nonblocking
+    /// advisory lock.
     impl_->fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
     if (impl_->fd < 0)
         throw std::system_error(errno, std::generic_category(), "Open run lock");

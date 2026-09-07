@@ -1,3 +1,7 @@
+/** @file
+ * @brief 缓存事务、碰撞候选排序、精确组去重和未来版本拒绝。 / Cache transactions, collision
+ * ordering, exact-group deduplication and future-schema rejection.
+ */
 #include "same/store.hpp"
 #include <chrono>
 #include <filesystem>
@@ -7,10 +11,13 @@
 #include <vector>
 
 namespace {
+/// 断言失败抛出可定位错误。 / Throw a diagnostic on assertion failure.
 void check(bool condition, const char* message) {
     if (!condition)
         throw std::runtime_error(message);
 }
+/// 构造可控大小与摘要的记录，隔离存储行为。 / Construct controlled metadata and hashes to isolate
+/// storage behavior.
 same::FileRecord record(std::string path, std::uint64_t size, unsigned char hash = 42) {
     same::FileRecord result;
     result.path = std::move(path);
@@ -19,6 +26,8 @@ same::FileRecord record(std::string path, std::uint64_t size, unsigned char hash
     return result;
 }
 } // namespace
+/// 运行本文件全部回归场景，断言失败即返回非零。 / Run all regressions; assertion failures produce a
+/// nonzero exit.
 int main() {
     const auto root = std::filesystem::temp_directory_path() /
                       ("same-store-test-" +

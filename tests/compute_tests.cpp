@@ -1,3 +1,7 @@
+/** @file
+ * @brief 官方 BLAKE3 向量、增量终结契约与 CPU/CUDA 一致性。 / Official BLAKE3 vectors, incremental
+ * finish contracts and CPU/CUDA parity.
+ */
 #include "same/compute.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -5,8 +9,11 @@
 #include <stdexcept>
 #include <vector>
 namespace {
+/** 官方输入长度和预期摘要。 / Official input length and expected digest. */
 struct Vector {
+    /// 输入字节数。 / Input byte count.
     std::size_t size;
+    /// 官方十六进制摘要。 / Official hexadecimal digest.
     const char* hex;
 };
 // Official unkeyed vectors, BLAKE3 1.8.2 (CC0 / Apache-2.0).
@@ -49,10 +56,13 @@ const Vector vectors[] = {
     {31744, "62b6960e1a44bcc1eb1a611a8d6235b6b4b78f32e7abc4fb4c6cdcce94895c47"},
     {102400, "bc3e3d41a1146b069abffad3c0d44860cf664390afce4d9661f7902e7943e085"},
 };
+/// 断言失败抛出可定位错误。 / Throw a diagnostic on assertion failure.
 void require(bool ok, const char* message) {
     if (!ok)
         throw std::runtime_error(message);
 }
+/// 按给定步长流式输入，额外验证空更新和重复终结。 / Stream by step and verify empty updates and
+/// repeated finish.
 same::Digest hash(same::Compute& compute, std::span<const std::byte> bytes, std::size_t step) {
     auto hasher = compute.hasher();
     hasher->update({});
@@ -62,6 +72,8 @@ same::Digest hash(same::Compute& compute, std::span<const std::byte> bytes, std:
     require(digest == hasher->finish(), "finish must be repeatable");
     return digest;
 }
+/// 对任一计算后端执行同一份正确性契约。 / Apply identical correctness contracts to either compute
+/// backend.
 void test(same::Compute& compute) {
     for (const auto& v : vectors) {
         std::vector<std::byte> input(v.size);
@@ -91,6 +103,8 @@ void test(same::Compute& compute) {
     require(h->finish() == hash(compute, a, 137), "update after finish");
 }
 } // namespace
+/// 运行本文件全部回归场景，断言失败即返回非零。 / Run all regressions; assertion failures produce a
+/// nonzero exit.
 int main() {
     try {
         auto cpu = same::make_cpu_compute();

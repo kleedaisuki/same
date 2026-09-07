@@ -9,6 +9,8 @@
 #include <toml++/toml.hpp>
 namespace same {
 namespace {
+/// Missing settings use defaults; existing unreadable or oversized files are errors.
+/// 缺少设置文件时使用默认值；已存在但无法读取或超限的文件属于错误。
 std::optional<std::string> read_settings(const std::filesystem::path& path, std::size_t limit) {
     if (!std::filesystem::exists(path))
         return std::nullopt;
@@ -95,6 +97,10 @@ void Config::validate() const {
         throw std::runtime_error("backend must be auto, cpu or cuda");
 }
 namespace {
+/// Byte-oriented glob DP: O(pattern * path) time and O(path) memory.
+/// 按字节执行 glob 动态规划：时间 O(pattern * path)，空间 O(path)。
+/// A matched ancestor also excludes descendants; **/ may match zero directories.
+/// 祖先匹配也覆盖后代；**/ 可匹配零层目录。
 bool glob_match(std::string_view pattern, std::string_view path, bool directory_rule,
                 bool directory) {
     // Dynamic programming bounds matching work; no recursive regex backtracking.

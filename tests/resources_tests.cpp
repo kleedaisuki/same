@@ -1,3 +1,7 @@
+/** @file
+ * @brief 有界队列背压、异常传播、CPU 重试和析构排空。 / Bounded-queue backpressure, exceptions, CPU
+ * retries and destructor draining.
+ */
 #include "same/resources.hpp"
 #include <chrono>
 #include <iostream>
@@ -5,10 +9,13 @@
 #include <vector>
 
 using namespace std::chrono_literals;
+/// 断言失败抛出可定位错误。 / Throw a diagnostic on assertion failure.
 void require(bool condition, const char* message) {
     if (!condition)
         throw std::runtime_error(message);
 }
+/// 运行本文件全部回归场景，断言失败即返回非零。 / Run all regressions; assertion failures produce a
+/// nonzero exit.
 int main() {
     try {
         same::Config config;

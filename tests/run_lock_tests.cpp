@@ -1,3 +1,7 @@
+/** @file
+ * @brief 进程排他锁、释放后复用与特殊文件拒绝。 / Process exclusion, lock reuse and rejection of
+ * special files.
+ */
 #include "same/run_lock.hpp"
 #include <chrono>
 #include <filesystem>
@@ -10,10 +14,12 @@
 #include <unistd.h>
 #endif
 namespace {
+/// 断言失败抛出可定位错误。 / Throw a diagnostic on assertion failure.
 void check(bool condition, const char* message) {
     if (!condition)
         throw std::runtime_error(message);
 }
+/// 尝试竞争锁，异常代表正确拒绝。 / Probe acquisition; an exception denotes expected rejection.
 bool rejected(const std::filesystem::path& path) {
     try {
         same::RunLock lock(path);
@@ -23,6 +29,8 @@ bool rejected(const std::filesystem::path& path) {
     return false;
 }
 } // namespace
+/// 运行本文件全部回归场景，断言失败即返回非零。 / Run all regressions; assertion failures produce a
+/// nonzero exit.
 int main() {
     const auto root = std::filesystem::temp_directory_path() /
                       ("same-lock-test-" +

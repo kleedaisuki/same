@@ -1,15 +1,24 @@
+/** @file
+ * @brief 配置类型与资源限制、忽略规则优先级和输入大小边界。 / Configuration types and limits,
+ * ignore-rule precedence and bounded inputs.
+ */
 #include "same/config.hpp"
 #include <chrono>
 #include <fstream>
 #include <stdexcept>
+/// 运行本文件全部回归场景，断言失败即返回非零。 / Run all regressions; assertion failures produce a
+/// nonzero exit.
 int main() {
     namespace fs = std::filesystem;
     const auto root = fs::temp_directory_path() /
                       ("same-config-" +
                        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     fs::create_directories(root / ".same");
+    /** 异常退出也清理测试目录。 / Clean the fixture even during unwinding. */
     struct Cleanup {
+        /// 唯一临时目录，由本测试独占。 / Unique directory exclusively owned by this test.
         fs::path path;
+        /// 不抛异常，以免掩盖断言。 / Do not mask assertion failures with cleanup errors.
         ~Cleanup() {
             std::error_code ec;
             fs::remove_all(path, ec);

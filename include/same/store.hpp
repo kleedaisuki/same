@@ -9,40 +9,80 @@
 #include <string_view>
 
 namespace same {
+/// 持久化的单文件缓存项；摘要仅筛选候选，不能代替逐字节验证。
+/// Persisted per-file cache entry; a digest filters candidates, not bytewise verification.
 struct FileRecord {
+    /// 根目录相对路径，UTF-8 编码。 / Root-relative UTF-8 path.
     std::string path;
+    /// 计算摘要所对应的文件版本。 / File version associated with the digest.
     FileStamp stamp;
+    /// 内容摘要，允许碰撞。 / Content digest; collisions remain possible.
     Digest digest;
 };
-// Single-owner repository. Callbacks are streamed; references expire on return.
-// 单线程独占仓储。回调逐行执行，引用仅在本次回调内有效。
+/** 单线程独占 SQLite 仓储；调用方负责持有整个运行周期的 RunLock。
+ * Single-owner SQLite repository; the caller holds RunLock for the whole run.
+ * 回调逐行执行，引用仅在本次回调内有效；不得在回调中重入同一遍历或修改其源表。
+ * Callbacks stream rows whose references expire on return; do not reenter a traversal or mutate its
+ * source table. 典型流程：begin_scan → cached/save（每个已见文件）→ end_scan → 候选验证。 Typical
+ * use: begin_scan → cached/save (every observed file) → end_scan → candidate verification.
+ */
 class Store {
 public:
+    /// 打开/初始化 schema；缓存预算按 KiB 换算并限制为 16 KiB 至 1 GiB。
+    /// Open/initialize the schema; convert the cache budget to KiB and clamp to 16 KiB–1 GiB.
     explicit Store(const std::filesystem::path& path, std::size_t cache_bytes = 2 * 1024 * 1024);
+    /// 回滚尚未完成的扫描，然后关闭连接。 / Roll back an unfinished scan, then close the
+    /// connection.
     ~Store();
     Store(const Store&) = delete;
     Store& operator=(const Store&) = delete;
+    /// 开启 IMMEDIATE 事务并推进代次；禁止嵌套扫描。
+    /// Begin an IMMEDIATE transaction and advance the generation; nested scans are rejected.
     void begin_scan();
+    /// 返回路径对应的缓存副本；不验证 stamp，也不将该文件标为本轮已见。
+    /// Return an owned cache entry; neither validate its stamp nor mark it seen in this scan.
     std::optional<FileRecord> cached(std::string_view path);
+    /// 在活动扫描中插入/更新记录并标记本轮已见；缓存命中也必须调用。
+    /// Upsert and mark seen in the active scan; cached hits must also be saved.
     void save(const FileRecord& record);
+    /// 删除本轮未见记录，与所有更新一并提交；必须有活动扫描。
+    /// Delete unseen entries and commit them atomically with updates; requires an active scan.
     void end_scan();
+    /// 尽力回滚活动扫描；无扫描时无操作，清理期间不抛异常。
+    /// Best-effort rollback of an active scan; no-op when inactive and never throws during cleanup.
     void rollback_scan() noexcept;
-    // Includes only size/hash buckets with at least two files; ordered by size/hash/path.
-    // 仅访问包含至少两个文件的大小/哈希桶，按大小、哈希、路径排序。
+    /// 扫描提交后访问至少两个文件的大小/摘要桶，按大小、摘要、路径排序。
+    /// After scan commit, visit size/digest buckets of at least two files, ordered by
+    /// size/digest/path.
     void visit_candidates(const std::function<void(const FileRecord&)>& visitor);
+    /// 清空当前候选桶的临时代表表；调用方负责桶边界。
+    /// Clear temporary representatives for the current candidate bucket; caller manages bucket
+    /// boundaries.
     void clear_representatives();
+    /// 加入已验证等价类的代表；重复路径会报错。
+    /// Add a representative of a verified equivalence class; duplicate paths fail.
     void add_representative(const FileRecord& record);
-    // Return false to stop. Do not mutate representatives during this callback.
-    // 回调返回 false 停止；回调期间不可修改代表文件表。
+    /// 按路径遍历代表，false 提前停止；回调中禁止修改代表表。
+    /// Visit representatives in path order; false stops early. Do not mutate that table in
+    /// callbacks.
     void visit_representatives(const std::function<bool(const FileRecord&)>& visitor);
+    /// 清空连接本地的精确匹配结果，不修改持久缓存。
+    /// Clear connection-local exact matches without changing the persistent cache.
     void reset_matches();
+    /// 幂等加入已验证成员；代表自身也需作为成员显式加入，仓储不执行内容验证。
+    /// Idempotently add a verified member; explicitly add the representative itself too. Store does
+    /// not verify content.
     void add_match(std::string_view representative, std::string_view member);
-    // Only exact groups with >=2 members. Paths refer to root-relative UTF-8 strings.
-    // 仅输出至少两个成员的精确相同组；路径为相对根目录的 UTF-8 字符串。
+    /// 按代表/成员路径输出至少两个成员的组；UTF-8 视图仅在回调内有效。
+    /// Emit groups with at least two members in representative/member order; UTF-8 views live only
+    /// within the callback.
     void visit_matches(const std::function<void(std::string_view, std::string_view)>& visitor);
 
 private:
+    /// 隐藏 SQLite 连接与事务状态。 / Hide SQLite connection and transaction state.
     struct Impl;
+    /// 独占连接，禁止跨线程并发使用。 / Own the connection exclusively; no concurrent cross-thread
+    /// use.
     std::unique_ptr<Impl> impl_;
 };
 } // namespace same

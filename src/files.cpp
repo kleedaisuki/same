@@ -22,6 +22,8 @@
 #endif
 namespace same {
 namespace {
+/// 将当前平台 I/O 错误附上操作与路径后抛出。 / Throw the native I/O error with operation and path
+/// context.
 [[noreturn]] void io_error(const char* operation, const std::filesystem::path& path) {
 #ifdef _WIN32
     throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
@@ -32,16 +34,24 @@ namespace {
 #endif
 }
 } // namespace
+/// 顺序读取资源；析构负责关闭，确保构造中途抛异常也不泄漏。
+/// Sequential-read resource; destruction closes it even when construction throws midway.
 struct FileReader::Impl {
+    /// 仅用于诊断；读取和元数据查询均使用已打开句柄。 / Diagnostic path only; reads and metadata
+    /// use the open handle.
     std::filesystem::path path;
 #ifdef _WIN32
+    /// 独占持有的 Windows 文件句柄。 / Exclusively owned Windows file handle.
     HANDLE handle{INVALID_HANDLE_VALUE};
+    /// 无异常释放句柄。 / Release the handle without throwing.
     ~Impl() {
         if (handle != INVALID_HANDLE_VALUE)
             CloseHandle(handle);
     }
 #else
+    /// 独占持有的 POSIX 文件描述符。 / Exclusively owned POSIX file descriptor.
     int fd{-1};
+    /// 无异常释放描述符。 / Release the descriptor without throwing.
     ~Impl() {
         if (fd >= 0)
             close(fd);
@@ -51,6 +61,9 @@ struct FileReader::Impl {
 FileReader::FileReader(const std::filesystem::path& path) : impl_(std::make_unique<Impl>()) {
     impl_->path = path;
 #ifdef _WIN32
+    /// 允许其他程序写入/替换路径；持有句柄仍指向原文件，但不是内容快照。
+    /// Sharing permits concurrent writes/path replacement; the handle pins the file, not a content
+    /// snapshot.
     impl_->handle = CreateFileW(
         path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
         OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -63,6 +76,8 @@ FileReader::FileReader(const std::filesystem::path& path) : impl_(std::make_uniq
         GetFileType(impl_->handle) != FILE_TYPE_DISK)
         throw std::runtime_error("not a regular non-reparse file: " + path.string());
 #else
+    /// 不跟随末级链接；NONBLOCK 防止验证文件类型之前因 FIFO 而阻塞。
+    /// Do not follow final symlinks; NONBLOCK avoids blocking on a FIFO before validating its type.
     impl_->fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (impl_->fd < 0)
         io_error("open file", impl_->path);
@@ -105,6 +120,8 @@ FileStamp FileReader::stamp() const {
             io_error("legacy file identity", impl_->path);
         identity = detail::legacy_file_identity(legacy);
     }
+    /// 保留原始 Windows 时间计数，不经日历格式化损失精度。
+    /// Preserve raw Windows timestamp ticks without precision-losing calendar formatting.
     return {static_cast<std::uint64_t>(standard.EndOfFile.QuadPart), identity,
             std::to_string(basic.LastWriteTime.QuadPart),
             std::to_string(basic.ChangeTime.QuadPart)};
@@ -119,6 +136,9 @@ FileStamp FileReader::stamp() const {
     const auto mt = info.st_mtim;
     const auto ct = info.st_ctim;
 #endif
+    /// st_ctime 是状态变更时间；与写入时间分开保存以降低缓存误命中风险。
+    /// st_ctime is status-change time; keep it separate from modification time to reduce stale
+    /// cache hits.
     return {static_cast<std::uint64_t>(info.st_size),
             std::to_string(info.st_dev) + ":" + std::to_string(info.st_ino),
             std::to_string(mt.tv_sec) + ":" + std::to_string(mt.tv_nsec),

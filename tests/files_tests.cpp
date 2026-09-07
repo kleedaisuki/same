@@ -1,3 +1,7 @@
+/** @file
+ * @brief 文件身份、移动所有权、读取边界与符号链接防护。 / File identity, moved ownership, read
+ * boundaries and symlink protection.
+ */
 #include "same/detail/windows_metadata.hpp"
 #include "same/files.hpp"
 #include <array>
@@ -5,6 +9,8 @@
 #include <fstream>
 #include <stdexcept>
 #include <utility>
+/// 运行本文件全部回归场景，断言失败即返回非零。 / Run all regressions; assertion failures produce a
+/// nonzero exit.
 int main() {
 #ifdef _WIN32
     for (DWORD error : {ERROR_INVALID_PARAMETER, ERROR_INVALID_LEVEL, ERROR_NOT_SUPPORTED,
@@ -29,8 +35,11 @@ int main() {
                       ("same-files-" +
                        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     fs::create_directory(root);
+    /** 异常退出也清理测试目录。 / Clean the fixture even during unwinding. */
     struct Cleanup {
+        /// 唯一临时目录，由本测试独占。 / Unique directory exclusively owned by this test.
         fs::path path;
+        /// 不抛异常，以免掩盖断言。 / Do not mask assertion failures with cleanup errors.
         ~Cleanup() {
             std::error_code ec;
             fs::remove_all(path, ec);

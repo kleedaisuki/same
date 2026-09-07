@@ -2,6 +2,10 @@
 #include <iostream>
 #include <string_view>
 
+/// Apply CLI overrides after loading local configuration; keep stdout machine-readable.
+/// 加载本地配置后应用命令行覆盖；标准输出仅包含机器可读结果。
+/// Return 2 on exceptions, including partial scans; duplicates are a successful result.
+/// 异常（含未完成扫描）返回 2；找到重复文件仍属于成功。
 int main(int argc, char** argv) {
     try {
         bool rehash = false, cpu = false;
