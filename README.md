@@ -14,78 +14,37 @@ Traverse → hash new or metadata-changed files → compare equal-size/equal-dig
 
 Requires CMake ≥ 3.25, a C/C++23 toolchain, and network access for the first dependency fetch. Dependencies are version/hash pinned. CUDA translation units use C++20; host C++ uses C++23.
 
-### 推荐：自动选择构建环境 / Recommended: automatic build environment
+### 原生 CMake：自动选择 / Native CMake: automatic selection
 
-**CUDA 构建使用 Ninja 直接调用 `nvcc`，不使用 Visual Studio CUDA/MSBuild 扩展，也不需要安装该扩展。** Windows 仍需 MSVC Build Tools 和 Windows SDK 来编译、链接主机代码。VS 生成器只保留纯 CPU 构建；开启 CUDA 时会在探测前明确拒绝，而不是悄悄回退 CPU。
+**不需要 Python。** Windows 优先 CUDA Toolkit（SDK）+ Ninja 直接调用 nvcc；不可用再尝试 Visual Studio CUDA Build Customizations，最后 CPU。两条 CUDA 路线都需要 Toolkit 和兼容的 MSVC/Windows SDK；扩展不能代替 Toolkit。
 
-**CUDA builds use Ninja to invoke `nvcc` directly, never the Visual Studio CUDA/MSBuild extension.** Windows still requires MSVC Build Tools and the Windows SDK for host compilation/linking. Visual Studio generators remain available for CPU-only builds; CUDA-enabled configurations reject them before probing rather than silently falling back.
-
-额外需要 Python ≥ 3.9 和 Ninja。Windows 原生默认用 `vswhere` 发现 MSVC Build Tools，初始化 x64 的 MSVC + Windows SDK 环境，再在**同一环境**中配置、构建、测试；无需手动修改 PATH。Linux / WSL / macOS 使用调用者的本机编译环境。macOS 自动构建 CPU 版本。
-
-Additionally requires Python ≥ 3.9 and Ninja. On native Windows the launcher discovers MSVC Build Tools via `vswhere`, initializes the x64 MSVC/Windows SDK environment, and configures, builds and tests in that same environment. Linux, WSL and macOS use the caller's native environment; macOS defaults to CPU.
+**No Python required.** Windows prefers direct Toolkit/nvcc through Ninja, then Visual Studio CUDA integration, finally CPU. Both CUDA routes require the Toolkit and compatible host tools.
 
 ```sh
-python tools/build.py --test                 # 自动 CUDA / automatic CUDA
-python tools/build.py --cuda on --test       # 必须能构建 CUDA / require CUDA build
-python tools/build.py --cuda off --test      # CPU only
-python tools/build.py --config Debug --test
+cmake -DSAME_BUILD_TESTS=ON -P tools/build.cmake
+cmake -DSAME_CUDA_MODE=on -DSAME_BUILD_TESTS=ON -P tools/build.cmake
+cmake -DSAME_CUDA_MODE=off -P tools/build.cmake
 ```
 
-`CC`、`CXX`、`CMAKE_TOOLCHAIN_FILE` 环境变量，以及 `-DCMAKE_CXX_COMPILER=...` 等显式选择优先于自动发现。`--toolchain environment` 完全保留调用者工具链，可用于 MinGW CPU 构建。其他 CMake 配置用 `-DVAR=VALUE` 传入。默认目录按平台、环境类别、配置和 CUDA 模式隔离；切换编译器时使用新的 `--build-dir`，不要复用旧缓存。自动 Windows 发现选取最新安装的 C++ Build Tools；若其版本不受 CUDA 支持，请先初始化受支持版本的开发环境再运行入口，不会绕过 NVIDIA 版本检查。
+严格 `on` 模式要求 CUDA；`off` 跳过 CUDA。所有 `-D` 放在 `-P` 前。Windows 自动初始化 MSVC x64 环境；显式编译器/工具链优先。完整选项、回退机制及诊断见 [构建契约](docs/build.md)。
 
-Explicit `CC`, `CXX`, `CMAKE_TOOLCHAIN_FILE` or compiler/toolchain `-D` definitions override discovery. `--toolchain environment` preserves the caller's tools (including MinGW CPU builds). Additional CMake settings use `-DVAR=VALUE`. Build directories separate platform, environment family, configuration and CUDA mode. Use a fresh `--build-dir` when changing compilers. Windows discovery chooses the latest C++ Build Tools installation; if CUDA does not support it, initialize a supported developer environment first. NVIDIA version checks are never bypassed.
+Strict on requires CUDA; off skips CUDA. Put definitions before `-P`. The launcher initializes MSVC x64; explicit toolchains take precedence. See the build contract for options and diagnostics.
 
-**CLion：**下面的原生 CMake 命令和现有 Ninja 预设不会运行 Python 自动入口，也不会覆盖 IDE 已选择的工具链。要在 CLion 内构建 CUDA，使用 Visual Studio 工具链并分配独立构建目录；若保留 MinGW，项目会明确说明 CPU 回退原因，而不是混用 `windres` 和 MSVC。自动入口不修改 IDE 私有设置。
+### CLion / 原生配置 / Native configuration
 
-**CLion:** native CMake commands and Ninja presets below do not invoke the Python launcher or override the IDE's selected tools. Select a Visual Studio toolchain and a separate build directory for in-IDE CUDA builds. MinGW receives an explicit CPU-fallback diagnosis. The launcher never edits private IDE settings.
+CLion 打开根 CMake 工程，Windows 选择 **Visual Studio 工具链 + Ninja**，使用 release/cuda/cpu 预设；不要把 MinGW 与 MSVC CUDA 混用。真实 CMake CUDA 语言和 targets 提供 IDE 元数据。命令行原生配置需先初始化开发环境：
 
-### 原生 CMake 入口 / Native CMake entry point
-
-适用于已初始化的工具链、IDE 和交叉编译；编译器由调用者选择，而非项目强制替换。
-
-Windows 必须先初始化 MSVC 开发环境；普通 PowerShell 请使用上面的 Python 入口。旧 `build` 若已配置为 Visual Studio，请使用新目录（例如 `build-ninja`），不要原地更换生成器。
-
-On Windows, initialize the MSVC developer environment first; from ordinary PowerShell use the Python launcher above. If `build` already uses Visual Studio, choose a fresh directory such as `build-ninja`; do not change generators in place.
-
-For initialized toolchains, IDEs and cross-compilation; compiler selection remains caller-owned.
+Open the root CMake project in CLion; on Windows select the **Visual Studio toolchain with Ninja** and a release/cuda/cpu preset. Native CUDA targets expose IDE metadata. Initialize the developer environment before native CLI configuration:
 
 ```sh
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release --parallel
-ctest --test-dir build -C Release --output-on-failure
-cmake --install build --config Release --prefix /your/install/prefix
+cmake --preset release
+cmake --build --preset release
+ctest --preset release
 ```
 
-默认验证 CUDA 工具链；缺失或探测失败时自动构建 CPU 版本并报告原因。Windows 非 MSVC 和 macOS 不进行无效 CUDA 探测。`-DSAME_REQUIRE_CUDA=ON` 要求配置阶段 CUDA 可用，不能与 `-DSAME_ENABLE_CUDA=OFF` 同用。只构建 CPU：
+直接配置尊重已有生成器，不会原地切换 Ninja/Visual Studio；跨生成器自动回退使用上面的脚本入口。构建不等于 GPU 运行验证。
 
-The default validates the CUDA toolchain and explains CPU fallback on absence or probe failure. Non-MSVC Windows and macOS skip unsupported CUDA probing. `-DSAME_REQUIRE_CUDA=ON` requires CUDA at configure time and conflicts with `-DSAME_ENABLE_CUDA=OFF`. For an explicitly CPU-only build:
-
-```sh
-cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DSAME_ENABLE_CUDA=OFF
-cmake --build build-cpu --config Release --parallel
-ctest --test-dir build-cpu -C Release --output-on-failure
-```
-
-| 平台 / Platform | 验证范围 / Verification scope |
-|---|---|
-| Linux / WSL | CPU 与 CUDA 已测试；CUDA 12.8、RTX 3070 Ti / CPU and CUDA tested, CUDA 12.8 on RTX 3070 Ti |
-| Windows / MinGW | CPU 已测试 / CPU tested |
-| Windows / MSVC 19.44 | CUDA 13.3 构建和 CPU 回退已测试；本机该运行时无法初始化 GPU / CUDA 13.3 build and CPU fallback tested; this runtime could not initialize the local GPU |
-| macOS | POSIX 分支包含元数据适配；尚未验证，无 CUDA / Metadata adaptation present, unverified, CPU only |
-
-Python 3 可用时 CTest 还运行端到端测试。支持的非 MSVC 工具链可通过 `-DSAME_SANITIZERS=ON` 开启 AddressSanitizer/UndefinedBehaviorSanitizer；不应将其视为 CUDA 内核检查器。
-
-CTest also runs integration tests when Python 3 is available. `SAME_SANITIZERS=ON` enables host address/undefined-behavior sanitizers on supported non-MSVC toolchains, not CUDA kernel validation.
-
-使用 Ninja 的预设（preset）：`cmake --preset cpu`、`cmake --build --preset cpu`、`ctest --preset cpu`；另有 `release` 和 `asan`。GPU 测试设置 `SAME_REQUIRE_CUDA=1` 可禁止静默跳过。详见 [验证记录](docs/validation.md)。
-
-Ninja presets are `cpu`, `release`, `cuda` (CUDA build required), and `asan`. Set `SAME_REQUIRE_CUDA=1` to make missing CUDA fail GPU tests instead of skipping them. See the [validation record](docs/validation.md).
-
-另有原生 `cuda` 预设，要求 CUDA 构建成功；它使用调用者已经初始化的工具链，不执行自动环境发现。
-
-注意：CMake 的 `-DSAME_REQUIRE_CUDA=ON` 检查构建能力；测试进程的环境变量 `SAME_REQUIRE_CUDA=1` 检查 GPU 运行能力，两者相互独立。构建不要求本机存在可用 GPU。
-
-The CMake option `-DSAME_REQUIRE_CUDA=ON` checks build capability; the test environment variable `SAME_REQUIRE_CUDA=1` checks GPU runtime availability. They are independent: compilation does not require a working local GPU.
+Native configuration preserves the chosen generator. Use the script above for cross-generator fallback. A successful build does not establish GPU runtime availability.
 
 ## 使用与输出 / Usage and output
 
@@ -196,3 +155,5 @@ build/
 详见 `docs/design.md` 中的架构、预算、碰撞处理和持久化边界。
 
 See `docs/design.md` for architecture, budgeting, collision handling, and persistence boundaries.
+
+开发说明与源码阅读顺序见 [开发指南](docs/development.md)。 / See the [development guide](docs/development.md) for the reading map and formatting workflow.

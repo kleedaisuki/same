@@ -1,35 +1,76 @@
 # 构建环境契约 / Build environment contract
 
-## 分层 / Layers
+## 入口 / Entry points
 
-- `tools/build.py`：本机构建入口，发现并初始化环境，使用参数数组调用配置、构建、测试；不修改全局 PATH 或 IDE 设置。
-- `CMakePresets.json`：原生 Ninja 配置，使用调用者环境，不偷偷执行自动发现。
-- `cmake/Cuda.cmake`：在依赖下载前验证平台与 CUDA，绝不修改已经启用的 C/C++ 编译器。
+构建只需要 CMake ≥ 3.25、C/C++23 工具链与构建工具，不需要 Python。首次配置需要网络下载固定版本、SHA-256 校验的依赖。CUDA 使用 C++20。
 
-The native launcher owns discovery and process environment. Presets use caller-owned tools. CMake validates capabilities before dependency downloads; it never replaces an enabled compiler. Cross builds remain caller-owned through standard CMake toolchain files.
+Build requires CMake ≥ 3.25, a C/C++23 toolchain and build tool; Python is not required. Initial configuration downloads version/hash-pinned dependencies. CUDA uses C++20.
 
-## 选择顺序 / Selection order
+```sh
+cmake -DSAME_BUILD_TESTS=ON -P tools/build.cmake
+cmake -DSAME_CUDA_MODE=on -DSAME_BUILD_TESTS=ON -P tools/build.cmake
+cmake -DSAME_CUDA_MODE=off -DCMAKE_BUILD_TYPE=Debug -P tools/build.cmake
+cmake -DSAME_CONFIGURE_ONLY=ON -DSAME_BUILD_DIR=build/custom -P tools/build.cmake
+```
 
-显式 C/C++ 编译器或工具链文件 > 已初始化的 MSVC 开发环境 > Windows 安装器发现的最新 C++ Build Tools > 调用者环境。非 Windows 不进行 MSVC 发现。Windows 自动发现目前以 x64 为默认；其他架构使用显式工具链。
+所有 `-D` 必须放在 `-P` 前面。`SAME_CUDA_MODE=auto|on|off` 默认为 auto，on 表示 CUDA 必须可构建，off 不进行 CUDA 探测。`SAME_BUILD_PARALLEL` 默认 4；`SAME_BUILD_TESTS=ON` 在构建后运行 CTest。额外工程选项使用分号列表，例如 `"-DSAME_CMAKE_ARGS=-DBUILD_TESTING=OFF;-DSAME_SANITIZERS=ON"`。
 
-Explicit C/C++ compilers or toolchain files > initialized MSVC developer environment > latest Windows C++ Build Tools discovered by the installer > caller environment. Non-Windows hosts never run MSVC discovery. Windows auto-discovery defaults to x64; other architectures require explicit tools.
+Put all `-D` options before `-P`. CUDA mode defaults to auto; on requires CUDA and off skips probing. Parallelism defaults to four. The tests switch runs CTest after building. Additional project options use the semicolon-separated `SAME_CMAKE_ARGS` list.
 
-自动发现不等于自动修复安装。缺少 SDK、CUDA 与 MSVC 版本不兼容时保留探测诊断；不使用 `--allow-unsupported-compiler`。多版本 MSVC 不进行组合穷举，使用受支持版本的开发环境可明确指定选择。
+## Windows 选择顺序 / Windows selection order
 
-Discovery does not repair installations. Missing SDKs and CUDA/MSVC version incompatibility retain probe diagnostics. Unsupported-compiler overrides are never used. Multiple MSVC/CUDA combinations are not exhaustively searched; initialize a supported developer environment to select a specific installation.
+| 顺序 / Order | 路线 / Route | 条件 / Requirement |
+|---|---|---|
+| 1 | CUDA Toolkit（SDK）+ Ninja，直接 nvcc / direct nvcc | Toolkit、兼容 MSVC、Windows SDK、Ninja |
+| 2 | Visual Studio 生成器 + CUDA Build Customizations | 对应 VS 实例安装扩展，且有匹配 Toolkit / installed integration and matching Toolkit |
+| 3 | CPU + Ninja（无 Ninja 时 MSBuild） | 可工作的 C/C++ 工具链 / working host toolchain |
 
-## 不变量 / Invariants
+自动入口使用 `vswhere` 发现最新 C++ Build Tools，并在本进程导入 x64 `VsDevCmd` 环境。每条 CUDA 路线在隔离目录配置微型原生 CUDA 工程、验证 C++20 编译链接，不下载项目依赖也不运行 GPU。失败日志保留在 `build/probes/`。SDK 不可用后才探测扩展，最后才 CPU；严格 on 模式不含 CPU。实际项目配置/构建失败立即报错，不掩盖为回退。
 
-- CUDA 使用 Ninja 直接调用 nvcc，不依赖 Visual Studio CUDA/MSBuild 扩展。VS 生成器开启 CUDA 时明确报错；纯 CPU 保持可用。/ CUDA uses direct nvcc invocation through Ninja, without Visual Studio CUDA/MSBuild integration. CUDA-enabled VS generators fail explicitly; CPU-only VS builds remain supported.
+The launcher imports an x64 MSVC environment discovered with vswhere. Isolated CUDA probes compile/link C++20 without dependencies or GPU execution. Probe logs remain under `build/probes/`. SDK failure precedes extension probing, then CPU; strict mode excludes CPU. Actual project errors never trigger a silent fallback.
 
-- 配置、构建、测试继承同一环境。/ Configure, build and test inherit the same environment.
-- Windows MinGW CPU 路径继续可用，不与 nvcc/MSVC 混用。/ MinGW CPU builds remain supported without mixing them with nvcc/MSVC.
-- `SAME_ENABLE_CUDA` 保持原有自动回退语义；新增 `SAME_REQUIRE_CUDA` 只增加严格模式。/ Existing optional-CUDA semantics remain; the new requirement option adds strict configuration.
-- 工具链变化使用新目录；入口记录选择并拒绝检测到的缓存冲突。工具链文件内容或 PATH 中工具版本变化后，调用者仍应使用新目录。/ Use a fresh directory after toolchain changes. The launcher records selections and rejects detected cache conflicts; changes inside toolchain files or PATH tools still require caller-managed fresh directories.
-- 编译可用不等于 GPU 运行可用。/ Build capability does not imply GPU runtime availability.
+**扩展不是独立 CUDA 编译器。** NVIDIA Build Customizations 仍需要匹配的 Toolkit、nvcc 和主机编译器，只有扩展文件而无 Toolkit 不能构建 CUDA。自动入口不安装软件、不绕过 NVIDIA 编译器版本检查、不穷举所有 MSVC/Toolkit 组合。
 
-## 本次验证 / Validation for this change
+**The extension is not a separate compiler.** It still requires a matching Toolkit, nvcc and host compiler. Discovery neither installs software nor bypasses NVIDIA compatibility checks or exhaustively searches version combinations.
 
-Windows MSVC 19.44 + CUDA 13.3、Windows MinGW 16.1 CPU 自动回退、WSL Ubuntu 24.04 GCC 13.3 CPU 均完成构建，各 8/8 CTest 通过。策略测试覆盖显式选择、环境传递、缓存冲突、MinGW 自动/严格模式、macOS 分支及互斥选项。macOS 已接入 CI，但本次未在 macOS 本机执行；GPU 硬件执行不由这些构建结果证明。
+显式 `CC`、`CXX`、`CMAKE_*_COMPILER`、`CMAKE_TOOLCHAIN_FILE` 优先；`SAME_USE_ENVIRONMENT=ON` 完全保留调用者环境，并禁用跨 VS 生成器回退。显式工具链文件请使用绝对路径。切换生成器/工具链使用新的 `SAME_BUILD_DIR`；同一路径工具升级或工具链文件内容变化后也应清理缓存。Linux/macOS 使用调用者环境；macOS 应选择 CPU。
 
-Windows MSVC 19.44/CUDA 13.3, Windows MinGW 16.1 CPU fallback and WSL Ubuntu 24.04/GCC 13.3 CPU built successfully, each passing 8/8 CTest tests. Policy tests cover explicit selection, environment propagation, cache conflicts, MinGW automatic/required modes, the macOS branch and conflicting options. macOS is covered by the configured CI matrix but was not executed locally for this change. These results do not establish GPU hardware execution.
+Explicit compiler/toolchain choices take precedence. `SAME_USE_ENVIRONMENT=ON` preserves caller tools and disables automatic VS-generator fallback. Use absolute toolchain paths and fresh build directories after generator/toolchain changes, including in-place upgrades. Unix hosts use caller tools; choose CPU on macOS.
+
+## CLion 与原生 CMake / CLion and native CMake
+
+```sh
+cmake --preset release
+cmake --build --preset release
+ctest --preset release
+# Explicit MSBuild route / 显式扩展路线：
+cmake -S . -B build/vs -G "Visual Studio 17 2022" -A x64 -DSAME_REQUIRE_CUDA=ON
+```
+
+CLion 打开根 `CMakeLists.txt`，Windows 选择 **Visual Studio 工具链**（不是默认 MinGW），使用 Ninja 的 release/cuda/cpu 预设或独立 CMake 配置。CLion 初始化 MSVC 环境；原生 CMake 在 `check_language(CUDA)` 后 `enable_language(CUDA)`，将 `.cu` 注册为真实 CUDA 目标源，并导出 `compile_commands.json`（Ninja）。非默认 SDK 使用 `CUDAToolkit_ROOT` 或 `CMAKE_CUDA_COMPILER`。显式无效编译器被视为配置错误，不会偷偷替换。
+
+Open the root CMake project in CLion and select the Visual Studio toolchain on Windows, with Ninja presets. CUDA is a native enabled language and `.cu` files are target sources, not opaque custom commands. Ninja exports a compilation database. Set `CUDAToolkit_ROOT` or `CMAKE_CUDA_COMPILER` for nondefault SDKs; invalid explicit compilers are configuration errors.
+
+**生成器不能在同一次 CMake 配置中切换。** 直接 `cmake -S/-B` 或 IDE 配置尊重当前生成器，只在该路线检测 CUDA 后回退 CPU；跨 Ninja → VS → CPU 选择由配置前的 CMake 脚本入口完成。`SAME_ENABLE_CUDA` 与 `SAME_REQUIRE_CUDA` 原有选项保留。MinGW 不混用 MSVC CUDA，自动模式给出 CPU 回退原因。
+
+**A generator cannot change during a CMake configure.** Native/IDE entry points probe within the selected generator and fall back to CPU there. Cross-generator selection belongs to the pre-configuration script. Existing optional/required CUDA options remain. MinGW never mixes host ABI with MSVC CUDA.
+
+## 检验与边界 / Validation and boundaries
+
+`build_policy` CTest 检查路线优先级、严格模式和禁用 CUDA；真实环境的配置、编译、测试结果由实际运行记录证明。编译成功不证明 GPU 可运行，也不证明 CLion UI 已人工验收。
+
+The build-policy CTest verifies ordering, strict mode and disabled CUDA. Actual build/test runs establish platform coverage; compilation does not establish GPU execution or manual CLion UI acceptance.
+
+## 官方依据 / Official references
+
+- [CMake CheckLanguage](https://cmake.org/cmake/help/latest/module/CheckLanguage.html)
+- [CMake Visual Studio CUDA toolset](https://cmake.org/cmake/help/latest/variable/CMAKE_VS_PLATFORM_TOOLSET_CUDA.html)
+- [NVIDIA Windows installation and Build Customizations](https://docs.nvidia.com/cuda/cuda-installation-guide-microsoft-windows/)
+- [JetBrains CLion CUDA projects](https://www.jetbrains.com/help/clion/cuda-projects.html)
+
+本次采用成熟原生 CMake 机制，不引入研究性构建框架；问题是工具链发现与 IDE 元数据一致性，而非需要新编译算法。
+
+This change uses established native CMake mechanisms rather than an experimental build framework: the issue is toolchain discovery and IDE metadata consistency, not a new compilation algorithm.
+
+
+Windows CUDA 12.8 的静态运行库在 MSBuild 链接时可能报告 LNK4098（LIBCMT/MSVCRT 默认库警告）。保留现有静态 CUDA 运行库，避免为消除警告而引入 cudart DLL 部署依赖；未使用 /NODEFAULTLIB 掩盖。 / CUDA 12.8 static runtime may produce MSBuild LNK4098 default-library warnings. Static linkage is preserved rather than introducing a cudart DLL deployment requirement or suppressing libraries.

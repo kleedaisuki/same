@@ -15,19 +15,17 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.12'
-      - run: python tools/build.py --cuda off --test
+      # Native generators discover VS on Windows; no Python bootstrap is needed.
+      # Windows 原生生成器发现 VS，无需 Python 引导环境。
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSAME_ENABLE_CUDA=OFF
+      - run: cmake --build build --config Release --parallel 4
+      - run: ctest --test-dir build -C Release --output-on-failure --timeout 120
   sanitizers:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.12'
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DSAME_ENABLE_CUDA=OFF -DSAME_SANITIZERS=ON
       - run: cmake --build build --parallel 4
       - run: ctest --test-dir build --output-on-failure --timeout 120

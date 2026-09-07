@@ -1,43 +1,98 @@
 {
   "version": 6,
-  "cmakeMinimumRequired": {"major": 3, "minor": 25, "patch": 0},
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
   "configurePresets": [
     {
       "name": "release",
       "displayName": "Release with optional CUDA",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/${presetName}",
-      "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "BUILD_TESTING": "ON"}
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BUILD_TESTING": "ON",
+        "SAME_ENABLE_CUDA": "ON",
+        "SAME_REQUIRE_CUDA": "OFF"
+      },
+      "description": "Native Ninja targets for CLion; Windows CUDA requires a Visual Studio toolchain. / CLion 原生 Ninja 目标；Windows CUDA 请选择 Visual Studio 工具链。"
     },
     {
       "name": "cuda",
       "inherits": "release",
       "displayName": "Release requiring a working CUDA toolchain",
-      "cacheVariables": {"SAME_ENABLE_CUDA": "ON", "SAME_REQUIRE_CUDA": "ON"}
+      "cacheVariables": {
+        "SAME_ENABLE_CUDA": "ON",
+        "SAME_REQUIRE_CUDA": "ON"
+      }
     },
     {
       "name": "cpu",
       "inherits": "release",
       "displayName": "CPU-only Release",
-      "cacheVariables": {"SAME_ENABLE_CUDA": "OFF", "SAME_REQUIRE_CUDA": "OFF"}
+      "cacheVariables": {
+        "SAME_ENABLE_CUDA": "OFF",
+        "SAME_REQUIRE_CUDA": "OFF"
+      }
     },
     {
       "name": "asan",
       "inherits": "cpu",
       "displayName": "Host ASan/UBSan (supported Unix toolchains)",
-      "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug", "SAME_SANITIZERS": "ON"}
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "SAME_SANITIZERS": "ON"
+      }
     }
   ],
   "buildPresets": [
-    {"name": "cuda", "configurePreset": "cuda"},
-    {"name": "release", "configurePreset": "release"},
-    {"name": "cpu", "configurePreset": "cpu"},
-    {"name": "asan", "configurePreset": "asan"}
+    {
+      "name": "cuda",
+      "configurePreset": "cuda"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "cpu",
+      "configurePreset": "cpu"
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan"
+    }
   ],
   "testPresets": [
-    {"name": "cuda", "configurePreset": "cuda", "output": {"outputOnFailure": true}},
-    {"name": "release", "configurePreset": "release", "output": {"outputOnFailure": true}},
-    {"name": "cpu", "configurePreset": "cpu", "output": {"outputOnFailure": true}},
-    {"name": "asan", "configurePreset": "asan", "output": {"outputOnFailure": true}}
+    {
+      "name": "cuda",
+      "configurePreset": "cuda",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "cpu",
+      "configurePreset": "cpu",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
   ]
 }

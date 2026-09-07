@@ -1,0 +1,15 @@
+# Ordered routes are independent of probing; CPU never hides strict-mode failure.
+# 路线排序独立于能力探测；严格模式绝不以 CPU 掩盖失败。
+function(same_build_routes output mode vs_generator)
+  set(_routes)
+  if(NOT mode STREQUAL off)
+    list(APPEND _routes sdk-cuda)
+    if(vs_generator)
+      list(APPEND _routes msvc-cuda)
+    endif()
+  endif()
+  if(NOT mode STREQUAL on)
+    list(APPEND _routes cpu)
+  endif()
+  set(${output} "${_routes}" PARENT_SCOPE)
+endfunction()

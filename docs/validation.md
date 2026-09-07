@@ -1,5 +1,33 @@
 # 验证记录 / Validation record
 
+## 2026-09-07：原生构建与可读性重构 / Native build and readability refactor
+
+本轮重新执行，集成测试已迁移为 C++，构建及全部 CTest 不依赖 Python。下方旧记录保留为历史，不替代本轮证据。
+
+These runs exercise the native C++ integration suite; configuration, builds and all CTest suites require no Python. Earlier records below remain historical evidence only.
+
+| 本轮环境 / Current environment | 实际结果 / Executed result |
+|---|---|
+| Windows, Ninja, MSVC 19.44, CUDA 12.8 | 完整构建及 8/8 CTest 通过；计算测试实际执行 CUDA / Full build and 8/8 suites passed, including actual CUDA execution |
+| Windows, Visual Studio 17 2022, CUDA Build Customizations 12.8 | 完整构建及 8/8 CTest 通过；原生 MSBuild CUDA 路线 / Full build and 8/8 suites passed through native MSBuild CUDA integration |
+| Windows, Ninja, MinGW GCC 16.1, automatic CUDA policy | 明确回退 CPU，完整构建及 8/8 CTest 通过 / Explicit CPU fallback, full build and 8/8 suites passed |
+| WSL Ubuntu 24.04, GCC 13.3, Debug CPU, ASan/UBSan | 完整构建及 8/8 CTest 通过 / Full build and 8/8 suites passed |
+| clang-format 22.1.8 | 项目全部 C++/CUDA 文件 `--dry-run --Werror` 通过；原生 `format-check` 目标通过 / All project C++/CUDA sources and native format-check target passed |
+
+Ninja CUDA 工程的 CMake File API 返回独立 CUDA 编译组，标准为 C++20；主机 C++ 编译组为 C++23。`compile_commands.json` 包含 `.cu` 的真实 nvcc 命令，公开头文件也注册为目标文件集。**这验证 IDE 所需的构建元数据，不等同于已人工打开 CLion 验收。**
+
+The Ninja CUDA CMake File API exposes a separate CUDA compile group using C++20, with host C++23. Its compilation database contains real nvcc commands and public headers are registered as target file sets. **This validates IDE-facing metadata, not manual CLion UI acceptance.**
+
+新增测试入口 / New test entry points: `tests/build_policy.cmake`、`tests/integration_tests.cpp`。原有 CLI 场景包括缓存、文件变化、忽略规则、链接、状态锁、非法配置、摘要碰撞和 CUDA 回退；平台专属场景仍明确跳过，不把 CPU 回退当成 GPU 执行证明。
+
+The migrated CLI scenarios cover caching, file changes, ignore rules, links, state locking, invalid configuration, digest collisions and CUDA fallback. Platform-only skips remain explicit; CPU fallback is never evidence of GPU execution.
+
+普通 PowerShell 下的纯 CMake 自动入口已验证选中 SDK/Ninja；显式指定 MinGW 则保持 GNU 工具链并回退 CPU。VS 链接可报告 NVIDIA 12.8 的 `cudart_static.lib` / `cudadevrt.lib` 默认库引起的 LNK4098；项目对象均使用 `/MD`。本次保留既有静态 CUDA 运行库，未为压制警告改成需要额外 cudart DLL 的部署方式。
+
+The pure-CMake launcher selected SDK/Ninja from ordinary PowerShell; explicit MinGW retained GNU and fell back to CPU. VS linking can report LNK4098 from NVIDIA 12.8 static runtime default-library directives, while project objects consistently use `/MD`. Existing static CUDA runtime linkage is preserved rather than adding a cudart DLL deployment dependency merely to suppress a warning.
+
+## 历史验证 / Historical validation
+
 日期 / Date: 2026-09-06。这里记录实际执行结果，不把尚未运行的 CI 视为证据。
 
 These are executed results, not claims that the newly added CI has run.

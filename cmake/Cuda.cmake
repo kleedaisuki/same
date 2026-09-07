@@ -1,21 +1,13 @@
 # Validate before fetching dependencies; never replace an already selected compiler.
 # 下载依赖前验证；绝不替换已经选定的编译器。
 set(SAME_CUDA OFF)
-if(SAME_ENABLE_CUDA AND CMAKE_GENERATOR MATCHES "^Visual Studio")
-  message(FATAL_ERROR
-    "same uses direct CUDA compiler invocation, not Visual Studio CUDA/MSBuild integration. "
-    "Run: python tools/build.py --cuda on --test (automatic MSVC environment + Ninja + nvcc). "
-    "For native CMake, initialize the MSVC developer environment and use -G Ninja with a fresh build directory. "
-    "For a Visual Studio CPU-only build, set -DSAME_ENABLE_CUDA=OFF. "
-    "Do not install a CUDA Visual Studio extension to resolve this error.")
-endif()
 if(SAME_REQUIRE_CUDA AND NOT SAME_ENABLE_CUDA)
   message(FATAL_ERROR "SAME_REQUIRE_CUDA conflicts with SAME_ENABLE_CUDA=OFF")
 endif()
 set(_same_cuda_reason "disabled by SAME_ENABLE_CUDA=OFF")
 if(SAME_ENABLE_CUDA)
   if(WIN32 AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-    set(_same_cuda_reason "Windows nvcc backend requires MSVC C/C++; selected ${CMAKE_CXX_COMPILER_ID}. Use python tools/build.py in a fresh directory for automatic MSVC discovery")
+    set(_same_cuda_reason "Windows nvcc backend requires MSVC C/C++; selected ${CMAKE_CXX_COMPILER_ID}. Use cmake -P tools/build.cmake in a fresh directory for automatic MSVC discovery")
   elseif(APPLE)
     set(_same_cuda_reason "the CUDA backend is not supported on macOS")
   else()
