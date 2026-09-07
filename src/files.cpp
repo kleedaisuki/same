@@ -14,6 +14,7 @@
 #include <system_error>
 #ifdef _WIN32
 #include "same/detail/windows_metadata.hpp"
+#include "same/detail/windows_path.hpp"
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -64,9 +65,10 @@ FileReader::FileReader(const std::filesystem::path& path) : impl_(std::make_uniq
     /// 允许其他程序写入/替换路径；持有句柄仍指向原文件，但不是内容快照。
     /// Sharing permits concurrent writes/path replacement; the handle pins the file, not a content
     /// snapshot.
+    const auto native = detail::windows_path(path);
     impl_->handle = CreateFileW(
-        path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        native.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (impl_->handle == INVALID_HANDLE_VALUE)
         io_error("open file", impl_->path);
     BY_HANDLE_FILE_INFORMATION info{};
@@ -167,7 +169,8 @@ std::size_t FileReader::read(std::span<std::byte> destination) {
 }
 bool is_reparse_point(const std::filesystem::path& path) {
 #ifdef _WIN32
-    const auto attributes = GetFileAttributesW(path.c_str());
+    const auto native = detail::windows_path(path);
+    const auto attributes = GetFileAttributesW(native.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES)
         io_error("file attributes", path);
     return (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;

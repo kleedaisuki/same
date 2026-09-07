@@ -1,0 +1,3 @@
+// Embed the same manifest with non-MSVC resource compilers.
+// 非 MSVC 资源编译器嵌入相同的应用程序清单。
+1 24 "windows.manifest"

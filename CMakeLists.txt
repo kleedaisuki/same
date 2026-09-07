@@ -21,8 +21,19 @@ set_target_properties(same_core PROPERTIES CXX_EXTENSIONS OFF)
 target_sources(same_core PUBLIC FILE_SET HEADERS BASE_DIRS include FILES
   include/same/application.hpp include/same/compute.hpp include/same/config.hpp
   include/same/files.hpp include/same/resources.hpp include/same/run_lock.hpp
-  include/same/store.hpp include/same/terminal.hpp include/same/detail/windows_metadata.hpp)
+  include/same/store.hpp include/same/terminal.hpp include/same/detail/windows_metadata.hpp include/same/detail/windows_path.hpp)
 target_link_libraries(same_core PUBLIC sqlite3 BLAKE3::blake3 tomlplusplus::tomlplusplus Threads::Threads)
+if(WIN32)
+  # Include the opt-in in every executable, including tests, for CRT/STL long paths.
+  # 所有可执行文件（含测试）均声明支持长路径，覆盖 CRT/STL 文件操作。
+  if(MSVC)
+    target_sources(same_core INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/src/windows.manifest")
+  else()
+    enable_language(RC)
+    target_sources(same_core INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/src/windows.rc")
+    target_include_directories(same_core INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  endif()
+endif()
 if(SAME_CUDA)
   target_sources(same_core PRIVATE src/compute_cuda.cu)
   set_target_properties(same_core PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)

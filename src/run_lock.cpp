@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <system_error>
 #ifdef _WIN32
+#include "same/detail/windows_path.hpp"
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -45,7 +46,8 @@ RunLock::RunLock(const std::filesystem::path& path) : impl_(std::make_unique<Imp
     /// 共享模式为零，因此已有不兼容打开会立刻失败；OPEN_ALWAYS 保留锁文件身份。
     /// Zero sharing fails immediately on incompatible opens; OPEN_ALWAYS preserves lock-file
     /// identity.
-    impl_->handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
+    const auto native = detail::windows_path(path);
+    impl_->handle = CreateFileW(native.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
                                 FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (impl_->handle == INVALID_HANDLE_VALUE)
         throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),

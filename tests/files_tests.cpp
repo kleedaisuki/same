@@ -3,7 +3,9 @@
  * boundaries and symlink protection.
  */
 #include "same/detail/windows_metadata.hpp"
+#include "same/detail/windows_path.hpp"
 #include "same/files.hpp"
+#include "same/run_lock.hpp"
 #include <array>
 #include <chrono>
 #include <fstream>
@@ -45,6 +47,44 @@ int main() {
             fs::remove_all(path, ec);
         }
     } cleanup{root};
+#ifdef _WIN32
+    // 显式扩展路径创建夹具，避免依赖注册表或测试进程清单。
+    // Create fixtures with explicit extended paths, independent of registry/manifest opt-in.
+    const auto deep = root / std::wstring(100, L'a') / std::wstring(100, L'b') / L"论文资料";
+    const fs::path extended(L"\\\\?\\" + deep.native());
+    fs::create_directories(extended);
+    {
+        std::ofstream file(extended / L"论文.pdf", std::ios::binary);
+        file << "abc";
+        if (!file)
+            throw std::runtime_error("long path fixture");
+    }
+    const auto long_file = deep / L"论文.pdf";
+    if (long_file.native().size() < MAX_PATH || same::is_reparse_point(long_file))
+        throw std::runtime_error("long path attributes");
+    for (const auto& path :
+         {long_file, deep / L".." / L"论文资料" / L"论文.pdf", extended / L"论文.pdf"}) {
+        same::FileReader long_reader(path);
+        std::array<std::byte, 4> content{};
+        if (long_reader.stamp().size != 3 || long_reader.read(content) != 3 ||
+            content[0] != std::byte{'a'} || long_reader.read(content) != 0)
+            throw std::runtime_error("long path read");
+    }
+    {
+        same::RunLock lock(deep / L"run.lock");
+    }
+    // 构造盘符相对路径，覆盖不同工作盘符而不修改进程工作目录。
+    // Exercise drive-relative input without changing the process working directory.
+    const auto relative =
+        long_file.root_name() / long_file.lexically_relative(fs::absolute(long_file.root_name()));
+    if (same::stamp_path(relative) != same::stamp_path(long_file))
+        throw std::runtime_error("drive-relative long path");
+    const std::wstring unc = L"\\\\server\\share\\" + std::wstring(250, L'x');
+    if (same::detail::windows_path(unc) != L"\\\\?\\UNC\\" + unc.substr(2) ||
+        same::detail::windows_path(L"file") != L"file" ||
+        same::detail::windows_path(L"\\\\.\\NUL") != L"\\\\.\\NUL")
+        throw std::runtime_error("Windows path conversion");
+#endif
     {
         std::ofstream file(root / "file", std::ios::binary);
         file << "abc";
