@@ -3,16 +3,30 @@
 #include "same/resources.hpp"
 #include "same/run_lock.hpp"
 #include "same/store.hpp"
+#include "same/terminal.hpp"
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <deque>
 #include <future>
+#include <iomanip>
+#include <locale>
+#include <numeric>
 #include <optional>
 #include <ostream>
+#include <sstream>
 #include <stdexcept>
 
 namespace same {
 namespace {
 namespace fs = std::filesystem;
+/// Monotonic wall clock for overlapping pipeline measurements.
+/// 用于重叠流水线计量的单调墙钟。
+using Clock = std::chrono::steady_clock;
+/// Convert one measured interval to milliseconds. 将一个测量区间转换为毫秒。
+double milliseconds(Clock::time_point start, Clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
 /// Persist paths as generic UTF-8 bytes, independent of native separators.
 /// 以通用 UTF-8 字节持久化路径，不依赖本机分隔符。
 std::string path_key(const fs::path& path) {
@@ -33,13 +47,14 @@ void unchanged(const fs::path& path, FileReader& reader, const FileStamp& expect
 }
 /// Coalesce short reads until the buffer is full or EOF is reached.
 /// 合并短读，直到缓冲区填满或遇到文件末尾。
-std::size_t read_block(FileReader& reader, std::span<std::byte> buffer) {
+std::size_t read_block(FileReader& reader, std::span<std::byte> buffer, std::uint64_t& bytes) {
     std::size_t count = 0;
     while (count < buffer.size()) {
         const auto read = reader.read(buffer.subspan(count));
         if (!read)
             break;
         count += read;
+        bytes += read;
     }
     return count;
 }
@@ -53,6 +68,7 @@ FileRecord hash_file(const fs::path& root, FileRecord record, Worker& worker) {
     std::uint64_t total = 0;
     for (;;) {
         const auto count = reader.read(worker.first);
+        worker.hash_bytes += count;
         if (!count)
             break;
         if (count > record.stamp.size - total)
@@ -79,7 +95,8 @@ bool equal_files(const fs::path& root, const FileRecord& a, const FileRecord& b,
         const auto count =
             static_cast<std::size_t>(std::min<std::uint64_t>(left, worker.first.size()));
         auto x = std::span(worker.first).first(count), y = std::span(worker.second).first(count);
-        if (read_block(first, x) != count || read_block(second, y) != count)
+        if (read_block(first, x, worker.compare_bytes) != count ||
+            read_block(second, y, worker.compare_bytes) != count)
             throw std::runtime_error("file truncated during comparison: " + a.path + " / " +
                                      b.path);
         equal = worker.compute->equal(x, y);
@@ -128,8 +145,19 @@ void prepare_state(const fs::path& root) {
 struct Counters {
     /// Eligible regular files visited. 扫描到的合格普通文件数。
     std::size_t scanned = 0;
+    /// Main state.db file length after scan commit; excludes journals and temporary storage.
+    /// 扫描提交后 state.db 主文件长度；不含日志和临时存储。
+    std::uintmax_t database_bytes = 0;
+    /// Logical sizes, not physical disk traffic. 逻辑大小，并非物理磁盘流量。
+    std::uint64_t scanned_bytes = 0, cached_bytes = 0;
     /// Files submitted for hashing. 已提交哈希计算的文件数。
     std::size_t hashed = 0;
+    /// Main-thread hash submission/get intervals, including dispatch overhead.
+    /// 主线程提交及获取哈希结果的区间，包含调度开销。
+    double hash_wait_ms = 0;
+    /// Sum of worker hash-job wall times, including reads and CPU fallback retries.
+    /// 工作线程哈希任务墙钟耗时之和，包含读取及 CPU 回退重试。
+    double hash_work_ms = 0;
     /// Records reused after matching stamps. 文件戳匹配后复用的记录数。
     std::size_t cached = 0;
     /// Emitted duplicate equivalence classes. 输出的重复文件等价类数量。
@@ -137,14 +165,26 @@ struct Counters {
     /// Emitted members, including representatives. 输出成员数，包含代表文件。
     std::size_t matches = 0;
 };
+/// Hash result and job-local timing, transferred together via a future.
+/// 哈希结果及任务本地耗时，通过同一个 future 传递。
+struct HashResult {
+    /// Successfully verified digest and metadata. 成功验证的摘要与元数据。
+    FileRecord record;
+    /// Worker wall time; queue residence excluded. 工作线程墙钟时间，不含排队。
+    double work_ms;
+};
 /// Stream the tree into bounded worker jobs; keep every SQLite mutation on this thread.
 /// 流式遍历目录并提交有界任务；所有 SQLite 修改留在当前线程。
 void scan(const fs::path& root, const Config& config, Store& store, Resources& resources,
           Counters& counters) {
     Ignore ignore(root);
-    std::deque<std::future<FileRecord>> pending;
+    std::deque<std::future<HashResult>> pending;
     auto drain = [&] {
-        store.save(pending.front().get());
+        const auto start = Clock::now();
+        auto result = pending.front().get();
+        counters.hash_wait_ms += milliseconds(start, Clock::now());
+        counters.hash_work_ms += result.work_ms;
+        store.save(result.record);
         pending.pop_front();
     };
     store.begin_scan();
@@ -161,16 +201,22 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
             continue;
         ++counters.scanned;
         FileRecord record{key, stamp_path(it->path()), {}};
+        counters.scanned_bytes += record.stamp.size;
         const auto cached = store.cached(key);
         if (!config.rehash && cached && cached->stamp == record.stamp) {
             store.save(*cached);
             ++counters.cached;
+            counters.cached_bytes += record.stamp.size;
             continue;
         }
         ++counters.hashed;
+        const auto submitted = Clock::now();
         pending.push_back(resources.submit([root, record = std::move(record)](Worker& worker) {
-            return worker.execute([&] { return hash_file(root, record, worker); });
+            const auto start = Clock::now();
+            auto hashed = worker.execute([&] { return hash_file(root, record, worker); });
+            return HashResult{std::move(hashed), milliseconds(start, Clock::now())};
         }));
+        counters.hash_wait_ms += milliseconds(submitted, Clock::now());
         // Futures, as well as executable jobs, are bounded: slow early files cannot
         // let completed results accumulate without limit.
         // future 同样有界，避免前面的慢文件导致后续已完成结果无限堆积。
@@ -277,42 +323,181 @@ void partition(const fs::path& root, Store& store, Resources& resources, std::si
     store.visit_candidates([&](const FileRecord& record) { partitioner.accept(record); });
     partitioner.flush();
 }
-} // namespace
-int run(const fs::path& root, const Config& config, std::ostream& output,
-        std::ostream& diagnostics) {
-    prepare_state(root);
-    RunLock lock(root / ".same" / "run.lock");
-    Store store(root / ".same" / "state.db");
-    Resources resources(config);
-    Counters counters;
-    scan(root, config, store, resources, counters);
-    partition(root, store, resources, config.queue_capacity);
-    // Validate every reported member before emitting anything. This detects ordinary
-    // concurrent edits, but a live filesystem is not an atomic snapshot.
-    // 输出前复核所有成员；这能检测通常的并发修改，但不构成原子文件系统快照。
-    store.visit_matches([&](std::string_view, std::string_view member) {
-        const auto record = store.cached(member);
+/// Recheck all displayed paths before any output; this is not an atomic snapshot.
+/// 输出前复核所有展示路径；这不是原子快照。
+void validate_results(const fs::path& root, Store& store, bool unique_files) {
+    const auto validate = [&](std::string_view path) {
+        const auto record = store.cached(path);
         if (!record || stamp_path(native_path(root, record->path)) != record->stamp)
-            throw std::runtime_error("file changed before output: " + std::string(member));
-    });
+            throw std::runtime_error("file changed before output: " + std::string(path));
+    };
+    store.visit_matches([&](std::string_view, std::string_view member) { validate(member); });
+    if (unique_files)
+        store.visit_unique(validate);
+}
+/// Stream an escaped, bounded-memory report; labels work without color.
+/// 流式输出转义报告，内存有界；无色时标签仍表达语义。
+void render_results(Store& store, Counters& counters, std::ostream& output, OutputOptions options) {
+    const auto green = options.color ? "\033[32m" : "";
+    const auto yellow = options.color ? "\033[33m" : "";
+    const auto reset = options.color ? "\033[0m" : "";
+    if (options.pretty)
+        output << "same | exact duplicate report\n"
+                  "-----------------------------\n";
     std::string previous;
     store.visit_matches([&](std::string_view representative, std::string_view member) {
         if (representative != previous) {
             previous = representative;
             ++counters.groups;
+            if (options.pretty)
+                output << green << "\n[SAME] Group " << counters.groups << reset << '\n';
         }
         ++counters.matches;
-        output << counters.groups << '\t';
+        if (options.pretty)
+            output << "  " << green;
+        else
+            output << green << counters.groups << '\t';
         quoted_path(output, member);
-        output << '\n';
+        output << reset << '\n';
     });
+    if (options.unique_files) {
+        if (options.pretty)
+            output << yellow << "\n[UNIQUE] No duplicate in this scan" << reset << '\n';
+        store.visit_unique([&](std::string_view path) {
+            output << yellow << (options.pretty ? "  " : "0\t");
+            quoted_path(output, path);
+            output << reset << '\n';
+        });
+    }
+    if (options.pretty) {
+        const auto heading = options.color ? "\033[1;36m" : "";
+        output << '\n'
+               << heading << "Summary" << reset << " | " << green << counters.groups << " groups"
+               << reset << " | " << green << counters.matches << " matching files" << reset << " | "
+               << yellow << counters.scanned - counters.matches << " unique files" << reset;
+        if (!options.unique_files && counters.scanned != counters.matches)
+            output << " (hidden; --unique-files to show)";
+        output << '\n';
+        output << "  " << heading << "Database" << reset << " | .same/state.db | " << green
+               << human_bytes(static_cast<double>(counters.database_bytes)) << reset << " | "
+               << counters.scanned << " records | " << green << "committed" << reset << '\n';
+    }
     output.flush();
     if (!output)
         throw std::runtime_error("cannot write results");
-    diagnostics << "scanned=" << counters.scanned << " hashed=" << counters.hashed
-                << " cached=" << counters.cached << " groups=" << counters.groups
-                << " matches=" << counters.matches << " gpu_workers=" << resources.gpu_workers()
-                << " cpu_fallbacks=" << resources.fallbacks() << '\n';
+}
+/// Human-facing profile; machine metrics use a separate unchanged renderer.
+/// 面向人的统计展示；机器统计使用独立且保持不变的渲染器。
+void render_pretty_profile(const Counters& counters, const Resources& resources,
+                           const std::array<double, 5>& phases, double elapsed,
+                           std::uint64_t hashed, std::uint64_t compared, std::ostream& out,
+                           bool color) {
+    const auto heading = color ? "\033[1;36m" : "";
+    const auto value = color ? "\033[36m" : "";
+    const auto reset = color ? "\033[0m" : "";
+    const auto row = [&](std::string_view label, const std::string& text) {
+        out << "  " << std::left << std::setw(16) << label << value << text << reset << '\n';
+    };
+    out << '\n'
+        << heading << "Profile" << reset << " | wall time / logical reads\n"
+        << "-----------------------------------------\n";
+    row("Files", std::to_string(counters.scanned) + " scanned | " +
+                     std::to_string(counters.hashed) + " hashed | " +
+                     std::to_string(counters.cached) + " cached");
+    row("Data", human_bytes(static_cast<double>(counters.scanned_bytes)) + " scanned | " +
+                    human_bytes(static_cast<double>(counters.cached_bytes)) + " cached");
+    row("Read", human_bytes(static_cast<double>(hashed) + static_cast<double>(compared)) +
+                    " total | " + human_bytes(static_cast<double>(hashed)) + " hash | " +
+                    human_bytes(static_cast<double>(compared)) + " compare");
+    row("Initialize", human_duration(phases[0]));
+    row("Scan",
+        human_duration(std::max(0.0, phases[1] - counters.hash_wait_ms)) + " (main-thread work)");
+    row("Hash wait", human_duration(counters.hash_wait_ms) + " (submit + join)");
+    row("Hash work", human_duration(counters.hash_work_ms) + " (summed workers; overlaps scan)");
+    row("Pipeline", human_duration(phases[1]) + " (Scan + Hash wait; excludes Hash work sum)");
+    row("Compare", human_duration(phases[2]));
+    row("Validate", human_duration(phases[3]));
+    row("Output", human_duration(phases[4]));
+    row("Elapsed", human_duration(elapsed));
+    const auto rate = elapsed > 0 ? (static_cast<double>(hashed) + static_cast<double>(compared)) /
+                                        (elapsed / 1000)
+                                  : 0;
+    row("Read rate", human_bytes(rate) + "/s");
+    row("Backend", std::to_string(resources.gpu_workers()) + " GPU workers | " +
+                       std::to_string(resources.fallbacks()) + " CPU fallbacks");
+}
+/// Print phase wall times and successful read bytes, not CPU time or physical I/O.
+/// 输出各阶段墙钟耗时及成功读取字节，不代表 CPU 时间或物理 I/O。
+void render_profile(const Counters& counters, const Resources& resources,
+                    const std::array<double, 5>& phases, std::ostream& diagnostics,
+                    OutputOptions options) {
+    const auto [hash_bytes, compare_bytes] = resources.read_bytes();
+    const double elapsed = std::accumulate(phases.begin(), phases.end(), 0.0);
+    const double rate =
+        elapsed > 0 ? (static_cast<double>(hash_bytes) + static_cast<double>(compare_bytes)) /
+                          1048576.0 / (elapsed / 1000.0)
+                    : 0;
+    // Local formatting leaves caller flags and locale untouched.
+    // 局部格式化保留调用方格式和区域设置。
+    std::ostringstream profile;
+    profile.imbue(std::locale::classic());
+    profile << std::fixed << std::setprecision(3);
+    if (options.diagnostics_pretty) {
+        render_pretty_profile(counters, resources, phases, elapsed, hash_bytes, compare_bytes,
+                              profile, options.diagnostics_color);
+        diagnostics << profile.str();
+        return;
+    }
+    profile << "scanned=" << counters.scanned << " hashed=" << counters.hashed
+            << " cached=" << counters.cached << " groups=" << counters.groups
+            << " matches=" << counters.matches << " gpu_workers=" << resources.gpu_workers()
+            << " cpu_fallbacks=" << resources.fallbacks() << '\n';
+    profile << "database_bytes=" << counters.database_bytes
+            << " database_records=" << counters.scanned << '\n';
+    profile << "unique=" << counters.scanned - counters.matches
+            << " scanned_bytes=" << counters.scanned_bytes
+            << " cached_bytes=" << counters.cached_bytes;
+    profile << " " << "hash_read_bytes=" << hash_bytes << " compare_read_bytes=" << compare_bytes
+            << " read_bytes=" << hash_bytes + compare_bytes;
+    profile << " " << "init_ms=" << phases[0] << " scan_ms=" << phases[1]
+            << " compare_ms=" << phases[2] << " validate_ms=" << phases[3]
+            << " output_ms=" << phases[4];
+    profile << " " << "elapsed_ms=" << elapsed << " read_mib_s=" << rate << '\n';
+    profile << "scan_work_ms=" << std::max(0.0, phases[1] - counters.hash_wait_ms)
+            << " hash_wait_ms=" << counters.hash_wait_ms
+            << " hash_work_ms=" << counters.hash_work_ms << '\n';
+    diagnostics << profile.str();
+}
+} // namespace
+int run(const fs::path& root, const Config& config, std::ostream& output,
+        std::ostream& diagnostics) {
+    return run(root, config, output, diagnostics, {});
+}
+int run(const fs::path& root, const Config& config, std::ostream& output, std::ostream& diagnostics,
+        OutputOptions options) {
+    const auto start = Clock::now();
+    prepare_state(root);
+    RunLock lock(root / ".same" / "run.lock");
+    Store store(root / ".same" / "state.db");
+    Resources resources(config);
+    Counters counters;
+    const auto initialized = Clock::now();
+    scan(root, config, store, resources, counters);
+    const auto scanned = Clock::now();
+    partition(root, store, resources, config.queue_capacity);
+    const auto compared = Clock::now();
+    validate_results(root, store, options.unique_files);
+    // end_scan committed exactly the visited records; measure before emitting any output.
+    // end_scan 已提交全部已访问记录；在任何输出前读取文件长度。
+    counters.database_bytes = fs::file_size(root / ".same" / "state.db");
+    const auto validated = Clock::now();
+    render_results(store, counters, output, options);
+    const auto finished = Clock::now();
+    render_profile(counters, resources,
+                   {milliseconds(start, initialized), milliseconds(initialized, scanned),
+                    milliseconds(scanned, compared), milliseconds(compared, validated),
+                    milliseconds(validated, finished)},
+                   diagnostics, options);
     if (config.backend != "cpu" && resources.gpu_workers() < config.workers)
         diagnostics << "CUDA unavailable or device budget insufficient for some workers; using CPU "
                        "fallback.\n";

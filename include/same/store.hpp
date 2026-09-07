@@ -78,6 +78,10 @@ public:
     /// within the callback.
     void visit_matches(const std::function<void(std::string_view, std::string_view)>& visitor);
 
+    /// Stream paths outside duplicate classes, ordered by path; bounded memory.
+    /// 按路径流式遍历不属于重复组的文件，内存有界。
+    void visit_unique(const std::function<void(std::string_view)>& visitor);
+
 private:
     /// 隐藏 SQLite 连接与事务状态。 / Hide SQLite connection and transaction state.
     struct Impl;

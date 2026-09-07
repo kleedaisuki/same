@@ -292,4 +292,15 @@ void Store::visit_matches(const std::function<void(std::string_view, std::string
         visitor(representative, member);
     }
 }
+void Store::visit_unique(const std::function<void(std::string_view)>& visitor) {
+    Statement query(
+        impl_->db,
+        "SELECT path FROM files EXCEPT SELECT m.member FROM matches m JOIN "
+        "(SELECT representative FROM matches GROUP BY representative HAVING count(*)>1) g "
+        "ON m.representative=g.representative ORDER BY 1");
+    while (query.step()) {
+        const auto path = query.string(0);
+        visitor(path);
+    }
+}
 } // namespace same

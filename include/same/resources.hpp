@@ -3,12 +3,14 @@
 #include "same/config.hpp"
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <future>
 #include <mutex>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace same {
@@ -23,6 +25,9 @@ struct Worker {
     /// 非拥有计数器，Resources 保证其比工作线程存活更久。 / Non-owning counter kept alive by
     /// Resources until workers stop.
     std::atomic<std::size_t>* fallbacks;
+    /// Actual successful read bytes, including backend retries; worker-thread-only writes.
+    /// 实际成功读取字节，包含后端重试；仅所属工作线程写入。
+    std::uint64_t hash_bytes{0}, compare_bytes{0};
 
     /**
      * @brief 后端失败时换为 CPU，并完整重试一次。 / Replace a failed backend with CPU and retry
@@ -87,6 +92,17 @@ public:
     /// probes.
     std::size_t fallbacks() const {
         return fallbacks_.load();
+    }
+
+    /// Sum after all submitted futures complete; never call concurrently with jobs.
+    /// 仅在所有已提交 future 完成后求和，不得与任务并发调用。
+    std::pair<std::uint64_t, std::uint64_t> read_bytes() const {
+        std::uint64_t hashed = 0, compared = 0;
+        for (const auto& worker : workers_) {
+            hashed += worker->hash_bytes;
+            compared += worker->compare_bytes;
+        }
+        return {hashed, compared};
     }
 
 private:

@@ -65,9 +65,9 @@ same --version
 
 `--cpu` overrides the backend; `--rehash` bypasses cached digests for this run. There is no directory argument.
 
-标准输出每行是 `组号<TAB>带双引号的相对路径`，只输出至少两个成员的精确重复组。路径使用 `/`，引号和反斜杠转义，控制字节表示为 `\u00xx`。组号仅属于本次结果，不是稳定标识。
+重定向或 `--format=tsv` 时，标准输出每行是 `组号<TAB>带双引号的相对路径`，只输出至少两个成员的精确重复组。路径使用 `/`，引号和反斜杠转义，控制字节表示为 `\u00xx`。组号仅属于本次结果，不是稳定标识。
 
-Each stdout line is `group-number<TAB>quoted-relative-path`. Only exact groups with at least two members are emitted. Paths use `/`; quotes/backslashes are escaped and control bytes use `\u00xx`. Group numbers are run-local, not persistent identifiers.
+When redirected or using `--format=tsv`, each stdout line is `group-number<TAB>quoted-relative-path`. Only exact groups with at least two members are emitted. Paths use `/`; quotes/backslashes are escaped and control bytes use `\u00xx`. Group numbers are run-local, not persistent identifiers.
 
 ```text
 1	"copies/a.txt"
@@ -79,6 +79,82 @@ Each stdout line is `group-number<TAB>quoted-relative-path`. Only exact groups w
 上述列之间实际为制表符。统计信息和诊断写入 stderr：`scanned`、`hashed`、`cached`、`groups`、`matches`、`gpu_workers`、`cpu_fallbacks`。退出码 **0** 表示扫描完成，无论是否发现重复；**2** 表示失败。输出设备故障可能留下部分输出，必须检查退出码。
 
 Columns above are separated by actual tabs. Statistics and diagnostics go to stderr. Exit **0** means a completed scan, with or without duplicates; **2** means failure. Output-device failure can leave partial output; always check the exit code.
+
+### 终端展示与着色 / Terminal presentation and color
+
+交互终端默认只按组展示绿色 `[SAME]` 文件，并显示彩色 Summary 与 Profile。未找到副本的文件默认折叠，只有加上 `--unique-files` 才展开黄色 `[UNIQUE]` 列表；Summary 仍显示其数量和展开提示。`UNIQUE` 仅表示**本次扫描范围内未找到副本**，不是错误，也不是与某个指定文件的差异报告。忽略规则排除的文件不参与判断；摘要缓存仍遵循下文的信任边界。所有路径沿用 TSV 的转义规则，文件名中的控制字符不会变成终端指令。
+
+Interactive terminals show green `[SAME]` groups and colored Summary/Profile sections. Unmatched paths are hidden by default; `--unique-files` expands the yellow `[UNIQUE]` list. Summary retains the unmatched count and expansion hint. UNIQUE means **no duplicate found within this scan**, not an error or a pairwise diff. Ignored files are outside the comparison scope; the cache trust boundary below still applies. Paths use the same escaping as TSV, including terminal control characters.
+
+```sh
+same --unique-files               # 展开未找到副本的文件 / expand unmatched paths
+same --color=auto                 # 自动检测 / automatic detection (default)
+same --color=never                # 无色，但保留终端排版 / plain terminal report
+same --format=pretty --color=never # 在日志中保留可读排版 / readable plain logs
+same --format=tsv --color=never    # 固定脚本格式 / stable script format
+same --color=always               # 显式强制 ANSI / explicitly force ANSI
+same > matches.tsv 2> profile.log # 结果与统计分离 / separate results and statistics
+```
+
+`--format=auto|pretty|tsv` 与 `--color=auto|always|never` 相互独立，均为命令行选项，不写入 TOML。自动颜色遵循非空 `NO_COLOR`、`TERM=dumb` 和各标准流是否连接终端；重定向默认无色并保留原 TSV。Windows 自动尝试启用虚拟终端（Virtual Terminal, VT）处理，不支持时降级无色，退出时恢复控制台模式。显式 `always` 会覆盖环境提示，即使重定向也输出 ANSI 控制码；`never` 始终无色。stdout 与 stderr 独立检测：自动模式下，重定向结果不影响终端中的 Profile，重定向统计也不会带入颜色。`--format=tsv` 始终保留原始统计字段；`--format=pretty` 显式选择可读报告与智能单位，重定向时默认仍无色。
+
+Format and color are independent CLI-only options. Auto color honors nonempty `NO_COLOR`, `TERM=dumb`, and independent stdout/stderr terminal detection. Redirected output stays plain legacy TSV. Windows enables VT processing when supported and restores the console mode on exit. Explicit `always` overrides environment hints, including redirection; `never` suppresses all color. Auto mode formats/colors each stream independently: redirecting results does not disable a terminal Profile, and redirecting diagnostics keeps raw uncolored metrics. `--format=tsv` preserves raw profile fields; `--format=pretty` explicitly selects human-readable units, still uncolored by default under redirection.
+
+下面示例使用 `same --unique-files`；默认不显示 UNIQUE 段。 / This example uses `same --unique-files`; the UNIQUE section is hidden by default.
+
+```text
+same | exact duplicate report
+-----------------------------
+
+[SAME] Group 1
+  "copies/a.txt"
+  "original.txt"
+
+[UNIQUE] No duplicate in this scan
+  "notes.txt"
+
+Summary | 1 groups | 2 matching files | 1 unique files
+  Database | .same/state.db | 32.00 KiB | 3 records | committed
+```
+
+Summary 下的彩色 `Database` 行显示 `.same/state.db` 主文件长度、本轮提交后的文件记录数和 `committed` 状态。示例中的大小仅为示意，实际值动态读取，包含数据库内部可复用空间，不含日志、临时数据库或物理磁盘分配开销。`committed` 表示扫描事务成功提交，不表示执行过完整性检查。机器统计在 stderr 另起一行输出 `database_bytes` 和 `database_records`，默认 TSV 结果不变。
+
+The colored Database row shows the main `.same/state.db` file length, committed file-record count, and `committed` status. The example size is illustrative; the actual size is measured, includes internal reusable space, and excludes journals, temporary databases and physical allocation overhead. Committed means the scan transaction succeeded, not that an integrity check was performed. Machine diagnostics add `database_bytes` and `database_records` on a separate stderr line; default TSV results remain unchanged.
+
+在 TSV 模式下显式使用 `--unique-files`，会在正常重复组后追加 `0<TAB>quoted-path` 行，组号 **0** 表示未找到副本，不表示这些文件彼此相同。默认 TSV 完全不变。
+
+With explicit `--unique-files` in TSV mode, unmatched paths follow the duplicate groups as `0<TAB>quoted-path`. Reserved group **0** means unmatched, not equality among those paths. Default TSV is unchanged.
+
+### 性能统计 / Profiling
+
+每次成功扫描都在 stderr 输出统计；重定向到扫描根目录之外即可保存。机器模式的旧计数行保持不变，新增 `key=value` 字段另起一行；可读模式使用对齐的标签、彩色标题/数值与自适应单位，不再混排原始字段。字节与速率自动使用 B、KiB、MiB、GiB 等二进制单位，耗时自动使用 ns、us、ms、s、min 或 h；机器字段仍是精确字节数和固定毫秒。无需高频计时或每块原子操作：读取量由各工作线程独占累计，所有任务完成后求和。
+
+Successful scans emit statistics to stderr; redirect outside the scan root to retain a log. Machine mode retains the legacy counter line and new `key=value` metrics on a separate line. Pretty mode uses aligned labels, colored headings/values and adaptive units instead of raw fields: B/KiB/MiB/GiB and higher binary units for data/rates, ns/us/ms/s/min/h for durations. Machine metrics retain exact byte counts and milliseconds. Workers accumulate read bytes locally, then totals are collected after all jobs finish; there are no per-block atomic operations or timers.
+
+| 字段 / Field | 口径 / Meaning |
+|---|---|
+| `unique` | 扫描文件数减重复组成员数 / Scanned files minus duplicate members |
+| `scanned_bytes` | 所有纳入文件的逻辑大小总和，硬链接按路径计数 / Logical file sizes, hard links counted per path |
+| `cached_bytes` | 复用摘要的文件大小，不是本次读取量 / Sizes of hash-cache hits, not reads |
+| `hash_read_bytes` | 哈希流程成功读取的字节，包含后端失败后的重读 / Successful hashing reads, including backend retries |
+| `compare_read_bytes` | 逐字节验证双方的读取量，包含提前失配前读取与重试 / Reads from both comparison inputs, including early mismatches and retries |
+| `read_bytes` | 上述两种读取量之和，不含 SQLite、元数据、配置与忽略文件 I/O / Hash plus comparison reads, excluding database, metadata, config and ignore I/O |
+| `init_ms` | 状态、锁、数据库与工作线程初始化 / State, lock, database and worker initialization |
+| `scan_ms` | 目录遍历、缓存查询、哈希与扫描事务；这些工作有重叠 / Traversal, cache lookup, hashing and scan transaction; work overlaps |
+| `scan_work_ms` | 原 `scan_ms` 减主线程提交/等待哈希区间，包含遍历、元数据、缓存与数据库写入 / Pipeline wall time minus submit/join intervals; includes traversal, metadata, cache and database writes |
+| `hash_wait_ms` | 主线程提交及获取哈希 future 的区间总和，包含调度开销，不是纯阻塞时间 / Main-thread submission and future-get intervals including dispatch overhead, not pure blocked time |
+| `hash_work_ms` | 所有哈希任务墙钟耗时之和，包含打开、读取、摘要、文件戳校验及 CPU 回退重试，不含排队 / Summed hash-job wall time, including open/read/hash/stamp checks and CPU retries, excluding queue residence |
+| `compare_ms` | 候选分组、字节比较及结果入库 / Candidate partitioning, byte comparison and result storage |
+| `validate_ms` | 输出前文件戳复核 / Pre-output file-stamp validation |
+| `output_ms` | 结果遍历、格式化、写入与 flush / Result iteration, formatting, writing and flush |
+| `elapsed_ms` | 上述阶段之和；不含 CLI 配置加载、统计输出及析构清理 / Sum of phases, excluding CLI config loading, profile output and teardown |
+| `read_mib_s` | `read_bytes / 2^20 / elapsed_seconds`，逻辑读取吞吐量 / Logical read throughput |
+
+计时使用单调时钟（Monotonic Clock）；机器模式使用毫秒并保留三位小数，可读模式自动选择单位并保留两位小数（零值除外）；并非 CPU 时间、GPU 核函数时间或物理磁盘带宽。热摘要缓存可让哈希读取量为零，但重复候选仍需重新读取验证；操作系统页缓存（Page Cache）也会影响耗时。单次测量不是严格基准测试，比较性能时应固定输入、后端、缓存条件并重复运行。
+
+Timings use a monotonic clock, with three decimal places in milliseconds for machine mode and two decimal places in adaptive units for human mode (except zero), not CPU time, GPU kernel time, or physical disk bandwidth. Warm digest caches can eliminate hashing reads but duplicate candidates are still reread. OS page caching affects elapsed time. For benchmarks, control input, backend and cache state and repeat measurements.
+
+设计依据 / Design references: [NO_COLOR convention](https://no-color.org/), [Microsoft VT console processing](https://learn.microsoft.com/en-us/windows/console/console-virtual-terminal-sequences), [USENIX: Auto-pilot benchmarking methodology](https://www.usenix.org/legacy/event/usenix05/tech/freenix/full_papers/wright/wright_html/)（基准测试链接仅作为方法背景，不代表本工具已通过性能认证 / methodological context, not a performance certification）。
 
 ## 状态与配置 / State and configuration
 
@@ -157,3 +233,9 @@ build/
 See `docs/design.md` for architecture, budgeting, collision handling, and persistence boundaries.
 
 开发说明与源码阅读顺序见 [开发指南](docs/development.md)。 / See the [development guide](docs/development.md) for the reading map and formatting workflow.
+
+### 扫描与哈希分项 / Separate scan and hash timing
+
+`scan_ms` 保留原来的流水线总耗时语义，以兼容既有日志。新增三项另起一行；可读 Profile 分别展示 Scan、Hash wait、Hash work 与 Pipeline。满足 `scan_ms ≈ scan_work_ms + hash_wait_ms`（显示舍入存在误差）。`hash_work_ms` 是并发工作线程耗时之和，与扫描重叠，也可能超过流水线总耗时，**不能再加到 elapsed_ms 上**；它不是 CPU 时间或纯哈希核函数时间。全缓存命中时 Hash work / Hash wait 均为零。保持现有有界并行流水线，仅每个哈希任务与提交/获取结果区间计时，不在每个数据块上计时。
+
+`scan_ms` retains its legacy pipeline-wall-time meaning. New fields appear on a separate log line; the human Profile separates Scan, Hash wait, Hash work and Pipeline. `scan_ms ≈ scan_work_ms + hash_wait_ms`, allowing display rounding. `hash_work_ms` sums concurrent worker durations, overlaps scanning and may exceed pipeline elapsed time; **do not add it to elapsed_ms**. It is neither CPU time nor pure hash-kernel time. Full cache hits produce zero Hash work / Hash wait. The bounded parallel pipeline is unchanged; timers bracket jobs and submit/get intervals, never individual data blocks.

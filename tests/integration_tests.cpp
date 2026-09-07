@@ -16,6 +16,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -97,7 +98,8 @@ std::string json_path(std::string_view value) {
 
 /// 每次进程最多运行 30 秒；输出存入扫描目录之外。 / Limit each child to 30 seconds; capture outside
 /// the scan root.
-int execute(const fs::path& exe, const fs::path& root, const fs::path& out, const fs::path& err) {
+int execute(const fs::path& exe, const fs::path& root, const fs::path& out, const fs::path& err,
+            const std::vector<std::string>& arguments = {}) {
 #ifdef _WIN32
     SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     HANDLE output = CreateFileW(out.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &security,
@@ -119,6 +121,10 @@ int execute(const fs::path& exe, const fs::path& root, const fs::path& out, cons
     startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     PROCESS_INFORMATION process{};
     auto command = L"\"" + exe.wstring() + L"\"";
+    // Test arguments are fixed ASCII options without spaces or shell syntax.
+    // 测试参数均为无空格或 shell 语法的固定 ASCII 选项。
+    for (const auto& arg : arguments)
+        command += L" " + std::wstring(arg.begin(), arg.end());
     const bool created =
         CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
                        nullptr, root.c_str(), &startup, &process);
@@ -147,7 +153,11 @@ int execute(const fs::path& exe, const fs::path& root, const fs::path& out, cons
             _exit(126);
         close(output);
         close(errors);
-        execl(exe.c_str(), exe.c_str(), static_cast<char*>(nullptr));
+        std::vector<char*> args{const_cast<char*>(exe.c_str())};
+        for (const auto& arg : arguments)
+            args.push_back(const_cast<char*>(arg.c_str()));
+        args.push_back(nullptr);
+        execv(exe.c_str(), args.data());
         _exit(127);
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -470,6 +480,14 @@ void collisions_and_queue(const fs::path& exe) {
     f.sql("UPDATE files SET digest=zeroblob(32)");
     f.expect({group({"a1", "a2"}), group({"b1", "b2"})});
     check(f.stats["cached"] == 5 && f.stats["hashed"] == 0, "collision cache");
+    check(execute(exe, f.root, f.base / "stdout", f.base / "stderr",
+                  {"--format=pretty", "--color=never", "--unique-files"}) == 0,
+          "collision report failed");
+    const auto report = read(f.base / "stdout");
+    const auto unique = report.find("[UNIQUE]");
+    check(unique != std::string::npos && report.find("\"c\"", unique) != std::string::npos,
+          "collision singleton lost from unique report");
+    check(report.find("[SAME] Group 2") != std::string::npos, "collision groups merged");
     Fixture many(exe);
     Group names;
     for (int i = 0; i < 50; ++i) {
@@ -498,6 +516,53 @@ void collisions_and_queue(const fs::path& exe) {
     parallel.sql("UPDATE files SET digest=zeroblob(32)");
     parallel.expect(expected);
     check(parallel.stats["cached"] == 42, "parallel collision cache");
+}
+
+/// CLI overrides preserve redirected TSV and reject invalid values before touching state.
+/// 命令行覆盖保留重定向 TSV；在修改状态前拒绝非法参数。
+void presentation(const fs::path& exe) {
+    Fixture f(exe);
+    f.file("a", "same");
+    f.file("b", "same");
+    f.file("unique", "different");
+    for (auto arg : {"--color=bad", "--format=bad"}) {
+        check(execute(exe, f.root, f.base / "stdout", f.base / "stderr", {arg}) == 2,
+              "invalid presentation accepted");
+        check(!fs::exists(f.root / ".same/state.db"), "invalid option created database");
+    }
+    f.run();
+    const auto legacy = read(f.base / "stdout");
+    check(legacy.find('\033') == std::string::npos, "redirected auto color");
+    check(execute(exe, f.root, f.base / "stdout", f.base / "stderr",
+                  {"--color=never", "--format=tsv"}) == 0,
+          "explicit TSV failed");
+    check(read(f.base / "stdout") == legacy, "explicit TSV changed bytes");
+    check(execute(exe, f.root, f.base / "stdout", f.base / "stderr",
+                  {"--color=always", "--format=pretty", "--unique-files"}) == 0,
+          "forced pretty failed");
+    const auto colored = read(f.base / "stdout");
+    check(colored.find("\033[32m") != std::string::npos &&
+              colored.find("\033[33m") != std::string::npos,
+          "forced color missing");
+    check(colored.find("[UNIQUE]") != std::string::npos &&
+              colored.find("\"unique\"") != std::string::npos,
+          "unique file missing");
+    check(read(f.base / "stderr").find("\033[1;36mProfile") != std::string::npos,
+          "profile color missing");
+    check(execute(exe, f.root, f.base / "stdout", f.base / "stderr",
+                  {"--color=never", "--format=pretty"}) == 0,
+          "plain pretty failed");
+    check(read(f.base / "stdout").find('\033') == std::string::npos, "never emitted escapes");
+    const auto folded = read(f.base / "stdout");
+    check(folded.find("[UNIQUE]") == std::string::npos &&
+              folded.find("\"unique\"") == std::string::npos,
+          "unique not folded by default");
+    check(read(f.base / "stderr").find('\033') == std::string::npos, "never colored profile");
+    check(execute(exe, f.root, f.base / "stdout", f.base / "stderr",
+                  {"--unique-files", "--format=tsv", "--color=never"}) == 0,
+          "unique TSV failed");
+    check(read(f.base / "stdout").find("0\t\"unique\"") != std::string::npos, "unique TSV missing");
+    check(read(f.base / "stderr").find("elapsed_ms=") != std::string::npos, "raw profile changed");
 }
 
 /// 自动模式在设备预算不足时回退；显式环境变量开启真实 GPU 回归。 / Auto mode falls back on
@@ -582,6 +647,7 @@ int main(int argc, char** argv) {
         {"invalid config", invalid_config},
         {"collisions and queue", collisions_and_queue},
         {"backends", backends},
+        {"presentation", presentation},
         {"locking and state", locking_and_state}};
     for (const auto& [name, test] : cases) {
         try {
