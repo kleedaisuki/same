@@ -12,6 +12,9 @@ import time
 
 
 def measure(executable, args):
+    """Measure repeated warm runs while retaining integral bytes and fractional timings.
+    重复测量热缓存运行，保留整数字节数与小数耗时。
+    """
     with tempfile.TemporaryDirectory(prefix="same-benchmark-") as directory:
         root = Path(directory)
         (root / ".same").mkdir()
@@ -26,7 +29,8 @@ def measure(executable, args):
             start = time.perf_counter()
             result = subprocess.run([executable], cwd=root, capture_output=True, text=True, check=True)
             elapsed = time.perf_counter() - start
-            stats = {key: int(value) for key, value in re.findall(r"(\w+)=(\d+)", result.stderr)}
+            stats = {key: float(value) if "." in value else int(value)
+                     for key, value in re.findall(r"(\w+)=(\d+(?:\.\d+)?)", result.stderr)}
             if stats.get("matches") != args.files or stats.get("groups") != 1:
                 raise RuntimeError(f"wrong result: {result.stderr}")
             if trial:
