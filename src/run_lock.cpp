@@ -41,14 +41,34 @@ struct RunLock::Impl {
     }
 #endif
 };
+#ifndef _WIN32
+namespace {
+/// 验证普通文件并取得非阻塞独占锁。 / Validate a regular file and acquire exclusion.
+void validate_lock(int fd) {
+    if (fd < 0)
+        throw std::system_error(errno, std::generic_category(), "Open run lock");
+    struct stat info{};
+    if (fstat(fd, &info) != 0)
+        throw std::system_error(errno, std::generic_category(), "Run lock attributes");
+    if (!S_ISREG(info.st_mode))
+        throw std::runtime_error("Run lock must be a regular file");
+    int result;
+    do {
+        result = flock(fd, LOCK_EX | LOCK_NB);
+    } while (result < 0 && errno == EINTR);
+    if (result < 0)
+        throw std::system_error(errno, std::generic_category(), "Cannot acquire run lock");
+}
+} // namespace
+#endif
 RunLock::RunLock(const std::filesystem::path& path) : impl_(std::make_unique<Impl>()) {
 #ifdef _WIN32
     /// 共享模式为零，因此已有不兼容打开会立刻失败；OPEN_ALWAYS 保留锁文件身份。
     /// Zero sharing fails immediately on incompatible opens; OPEN_ALWAYS preserves lock-file
     /// identity.
     const auto native = detail::windows_path(path);
-    impl_->handle = CreateFileW(native.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
-                                FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    impl_->handle = CreateFileW(native.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (impl_->handle == INVALID_HANDLE_VALUE)
         throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
                                 "Cannot acquire run lock (another same process may be running)");
@@ -60,25 +80,44 @@ RunLock::RunLock(const std::filesystem::path& path) : impl_(std::make_unique<Imp
         GetFileType(impl_->handle) != FILE_TYPE_DISK)
         throw std::runtime_error("Run lock must be a regular non-reparse file");
 #else
-    /// NOFOLLOW 拒绝末级链接；先验证普通文件，再取得非阻塞协作式锁。
-    /// NOFOLLOW rejects final symlinks; validate a regular file before taking a nonblocking
-    /// advisory lock.
     impl_->fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
-    if (impl_->fd < 0)
-        throw std::system_error(errno, std::generic_category(), "Open run lock");
-    struct stat info{};
-    if (fstat(impl_->fd, &info) != 0)
-        throw std::system_error(errno, std::generic_category(), "Run lock attributes");
-    if (!S_ISREG(info.st_mode))
-        throw std::runtime_error("Run lock must be a regular file");
-    int result;
-    do {
-        result = flock(impl_->fd, LOCK_EX | LOCK_NB);
-    } while (result < 0 && errno == EINTR);
-    if (result < 0)
-        throw std::system_error(errno, std::generic_category(),
-                                "Cannot acquire run lock (another same process may be running)");
+    validate_lock(impl_->fd);
 #endif
 }
+#ifndef _WIN32
+RunLock::RunLock(int directory_fd, const char* name) : impl_(std::make_unique<Impl>()) {
+    const std::filesystem::path component(name);
+    if (component.empty() || component.has_parent_path() || component == "." || component == "..")
+        throw std::runtime_error("Run lock requires a single filename");
+    impl_->fd =
+        openat(directory_fd, name, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
+    validate_lock(impl_->fd);
+}
+#endif
 RunLock::~RunLock() = default;
+WorkspaceLock::WorkspaceLock(const std::filesystem::path& root) {
+#ifdef _WIN32
+    (void)root;
+#else
+    fd_ = open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd_ < 0)
+        throw std::system_error(errno, std::generic_category(), "Open workspace lock directory");
+    int result;
+    do {
+        result = flock(fd_, LOCK_EX | LOCK_NB);
+    } while (result < 0 && errno == EINTR);
+    if (result < 0) {
+        const auto error = errno;
+        close(fd_);
+        fd_ = -1;
+        throw std::system_error(error, std::generic_category(), "Cannot acquire workspace lock");
+    }
+#endif
+}
+WorkspaceLock::~WorkspaceLock() {
+#ifndef _WIN32
+    if (fd_ >= 0)
+        close(fd_);
+#endif
+}
 } // namespace same

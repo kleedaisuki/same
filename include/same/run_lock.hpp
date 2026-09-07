@@ -16,6 +16,11 @@ public:
     /// Open/create a regular lock file and try exclusive ownership; contention/I/O errors throw
     /// without waiting.
     explicit RunLock(const std::filesystem::path& path);
+#ifndef _WIN32
+    /// 相对稳定目录句柄打开锁文件；name 必须是单个文件名。
+    /// Open relative to a stable directory descriptor; name must be one filename.
+    RunLock(int directory_fd, const char* name);
+#endif
     /// 关闭句柄释放锁，但保留锁文件。 / Close the handle to release the lock, retaining the file.
     ~RunLock();
     RunLock(const RunLock&) = delete;
@@ -27,5 +32,24 @@ private:
     /// 唯一所有权使构造失败和正常销毁都能释放资源。 / Sole ownership cleans up on construction
     /// failure and destruction.
     std::unique_ptr<Impl> impl_;
+};
+/** 工作区生命周期锁；POSIX 锁住不会被 clean 删除的工作目录 inode。
+ * Workspace lifecycle guard; POSIX locks the working-directory inode, which clean preserves.
+ * Windows 使用原有独占文件句柄及清理目录句柄，此守卫不额外加锁。
+ * Windows relies on exclusive file and cleanup directory handles; this guard is a no-op.
+ */
+class WorkspaceLock {
+public:
+    /// 立即尝试工作区互斥，不等待；须先于创建状态目录取得。
+    /// Try workspace exclusion without waiting, before state directory creation.
+    explicit WorkspaceLock(const std::filesystem::path& root);
+    /// 释放稳定目录锁。 / Release the stable directory lock.
+    ~WorkspaceLock();
+    WorkspaceLock(const WorkspaceLock&) = delete;
+    WorkspaceLock& operator=(const WorkspaceLock&) = delete;
+
+private:
+    /// POSIX 描述符；Windows 保持 -1。 / POSIX descriptor; stays -1 on Windows.
+    int fd_{-1};
 };
 } // namespace same

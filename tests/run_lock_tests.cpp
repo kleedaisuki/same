@@ -3,12 +3,14 @@
  * special files.
  */
 #include "same/run_lock.hpp"
+#include <cerrno>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 #ifndef _WIN32
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -28,6 +30,107 @@ bool rejected(const std::filesystem::path& path) {
     }
     return false;
 }
+#ifndef _WIN32
+/// 工作目录锁竞争立即失败。 / Workspace contention must fail immediately.
+bool workspace_rejected(const std::filesystem::path& root) {
+    try {
+        same::WorkspaceLock lock(root);
+    } catch (const std::exception&) {
+        return true;
+    }
+    return false;
+}
+
+/// 子进程重新打开工作目录验证跨进程互斥。 / Reopen the workspace in a child to verify process
+/// exclusion.
+void workspace_contender(const std::filesystem::path& root) {
+    const auto child = fork();
+    check(child >= 0, "fork workspace contender");
+    if (child == 0)
+        _exit(workspace_rejected(root) ? 0 : 1);
+    int status{};
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    check(waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "workspace must reject a second process");
+}
+
+/// 状态目录重建不能绕过稳定工作目录互斥。 / State recreation must not bypass stable workspace
+/// exclusion.
+void workspace_lifetime(const std::filesystem::path& root) {
+    const auto state = root / ".same";
+    const auto unrelated = root / "unrelated";
+    std::filesystem::create_directory(state);
+    std::filesystem::create_directory(unrelated);
+    {
+        same::WorkspaceLock lock(root);
+        check(workspace_rejected(root), "workspace must reject a second owner");
+        workspace_contender(root);
+        check(!workspace_rejected(unrelated), "unrelated workspace must remain available");
+        std::filesystem::remove_all(state);
+        workspace_contender(root);
+        std::filesystem::create_directory(state);
+        workspace_contender(root);
+    }
+    check(!workspace_rejected(root), "released workspace must be reusable");
+}
+
+/// 拥有目录描述符，异常路径也关闭。 / Own a directory descriptor with exception-safe cleanup.
+struct Directory {
+    /// 锚定 openat 的目录句柄。 / Directory handle anchoring openat.
+    int fd;
+    /// 打开普通目录且不跟随链接。 / Open a directory without following links.
+    explicit Directory(const std::filesystem::path& path)
+        : fd(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)) {
+        check(fd >= 0, "open test directory descriptor");
+    }
+    /// 关闭测试拥有的描述符。 / Close the descriptor owned by this fixture.
+    ~Directory() {
+        close(fd);
+    }
+};
+
+/// 相对句柄锁仍须拒绝竞争、路径逃逸与链接。 / Descriptor-relative locks reject contention, escapes
+/// and links.
+void relative_lock(const std::filesystem::path& root) {
+    const auto directory = root / "relative";
+    std::filesystem::create_directory(directory);
+    Directory handle(directory);
+    const auto rejects = [&](const char* name) {
+        try {
+            same::RunLock lock(handle.fd, name);
+        } catch (const std::exception&) {
+            return true;
+        }
+        return false;
+    };
+    {
+        same::RunLock lock(handle.fd, "run.lock");
+        check(rejects("run.lock"), "relative lock must reject second owner");
+    }
+    check(!rejects("run.lock"), "relative lock must be reusable");
+    for (const auto* name : {"", ".", "..", "../escaped.lock", "nested/run.lock", "/escaped.lock"})
+        check(rejects(name), "relative lock accepted a non-filename");
+    check(!std::filesystem::exists(root / "escaped.lock"), "relative lock escaped directory");
+    const auto target = directory / "target";
+    {
+        std::ofstream output(target);
+        output << "preserve";
+    }
+    std::filesystem::create_symlink(target, directory / "link");
+    check(rejects("link"), "relative lock must reject symlink");
+    check(std::filesystem::file_size(target) == 8, "relative lock modified symlink target");
+    const auto moved = root / "relative-moved";
+    std::filesystem::rename(directory, moved);
+    std::filesystem::create_directory(directory);
+    check(!rejects("after-rename.lock"), "stable directory descriptor lost after rename");
+    check(std::filesystem::exists(moved / "after-rename.lock") &&
+              !std::filesystem::exists(directory / "after-rename.lock"),
+          "relative lock followed replacement directory");
+}
+#endif
 } // namespace
 /// 运行本文件全部回归场景，断言失败即返回非零。 / Run all regressions; assertion failures produce a
 /// nonzero exit.
@@ -66,6 +169,8 @@ int main() {
         check(std::filesystem::file_size(target) == 9, "lock must not truncate link target");
         check(rejected(root), "directory lock must be rejected");
 #ifndef _WIN32
+        workspace_lifetime(root);
+        relative_lock(root);
         const auto fifo = root / "fifo";
         check(mkfifo(fifo.c_str(), 0600) == 0, "create fifo");
         check(rejected(fifo), "FIFO must be rejected without blocking");

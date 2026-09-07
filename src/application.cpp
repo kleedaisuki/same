@@ -476,6 +476,7 @@ int run(const fs::path& root, const Config& config, std::ostream& output,
 int run(const fs::path& root, const Config& config, std::ostream& output, std::ostream& diagnostics,
         OutputOptions options) {
     const auto start = Clock::now();
+    WorkspaceLock workspace_lock(root);
     prepare_state(root);
     RunLock lock(root / ".same" / "run.lock");
     Store store(root / ".same" / "state.db");
