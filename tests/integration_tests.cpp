@@ -384,7 +384,7 @@ void ignores(const fs::path& exe) {
     Fixture f(exe);
     for (auto name : {"a", "drop.tmp", "dir/drop", "dir/keep", ".same/hidden"})
         f.file(name, "same");
-    f.file(".same/ignore", "*.tmp\ndir/\n!dir/keep\n!.same/hidden\n");
+    f.file(".same/ignore", "*.tmp\ndir/*\n!dir/keep\n!.same/hidden\n");
     f.expect({group({"a", "dir/keep"})});
     check(f.stats["scanned"] == 2, "ignore count");
 }

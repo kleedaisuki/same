@@ -97,45 +97,110 @@ void Config::validate() const {
         throw std::runtime_error("backend must be auto, cpu or cuda");
 }
 namespace {
-/// Byte-oriented glob DP: O(pattern * path) time and O(path) memory.
-/// 按字节执行 glob 动态规划：时间 O(pattern * path)，空间 O(path)。
-/// A matched ancestor also excludes descendants; **/ may match zero directories.
-/// 祖先匹配也覆盖后代；**/ 可匹配零层目录。
-bool glob_match(std::string_view pattern, std::string_view path, bool directory_rule,
-                bool directory) {
-    // Dynamic programming bounds matching work; no recursive regex backtracking.
-    // 动态规划限制匹配复杂度，避免正则表达式递归回溯。
+/// Match a bracket expression using ASCII/POSIX byte classes, independent of locale.
+/// 使用不依赖区域设置的 ASCII/POSIX 字节类别匹配方括号表达式。
+bool bracket(std::string_view pattern, std::size_t& end, unsigned char value) {
+    auto i = end + 1;
+    const bool negate = i < pattern.size() && (pattern[i] == '!' || pattern[i] == '^');
+    i += negate;
+    bool matched = false;
+    bool first = true;
+    for (; i < pattern.size(); ++i) {
+        if (pattern[i] == ']' && !first) {
+            end = i;
+            return value != '/' && (matched != negate);
+        }
+        first = false;
+        if (pattern[i] == '[' && i + 1 < pattern.size() && pattern[i + 1] == ':') {
+            const auto close = pattern.find(":]", i + 2);
+            if (close == std::string_view::npos)
+                break;
+            const auto name = pattern.substr(i + 2, close - i - 2);
+            const bool digit = value >= '0' && value <= '9';
+            const bool upper = value >= 'A' && value <= 'Z';
+            const bool lower = value >= 'a' && value <= 'z';
+            const bool alpha = upper || lower;
+            const bool space = value == ' ' || (value >= 9 && value <= 13);
+            matched |=
+                (name == "alnum" && (alpha || digit)) || (name == "alpha" && alpha) ||
+                (name == "blank" && (value == ' ' || value == 9)) ||
+                (name == "cntrl" && (value < 32 || value == 127)) || (name == "digit" && digit) ||
+                (name == "graph" && value > 32 && value < 127) || (name == "lower" && lower) ||
+                (name == "print" && value >= 32 && value < 127) ||
+                (name == "punct" && value > 32 && value < 127 && !alpha && !digit) ||
+                (name == "space" && space) || (name == "upper" && upper) ||
+                (name == "xdigit" &&
+                 (digit || (value >= 'a' && value <= 'f') || (value >= 'A' && value <= 'F')));
+            i = close + 1;
+            continue;
+        }
+        if (pattern[i] == '\\' && i + 1 < pattern.size())
+            ++i;
+        const auto low = static_cast<unsigned char>(pattern[i]);
+        if (i + 2 < pattern.size() && pattern[i + 1] == '-' && pattern[i + 2] != ']') {
+            i += 2;
+            if (pattern[i] == '\\' && i + 1 < pattern.size())
+                ++i;
+            matched |= value >= low && value <= static_cast<unsigned char>(pattern[i]);
+        } else {
+            matched |= value == low;
+        }
+    }
+    end = pattern.size();
+    return false;
+}
+/// Bounded glob dynamic programming; stars cross slashes only at ** component boundaries.
+/// 有界 glob 动态规划；只有位于路径分量边界的 ** 可以跨越斜杠。
+bool glob_match(std::string_view pattern, std::string_view path) {
     std::vector<unsigned char> previous(path.size() + 1), current(path.size() + 1);
     previous[0] = 1;
     for (std::size_t i = 0; i < pattern.size(); ++i) {
         std::fill(current.begin(), current.end(), 0);
-        const char token = pattern[i];
-        bool double_star = token == '*' && i + 1 < pattern.size() && pattern[i + 1] == '*';
-        if (double_star)
-            ++i;
-        bool directory_star = double_star && i + 1 < pattern.size() && pattern[i + 1] == '/';
-        if (directory_star)
-            ++i;
+        char token = pattern[i];
+        bool escaped = false;
+        if (token == '\\') {
+            if (++i == pattern.size())
+                return false;
+            token = pattern[i];
+            escaped = true;
+        }
+        bool cross = false;
+        bool directories = false;
+        if (token == '*' && !escaped) {
+            const auto begin = i;
+            while (i + 1 < pattern.size() && pattern[i + 1] == '*')
+                ++i;
+            cross = i > begin && (begin == 0 || pattern[begin - 1] == '/') &&
+                    (i + 1 == pattern.size() || pattern[i + 1] == '/');
+            directories = cross && i + 1 < pattern.size();
+            if (directories)
+                ++i;
+        }
         bool reachable = false;
+        auto bracket_end = i;
         for (std::size_t j = 0; j <= path.size(); ++j) {
-            if (directory_star) {
+            if (directories) {
                 current[j] = previous[j] || (j && path[j - 1] == '/' && reachable);
-                reachable = reachable || previous[j];
-            } else if (token == '*') {
-                current[j] =
-                    previous[j] || (j && (double_star || path[j - 1] != '/') && current[j - 1]);
+                reachable |= previous[j] != 0;
+            } else if (token == '*' && !escaped) {
+                current[j] = previous[j] || (j && (cross || path[j - 1] != '/') && current[j - 1]);
             } else if (j) {
-                current[j] =
-                    previous[j - 1] && (token == '?' ? path[j - 1] != '/' : token == path[j - 1]);
+                bool match = token == path[j - 1];
+                if (!escaped && token == '?')
+                    match = path[j - 1] != '/';
+                if (!escaped && token == '[') {
+                    auto close = i;
+                    match = bracket(pattern, close, static_cast<unsigned char>(path[j - 1]));
+                    bracket_end = close;
+                }
+                current[j] = previous[j - 1] && match;
             }
         }
+        if (!escaped && token == '[')
+            i = bracket_end;
         previous.swap(current);
     }
-    for (std::size_t j = 0; j < path.size(); ++j) {
-        if (path[j] == '/' && previous[j])
-            return true;
-    }
-    return (!directory_rule || directory) && previous.back() != 0;
+    return previous.back() != 0;
 }
 } // namespace
 Ignore::Ignore(const std::filesystem::path& root) {
@@ -144,9 +209,23 @@ Ignore::Ignore(const std::filesystem::path& root) {
         return;
     std::istringstream lines(*contents);
     std::string line;
+    bool first_line = true;
     while (std::getline(lines, line)) {
+        // Git accepts a UTF-8 BOM only at the start of an ignore file.
+        // 与 Git 一致，仅在忽略文件起始处接受 UTF-8 BOM。
+        if (first_line && line.starts_with("\xEF\xBB\xBF"))
+            line.erase(0, 3);
+        first_line = false;
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
+        while (!line.empty() && line.back() == ' ') {
+            std::size_t slashes = 0;
+            for (auto i = line.size() - 1; i && line[i - 1] == '\\'; --i)
+                ++slashes;
+            if (slashes % 2)
+                break;
+            line.pop_back();
+        }
         if (line.empty() || line.front() == '#')
             continue;
         bool negate = line.front() == '!';
@@ -164,23 +243,31 @@ Ignore::Ignore(const std::filesystem::path& root) {
             line = "**/" + line;
         if (rules_.size() >= 4096)
             throw std::runtime_error("ignore file exceeds 4096 rules");
-        has_negations_ = has_negations_ || negate;
         rules_.push_back({std::move(line), negate, directory});
     }
 }
 bool Ignore::can_prune(std::string_view relative) const {
-    return !has_negations_ && matches(relative, true);
+    return matches(relative, true);
 }
 bool Ignore::matches(std::string_view relative, bool directory) const {
-    if (relative == ".same" || relative.starts_with(".same/"))
-        return true;
-    bool ignored = false;
-    // Match ancestors as well; callers must still descend to allow negated children.
-    // 同时匹配父目录；调用方仍须递归，以允许子项否定规则生效。
-    for (const auto& rule : rules_) {
-        if (glob_match(rule.pattern, relative, rule.directory, directory))
-            ignored = !rule.negate;
+    // Evaluate every ancestor first: Git cannot reinclude a child of an excluded parent.
+    // 先评估每个祖先：Git 不允许重新纳入被排除父目录中的子项。
+    for (std::size_t end = 0; end <= relative.size(); ++end) {
+        if (end != relative.size() && relative[end] != '/')
+            continue;
+        const auto prefix = relative.substr(0, end);
+        const bool is_directory = end != relative.size() || directory;
+        const auto slash = prefix.rfind('/');
+        if (prefix.substr(slash == std::string_view::npos ? 0 : slash + 1) == ".same")
+            return true;
+        bool ignored = false;
+        for (const auto& rule : rules_) {
+            if ((!rule.directory || is_directory) && glob_match(rule.pattern, prefix))
+                ignored = !rule.negate;
+        }
+        if (ignored)
+            return true;
     }
-    return ignored;
+    return false;
 }
 } // namespace same

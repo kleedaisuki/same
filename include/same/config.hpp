@@ -44,8 +44,8 @@ public:
     /// Match a root-relative forward-slash path; .same is always excluded.
     /// 匹配使用正斜杠的根目录相对路径；始终排除 .same。
     bool matches(std::string_view relative, bool directory) const;
-    /// Prune only when no negated child could require descending into the directory.
-    /// 仅在否定规则不可能要求访问子项时剪枝。
+    /// Excluded parents are pruned, as in Git; child negations cannot reopen them.
+    /// 与 Git 一致地剪枝被排除的父目录；子项否定规则不能重新纳入它们。
     bool can_prune(std::string_view relative) const;
 
 private:
@@ -60,7 +60,5 @@ private:
     };
     /// File order is semantically significant. 文件中的规则顺序具有语义。
     std::vector<Rule> rules_;
-    /// Conservative pruning guard, even for unrelated negations. 保守剪枝保护，含无关否定规则。
-    bool has_negations_{false};
 };
 } // namespace same

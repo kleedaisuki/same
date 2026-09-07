@@ -78,8 +78,8 @@ int main() {
         file << "# test\n*.tmp\nbuild/\n!build/keep.txt\n/root.txt\na/**/b?.dat\n!.same/state.db\n";
     }
     same::Ignore ignore(root);
-    if (ignore.can_prune("build"))
-        throw std::runtime_error("negated children pruned");
+    if (!ignore.can_prune("build"))
+        throw std::runtime_error("excluded parent must be pruned");
     auto check = [&](const char* path, bool directory, bool expected) {
         if (ignore.matches(path, directory) != expected)
             throw std::runtime_error(path);
@@ -89,7 +89,7 @@ int main() {
     check("build", true, true);
     check("build", false, false);
     check("build/x.txt", false, true);
-    check("build/keep.txt", false, false);
+    check("build/keep.txt", false, true);
     check("root.txt", false, true);
     check("sub/root.txt", false, false);
     check("a/b1.dat", false, true);
@@ -97,6 +97,54 @@ int main() {
     check("a/x/b22.dat", false, false);
     check(".same/state.db", false, true);
     check("normal", false, false);
+    // Git-compatible escaping, bracket classes, anchoring and explicit parent reopening.
+    // Git 兼容的转义、字符类别、锚定及显式重新纳入父目录。
+    {
+        std::ofstream file(root / ".same/ignore");
+        file << "\xEF\xBB\xBF" << R"(\#literal
+\!literal
+[a-c].txt
+[!a-c].dat
+[[:digit:]].log
+literal\*.txt
+ab**cd
+parent/
+!parent/
+parent/*
+!parent/keep
+/root-only/
+a/**/target
+)" << "escaped\\ \ntrailing   \n";
+    }
+    same::Ignore syntax(root);
+    auto syntax_check = [&](const char* path, bool dir, bool expected) {
+        if (syntax.matches(path, dir) != expected)
+            throw std::runtime_error(std::string("gitignore syntax: ") + path);
+    };
+    syntax_check("#literal", false, true);
+    syntax_check("!literal", false, true);
+    syntax_check("trailing", false, true);
+    syntax_check("trailing ", false, false);
+    syntax_check("escaped ", false, true);
+    syntax_check("escaped", false, false);
+    syntax_check("b.txt", false, true);
+    syntax_check("d.txt", false, false);
+    syntax_check("z.dat", false, true);
+    syntax_check("b.dat", false, false);
+    syntax_check("5.log", false, true);
+    syntax_check("x.log", false, false);
+    syntax_check("literal*.txt", false, true);
+    syntax_check("literalX.txt", false, false);
+    syntax_check("abZZcd", false, true);
+    syntax_check("ab/x/cd", false, false);
+    syntax_check("parent/keep", false, false);
+    syntax_check("parent/other", false, true);
+    syntax_check("parent/other/keep", false, true);
+    syntax_check("root-only/a", false, true);
+    syntax_check("sub/root-only/a", false, false);
+    syntax_check("a/target", false, true);
+    syntax_check("a/b/c/target", false, true);
+    syntax_check("nested/.same/state.db", false, true);
     {
         std::ofstream file(root / ".same/ignore");
         file << "build/\n";
