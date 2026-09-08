@@ -30,23 +30,11 @@ cmake -DSAME_CUDA_MODE=off -P tools/build.cmake
 
 Strict on requires CUDA; off skips CUDA. Put definitions before `-P`. The launcher initializes MSVC x64; explicit toolchains take precedence. See the build contract for options and diagnostics.
 
-### CLion / 原生配置 / Native configuration
+### CMake 预设 / CMake presets
 
-CLion 打开根 CMake 工程，Windows 选择 **Visual Studio 工具链 + Ninja**，使用 release/cuda/cpu 预设；不要把 MinGW 与 MSVC CUDA 混用。真实 CMake CUDA 语言和 targets 提供 IDE 元数据。命令行原生配置需先初始化开发环境：
+Windows 用户请先打开 **x64 Native Tools Command Prompt for VS 2022**，再进入项目目录执行以下命令。
 
-Open the root CMake project in CLion; on Windows select the **Visual Studio toolchain with Ninja** and a release/cuda/cpu preset. Native CUDA targets expose IDE metadata. Initialize the developer environment before native CLI configuration:
-
-**Windows 使用预设前，请打开 Visual Studio 的 “x64 Native Tools Command Prompt for VS 2022”，再进入项目目录。必须使用 x64 目标环境，不要使用 x86 开发者终端或未初始化的普通终端。CLion 用户请选择 Visual Studio 工具链，并将架构设为 amd64/x64，由 IDE 初始化环境。**
-
-**On Windows, open “x64 Native Tools Command Prompt for VS 2022” before using presets, then enter the project directory. Use an x64 target environment, not an x86 developer prompt or an uninitialized terminal. In CLion, select the Visual Studio toolchain with amd64/x64 architecture so the IDE initializes the environment.**
-
-`release` 会尝试启用 CUDA，探测失败时允许退回 CPU；`cuda` 要求 CUDA 可构建。两者启用 CUDA 后都支持运行时自动分流。检查配置输出中的 `same backend: CUDA`，不要只凭构建成功判断 GPU 支持。
-
-`release` attempts CUDA with CPU fallback; `cuda` requires a usable CUDA toolchain. Both support runtime auto routing when CUDA is enabled. Check for `same backend: CUDA` in configure output rather than treating build success as proof of GPU support.
-
-如果此前使用了错误架构或缓存了 CUDA 探测失败，请切换到正确的 x64 环境后执行 `cmake --fresh --preset release`，再重新构建；CLion 中使用重置 CMake 缓存并重新加载。
-
-If an earlier configuration used the wrong architecture or cached a failed CUDA probe, switch to the correct x64 environment and run `cmake --fresh --preset release` before rebuilding; in CLion, reset the CMake cache and reload.
+On Windows, open **x64 Native Tools Command Prompt for VS 2022**, then enter the project directory and run:
 
 ```sh
 cmake --preset release
@@ -54,9 +42,9 @@ cmake --build --preset release
 ctest --preset release
 ```
 
-直接配置尊重已有生成器，不会原地切换 Ninja/Visual Studio；跨生成器自动回退使用上面的脚本入口。构建不等于 GPU 运行验证。
+`release` 尝试启用 CUDA，不可用时回退 CPU；`cuda` 要求 CUDA 可构建；`cpu` 仅构建 CPU 版本。启用 CUDA 的构建均支持运行时自动分流。完整配置与故障排查见 [构建指南](docs/build.md)。
 
-Native configuration preserves the chosen generator. Use the script above for cross-generator fallback. A successful build does not establish GPU runtime availability.
+`release` attempts CUDA with CPU fallback; `cuda` requires a usable CUDA toolchain; `cpu` builds without CUDA. CUDA-enabled builds support runtime auto routing. See the [build guide](docs/build.md) for configuration and troubleshooting.
 
 ## 使用与输出 / Usage and output
 
