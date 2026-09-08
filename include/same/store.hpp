@@ -49,6 +49,11 @@ public:
     /// After validating a cache hit, update only its generation; requires an existing path
     /// and active scan. Example: if (cached(path)->stamp == stamp) mark_seen(path).
     void mark_seen(std::string_view path);
+    /// 完整文件戳匹配时标记已见，单条语句完成缓存验证和更新；必须有活动扫描。
+    /// Validate the complete stamp and mark seen in one statement; requires an active scan.
+    /// 返回 false 表示缺失或版本变化，不修改记录。False means missing/changed, without mutation.
+    /// Example: if (store.mark_if_unchanged(path, stamp)) skip_hash();
+    bool mark_if_unchanged(std::string_view path, const FileStamp& stamp);
     /// 删除本轮未见记录，与所有更新一并提交；必须有活动扫描。
     /// Delete unseen entries and commit them atomically with updates; requires an active scan.
     void end_scan();

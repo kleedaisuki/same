@@ -274,12 +274,9 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
         FileRecord record{std::move(entry->path), std::move(entry->stamp), {}};
         counters.scanned_bytes += record.stamp.size;
         const auto queried = Clock::now();
-        const auto cached = config.rehash ? std::nullopt : store.cached(record.path);
+        const bool cached = !config.rehash && store.mark_if_unchanged(record.path, record.stamp);
         counters.database_work_ms += milliseconds(queried, Clock::now());
-        if (cached && cached->stamp == record.stamp) {
-            const auto marked = Clock::now();
-            store.mark_seen(cached->path);
-            counters.database_work_ms += milliseconds(marked, Clock::now());
+        if (cached) {
             ++counters.cached;
             counters.cached_bytes += record.stamp.size;
             continue;

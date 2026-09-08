@@ -22,9 +22,11 @@ void exec(sqlite3* db, const char* sql) {
 /// Sole owner of a prepared statement and cursor; finalize also runs during exception unwinding.
 class Statement {
 public:
-    /// 连接为借用，必须比语句活得更久。 / The borrowed connection must outlive the statement.
-    Statement(sqlite3* db, const char* sql) : db_(db) {
-        if (sqlite3_prepare_v2(db, sql, -1, &stmt_, nullptr) != SQLITE_OK)
+    /// 连接为借用，必须比语句活得更久；持久语句提示避免占用短期 lookaside 分配池。
+    /// The borrowed connection must outlive the statement; PERSISTENT preserves short-lived
+    /// lookaside.
+    Statement(sqlite3* db, const char* sql, unsigned flags = 0) : db_(db) {
+        if (sqlite3_prepare_v3(db, sql, -1, flags, &stmt_, nullptr) != SQLITE_OK)
             fail(db, "SQLite prepare");
     }
     /// 释放语句与游标，清理期间不抛异常。 / Release statement/cursor without throwing during
@@ -103,18 +105,23 @@ public:
     }
     /// 8 字节大端 BLOB 保留完整 uint64 范围，且字节排序等价于数值排序。
     /// An 8-byte big-endian BLOB preserves uint64 range and makes bytewise order numeric.
-    void bind_record(const FileRecord& record) {
+    void bind_stamp(std::string_view path, const FileStamp& stamp) {
         std::array<unsigned char, 8> size{};
-        auto value = record.stamp.size;
+        auto value = stamp.size;
         for (std::size_t i = size.size(); i != 0; --i) {
             size[i - 1] = static_cast<unsigned char>(value & 255);
             value >>= 8;
         }
-        string(1, record.path);
+        string(1, path);
         bytes(2, size.data(), size.size());
-        string(3, record.stamp.identity);
-        string(4, record.stamp.modified);
-        string(5, record.stamp.changed);
+        string(3, stamp.identity);
+        string(4, stamp.modified);
+        string(5, stamp.changed);
+    }
+    /// 共享完整文件戳编码，摘要占第六个参数。 / Share complete stamp encoding; digest is parameter
+    /// six.
+    void bind_record(const FileRecord& record) {
+        bind_stamp(record.path, record.stamp);
         bytes(6, record.digest.data(), record.digest.size());
     }
 
@@ -163,6 +170,8 @@ struct Store::Impl {
     std::unique_ptr<Statement> lookup;
     /// 缓存命中仅修改非索引列。 / Cache hits update only the non-indexed generation.
     std::unique_ptr<Statement> seen;
+    /// 一次主键查找完成文件戳验证和已见写入。 / Validate and mark seen with one primary-key lookup.
+    std::unique_ptr<Statement> unchanged;
     std::unique_ptr<Statement> upsert;
     std::unique_ptr<Statement> representative;
     std::unique_ptr<Statement> match;
@@ -174,6 +183,7 @@ struct Store::Impl {
         upsert.reset();
         lookup.reset();
         seen.reset();
+        unchanged.reset();
         if (db)
             sqlite3_close_v2(db);
     }
@@ -227,16 +237,26 @@ Store::Store(const std::filesystem::path& path, std::size_t cache_bytes)
              "CREATE TEMP TABLE matches(representative BLOB NOT NULL,member BLOB NOT NULL,"
              "PRIMARY KEY(representative,member)) WITHOUT ROWID;");
     impl_->lookup = std::make_unique<Statement>(
-        db, "SELECT path,size,identity,modified,changed,digest FROM files WHERE path=?1");
-    impl_->seen = std::make_unique<Statement>(db, "UPDATE files SET generation=?2 WHERE path=?1");
+        db, "SELECT path,size,identity,modified,changed,digest FROM files WHERE path=?1",
+        SQLITE_PREPARE_PERSISTENT);
+    impl_->seen = std::make_unique<Statement>(db, "UPDATE files SET generation=?2 WHERE path=?1",
+                                              SQLITE_PREPARE_PERSISTENT);
+    impl_->unchanged = std::make_unique<Statement>(
+        db,
+        "UPDATE files SET generation=?6 WHERE path=?1 AND size=?2 AND identity=?3 "
+        "AND modified=?4 AND changed=?5",
+        SQLITE_PREPARE_PERSISTENT);
     impl_->upsert = std::make_unique<Statement>(
-        db, "INSERT INTO files(path,size,identity,modified,changed,digest,generation)"
-            " VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(path) DO UPDATE SET "
-            "size=excluded.size,identity=excluded.identity,modified=excluded.modified,"
-            "changed=excluded.changed,digest=excluded.digest,generation=excluded.generation");
-    impl_->representative =
-        std::make_unique<Statement>(db, "INSERT INTO representatives VALUES(?1,?2,?3,?4,?5,?6)");
-    impl_->match = std::make_unique<Statement>(db, "INSERT OR IGNORE INTO matches VALUES(?1,?2)");
+        db,
+        "INSERT INTO files(path,size,identity,modified,changed,digest,generation)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(path) DO UPDATE SET "
+        "size=excluded.size,identity=excluded.identity,modified=excluded.modified,"
+        "changed=excluded.changed,digest=excluded.digest,generation=excluded.generation",
+        SQLITE_PREPARE_PERSISTENT);
+    impl_->representative = std::make_unique<Statement>(
+        db, "INSERT INTO representatives VALUES(?1,?2,?3,?4,?5,?6)", SQLITE_PREPARE_PERSISTENT);
+    impl_->match = std::make_unique<Statement>(db, "INSERT OR IGNORE INTO matches VALUES(?1,?2)",
+                                               SQLITE_PREPARE_PERSISTENT);
 }
 Store::~Store() {
     rollback_scan();
@@ -300,6 +320,18 @@ void Store::mark_seen(std::string_view path) {
         throw std::logic_error("Cannot mark missing cache entry seen");
     use.finish();
 }
+bool Store::mark_if_unchanged(std::string_view path, const FileStamp& stamp) {
+    if (!impl_->scanning)
+        throw std::logic_error("No active scan");
+    auto& update = *impl_->unchanged;
+    StatementUse use(update);
+    update.bind_stamp(path, stamp);
+    update.integer(6, impl_->generation);
+    update.step();
+    const bool matched = sqlite3_changes(impl_->db) == 1;
+    use.finish();
+    return matched;
+}
 void Store::end_scan() {
     if (!impl_->scanning)
         throw std::logic_error("No active scan");
@@ -318,12 +350,20 @@ void Store::rollback_scan() noexcept {
 void Store::visit_candidates(const std::function<void(const FileRecord&)>& visitor) {
     if (impl_->scanning)
         throw std::logic_error("Commit scan before comparing");
-    Statement query(impl_->db,
-                    "SELECT f.path,f.size,f.identity,f.modified,f.changed,f.digest FROM files f "
-                    "JOIN (SELECT size,digest FROM files GROUP BY size,digest HAVING count(*)>1) d "
-                    "ON f.size=d.size AND f.digest=d.digest ORDER BY f.size,f.digest,f.path");
-    while (query.step())
-        visitor(query.record());
+    // 两级有序游标避免 JOIN 后对所有宽记录排序，且不物化全部重复桶。
+    // Two ordered cursors avoid sorting wide joined records or materializing all duplicate buckets.
+    Statement buckets(impl_->db, "SELECT size,digest FROM files GROUP BY size,digest "
+                                 "HAVING count(*)>1 ORDER BY size,digest");
+    Statement members(impl_->db, "SELECT path,size,identity,modified,changed,digest FROM files "
+                                 "WHERE size=?1 AND digest=?2 ORDER BY path");
+    while (buckets.step()) {
+        StatementUse use(members);
+        members.string(1, buckets.string(0));
+        members.string(2, buckets.string(1));
+        while (members.step())
+            visitor(members.record());
+        use.finish();
+    }
 }
 void Store::clear_representatives() {
     exec(impl_->db, "DELETE FROM representatives");
@@ -355,15 +395,21 @@ void Store::add_match(std::string_view representative, std::string_view member) 
     use.finish();
 }
 void Store::visit_matches(const std::function<void(std::string_view, std::string_view)>& visitor) {
-    Statement query(
-        impl_->db,
-        "SELECT m.representative,m.member FROM matches m JOIN "
-        "(SELECT representative FROM matches GROUP BY representative HAVING count(*)>1) g "
-        "ON m.representative=g.representative ORDER BY m.representative,m.member");
-    while (query.step()) {
-        const auto representative = query.string(0);
-        const auto member = query.string(1);
-        visitor(representative, member);
+    // 主键同时覆盖分组与成员排序；每组复用游标，不创建全结果排序表。
+    // The primary key covers grouping and member order; reuse a cursor instead of sorting all rows.
+    Statement groups(impl_->db, "SELECT representative FROM matches GROUP BY representative "
+                                "HAVING count(*)>1 ORDER BY representative");
+    Statement members(impl_->db,
+                      "SELECT member FROM matches WHERE representative=?1 ORDER BY member");
+    while (groups.step()) {
+        const auto representative = groups.string(0);
+        StatementUse use(members);
+        members.string(1, representative);
+        while (members.step()) {
+            const auto member = members.string(0);
+            visitor(representative, member);
+        }
+        use.finish();
     }
 }
 void Store::visit_unique(const std::function<void(std::string_view)>& visitor) {

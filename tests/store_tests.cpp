@@ -98,6 +98,45 @@ int main() {
             });
             check(paths == std::vector<std::string>{"a", "b"},
                   "exact matches deduplicated ordered");
+            paths.clear();
+            store.visit_unique([&](auto path) { paths.emplace_back(path); });
+            check(paths == std::vector<std::string>{"c", binary.path}, "unique singleton handling");
+            bool inactive_rejected = false;
+            try {
+                store.mark_if_unchanged(a.path, a.stamp);
+            } catch (const std::logic_error&) {
+                inactive_rejected = true;
+            }
+            check(inactive_rejected, "conditional mark requires scan");
+            store.begin_scan();
+            check(store.mark_if_unchanged(binary.path, binary.stamp),
+                  "conditional mark binary path and uint64 size");
+            check(store.mark_if_unchanged(binary.path, binary.stamp),
+                  "conditional mark repeats in same generation");
+            check(!store.mark_if_unchanged("missing", a.stamp), "conditional mark absent record");
+            // 四个戳字段必须分别参与比较，任一变化都不能保留旧摘要。
+            // Every stamp field participates independently; changes cannot retain a stale digest.
+            auto changed = a.stamp;
+            ++changed.size;
+            check(!store.mark_if_unchanged(a.path, changed), "conditional mark checks size");
+            changed = a.stamp;
+            changed.identity += "changed";
+            check(!store.mark_if_unchanged(a.path, changed), "conditional mark checks identity");
+            changed = a.stamp;
+            changed.modified += "changed";
+            check(!store.mark_if_unchanged(a.path, changed), "conditional mark checks modified");
+            changed = a.stamp;
+            changed.changed += "changed";
+            check(!store.mark_if_unchanged(a.path, changed), "conditional mark checks changed");
+            check(store.cached(a.path)->stamp == a.stamp, "conditional misses preserve metadata");
+            store.rollback_scan();
+            store.begin_scan();
+            check(store.mark_if_unchanged(a.path, a.stamp),
+                  "conditional mark reuse after rollback");
+            store.mark_seen(b.path);
+            store.mark_seen(c.path);
+            store.mark_seen(binary.path);
+            store.end_scan();
             store.begin_scan();
             bool missing_rejected = false;
             try {
@@ -122,6 +161,54 @@ int main() {
             store.begin_scan();
             store.end_scan();
             check(!store.cached("a"), "empty scan removes stale files");
+        }
+        {
+            same::Store store(root / "buckets.db", 16 * 1024);
+            store.begin_scan();
+            // 交错插入多个桶，验证两层游标的排序、过滤和独立回调操作。
+            // Interleave buckets to verify two-cursor ordering, filtering and independent
+            // callbacks.
+            for (const auto& item :
+                 {record("z", 9, 2), record("b", 1, 2), record("x", 9, 2), record("a", 1, 2),
+                  record("solo", 1, 3), record("d", 1, 1), record("c", 1, 1)})
+                store.save(item);
+            store.end_scan();
+            bool interrupted = false;
+            try {
+                store.visit_candidates([](const auto&) { throw std::runtime_error("stop"); });
+            } catch (const std::runtime_error&) {
+                interrupted = true;
+            }
+            check(interrupted, "candidate callback exception propagates");
+            std::vector<std::string> paths;
+            store.visit_candidates([&](const auto& item) {
+                check(store.cached(item.path)->stamp == item.stamp, "nested independent lookup");
+                paths.push_back(item.path);
+            });
+            check(paths == std::vector<std::string>{"c", "d", "a", "b", "x", "z"},
+                  "multiple buckets ordered after callback exception");
+            store.add_match("x", "z");
+            store.add_match("a", "b");
+            store.add_match("solo", "solo");
+            store.add_match("x", "x");
+            store.add_match("a", "a");
+            interrupted = false;
+            try {
+                store.visit_matches([](auto, auto) { throw std::runtime_error("stop"); });
+            } catch (const std::runtime_error&) {
+                interrupted = true;
+            }
+            check(interrupted, "match callback exception propagates");
+            paths.clear();
+            store.visit_matches([&](auto, auto member) { paths.emplace_back(member); });
+            check(paths == std::vector<std::string>{"a", "b", "x", "z"},
+                  "multiple exact groups ordered after callback exception");
+            store.begin_scan();
+            check(!store.mark_if_unchanged("a", record("a", 2, 2).stamp),
+                  "changed entry is not marked seen");
+            check(store.mark_if_unchanged("b", record("b", 1, 2).stamp), "unchanged retained");
+            store.end_scan();
+            check(!store.cached("a") && store.cached("b"), "conditional misses removed at commit");
         }
         sqlite3* raw{};
         check(sqlite3_open(db.string().c_str(), &raw) == SQLITE_OK, "raw database open");
