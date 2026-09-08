@@ -39,6 +39,18 @@ Explicit compiler/toolchain choices take precedence. `SAME_USE_ENVIRONMENT=ON` p
 
 ## CLion 与原生 CMake / CLion and native CMake
 
+**Windows 使用预设前，请打开 Visual Studio 的 “x64 Native Tools Command Prompt for VS 2022”，再进入项目目录。必须使用 x64 目标环境，不要使用 x86 开发者终端或未初始化的普通终端。CLion 用户请选择 Visual Studio 工具链，并将架构设为 amd64/x64，由 IDE 初始化环境。**
+
+**On Windows, open “x64 Native Tools Command Prompt for VS 2022” before using presets, then enter the project directory. Use an x64 target environment, not an x86 developer prompt or an uninitialized terminal. In CLion, select the Visual Studio toolchain with amd64/x64 architecture so the IDE initializes the environment.**
+
+`release` 会尝试启用 CUDA，探测失败时允许退回 CPU；`cuda` 要求 CUDA 可构建。两者启用 CUDA 后都支持运行时自动分流。检查配置输出中的 `same backend: CUDA`，不要只凭构建成功判断 GPU 支持。
+
+`release` attempts CUDA with CPU fallback; `cuda` requires a usable CUDA toolchain. Both support runtime auto routing when CUDA is enabled. Check for `same backend: CUDA` in configure output rather than treating build success as proof of GPU support.
+
+如果此前使用了错误架构或缓存了 CUDA 探测失败，请切换到正确的 x64 环境后执行 `cmake --fresh --preset release`，再重新构建；CLion 中使用重置 CMake 缓存并重新加载。
+
+If an earlier configuration used the wrong architecture or cached a failed CUDA probe, switch to the correct x64 environment and run `cmake --fresh --preset release` before rebuilding; in CLion, reset the CMake cache and reload.
+
 ```sh
 cmake --preset release
 cmake --build --preset release
