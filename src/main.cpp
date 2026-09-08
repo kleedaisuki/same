@@ -9,7 +9,7 @@ namespace {
 /// 输出命令契约，不访问或修改工作区状态。
 void help() {
     std::cout
-        << "same 0.2.0 - exact duplicate files in the working directory\n"
+        << "same 0.3.0 - exact duplicate files in the working directory\n"
            "Usage: same [scan] [-r] [--summary] [scan options]\n"
            "       same new\n"
            "       same clean [-r]\n"
@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
                 return 0;
             }
             if (arg == "--version") {
-                std::cout << "same 0.2.0\n";
+                std::cout << "same 0.3.0\n";
                 return 0;
             }
             if ((arg == "-r" || arg == "--recursive") && command != "new") {
