@@ -1,5 +1,8 @@
 # 自适应路由设计依据 / Adaptive routing rationale
 
+> 历史固定偏好调度阶段；当前在线模型见 [online-routing-design.md](online-routing-design.md)。以下测量不能视为当前在线模型的验证。
+> Historical fixed-preference stage; these measurements do not validate the current online model.
+
 ## 问题定义 / Problem
 
 自动模式要保留小载荷的 CPU SIMD 优势，为长载荷或明显 GPU 优势提供 GPU 偏好，并让空闲

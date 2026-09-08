@@ -1,5 +1,8 @@
 # 自适应路由验证 / Adaptive routing validation
 
+> 历史固定偏好调度阶段；当前在线模型见 [online-routing-design.md](online-routing-design.md)。以下测量不能视为当前在线模型的验证。
+> Historical fixed-preference stage; these measurements do not validate the current online model.
+
 2026-09-08。策略见 [设计依据](adaptive-routing-design.md) 和 [执行契约](auto-dispatch.md)。
 历史基线为 `04419ff`；本报告验证独立 GPU 服务及异步初始化的新实现。
 Historical baseline: `04419ff`; this report covers independent GPU service and asynchronous startup.

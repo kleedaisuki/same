@@ -253,6 +253,8 @@ compiler PGO switch. Summary visibility is independent of analyzer operation.
 [实验计划](docs/online-routing-experiment-plan.md)。 / See the routing contract, research design and
 experiment plan; historical benchmarks do not establish the new model's speedup.
 
+完整实测、开销与限制见 [验证报告](docs/online-routing-validation.md)。 / See the validation report for measurements, overhead and limitations.
+
 ### 有界扫描流水线 / Bounded scanning pipeline
 
 目录枚举与文件元数据构成动态任务图：`metadata_workers` 个线程共享有界任务队列，满时就地深度优先处理，不等待递归提交。结果流入单线程数据库协调器，缓存未命中交给 `workers` 个内容工作线程。哈希按完成顺序收取，慢首任务不阻塞后完成结果。`queue_capacity` 分别约束遍历任务、遍历结果和未收取哈希任务；它不是所有队列合计的容量。
