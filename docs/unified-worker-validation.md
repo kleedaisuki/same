@@ -91,13 +91,13 @@ Regressions remain after matching total threads: the oldN+1/newN count differenc
 
 | 实现 / Implementation | SHA-256 |
 |---|---|
-| baseline | `d58a491a7a47194ed771316f03b843cc98d2b4ffdee0321545b76a810db4010d` |
+| baseline（源提交 / source commit `1f1eda4`） | `d58a491a7a47194ed771316f03b843cc98d2b4ffdee0321545b76a810db4010d` |
 | 初始 / Initial unified | `3353422a0d76f572e7531356ee13230e4bea4596219ed94bf7c9a32ab5d35880` |
 | 最终冷启动协调 / Final | `972bc2467c49ce3738023e2f9818b12f7d923e0b596de5b145fd0345f1c7b3c4` |
 
-产品版本均保持0.4.0，哈希区分不同实现。旧基线没有GPU peak或cold CPU指标：CSV缺失peak留空，不能解释为0；旧setup是单服务时间，新setup_sum是多线程累计，可重叠，不能直接当作墙钟差。
+产品版本均保持0.4.0；基线由源提交 `1f1eda4` 构建，哈希区分实际测量的二进制。旧基线没有GPU peak或cold CPU指标：CSV缺失peak留空，不能解释为0；旧setup是单服务时间，新setup_sum是多线程累计，可重叠，不能直接当作墙钟差。
 
-All identify version 0.4.0; hashes distinguish implementations. Missing old GPU peak is blank, not zero. Old setup is one service; new setup sums worker time and may overlap, not directly comparable wall time.
+All identify version 0.4.0; the baseline was built from source commit `1f1eda4`, and hashes distinguish the measured binaries. Missing old GPU peak is blank, not zero. Old setup is one service; new setup sums worker time and may overlap, not directly comparable wall time.
 
 ### 复现 / Reproduction
 
