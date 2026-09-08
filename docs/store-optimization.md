@@ -45,3 +45,7 @@ cache and improve aggregate query shape instead of migrating formats on unrelate
 ## 验证 / Validation
 
 2026-09-07: release x86 MSVC `store_tests` 构建成功，`ctest --test-dir build/release -R "^store$" --output-on-failure` 1/1 通过。覆盖二进制路径、完整 uint64 大小、命中/未命中交替、重复键异常后复用、回滚后复用、mark_seen 保持内容且清除未见记录、重开数据库与未来 schema 拒绝。 / Build and 1/1 test pass cover binary paths, uint64 sizes, alternating lookup hits/misses, reuse after constraint failure and rollback, mark_seen preservation/stale cleanup, reopen and future-schema rejection.
+
+2026-09-08：CPU/CUDA各14/14测试通过。10万条记录、三类分组的对照基准与负结果见
+[本轮验证报告](hash-store-validation.md)。 / See the linked report for 100,000-row paired
+benchmarks, limitations and both 14/14 test suites.

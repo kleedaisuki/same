@@ -63,6 +63,12 @@ install(TARGETS same RUNTIME DESTINATION bin)
 add_executable(dispatch_benchmark EXCLUDE_FROM_ALL tools/dispatch_benchmark.cpp)
 target_link_libraries(dispatch_benchmark PRIVATE same_core)
 
+# Isolated database phases; fused lookup can be compared with the retained legacy API.
+# 独立测量数据库阶段；合并查询可与保留的旧 API 公平比较。
+add_executable(store_benchmark EXCLUDE_FROM_ALL tools/store_benchmark.cpp)
+target_link_libraries(store_benchmark PRIVATE same_core)
+target_compile_definitions(store_benchmark PRIVATE SAME_STORE_FUSED_LOOKUP=1)
+
 if(BUILD_TESTING)
   foreach(test compute files config store resources run_lock terminal walk completion hash_retry dispatch workspace)
     add_executable(${test}_tests tests/${test}_tests.cpp)

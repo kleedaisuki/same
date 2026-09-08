@@ -247,6 +247,11 @@ The decision depends on file size, update block size, device budget and concurre
 
 Actual CPU/GPU hash attempts exclude calibration; `auto_backend`, `calibration_ms`, and four `probe_*_ms` fields expose the decision evidence. A single-instance probe does not prove whole-drive speedup. Explicit CPU avoids probing for short or fully cached scans.
 
+合格哈希在GPU优先、CPU可窃取的有界队列中持续分流；缓存验证与已见更新合并为一次数据库操作。
+实现边界、CPU/CUDA回归与分阶段实测见[哈希分流及数据库验证](docs/hash-store-validation.md)。
+Eligible hashes use bounded GPU-preferred, CPU-stealable scheduling; cache validation and marking
+are fused. See the linked validation report for contracts, regressions and measured limitations.
+
 新增统计：`walk_wait_ms` 是协调线程等待遍历结果的时间；`enumerate_work_ms`、`metadata_work_ms` 是各工作线程累计时间，不应与总耗时相加；`database_work_ms` 为扫描协调器数据库操作时间。旧 `scan_work_ms` 字段仍为 `scan_ms - hash_wait_ms`，现在包含等待元数据的时间，不是 CPU 工作时间。`walk_task_peak`、`walk_result_peak` 显示队列峰值。
 
 New metrics separate coordinator walk wait, summed enumeration/metadata worker time, coordinator database work, and traversal queue peaks. Legacy `scan_work_ms = scan_ms - hash_wait_ms` is retained and includes metadata waiting, not CPU execution time. Summed worker times overlap and must not be added to elapsed time.
