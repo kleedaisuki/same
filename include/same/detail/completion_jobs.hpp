@@ -67,27 +67,45 @@ public:
     /// 达到容量前提交；调用方先 drain，再接收更多任务。
     /// Submit below capacity; callers drain before admitting further work.
     template <class F> void submit(F&& operation, bool prefer_gpu = false) {
+        submit_impl(std::forward<F>(operation), prefer_gpu, false);
+    }
+    /// 哈希任务携带可窃取的 GPU 资格，不固定到单一工作线程。
+    /// Hash work carries a stealable GPU eligibility hint, not a fixed worker assignment.
+    template <class F> void submit_hash(F&& operation, bool gpu_eligible) {
+        submit_impl(std::forward<F>(operation), gpu_eligible, true);
+    }
+
+private:
+    /// 两类接收共用完成发布和容量契约，仅资源调度入口不同。
+    /// Both admission routes share publication and capacity contracts, differing only in
+    /// scheduling.
+    template <class F> void submit_impl(F&& operation, bool hint, bool hash) {
         if (pending_ == state_->ring.size())
             throw std::logic_error("completion admission capacity exceeded");
-        resources_.submit(
-            [state = state_, operation = std::forward<F>(operation)](Worker& worker) mutable {
-                Outcome result;
-                try {
-                    result.value = operation(worker);
-                } catch (...) {
-                    result.error = std::current_exception();
-                }
-                {
-                    std::lock_guard lock(state->mutex);
-                    state->ring[state->write] = std::move(result);
-                    state->write = (state->write + 1) % state->ring.size();
-                    ++state->count;
-                }
-                state->ready.notify_one();
-            },
-            prefer_gpu);
+        auto publish = [state = state_,
+                        operation = std::forward<F>(operation)](Worker& worker) mutable {
+            Outcome result;
+            try {
+                result.value = operation(worker);
+            } catch (...) {
+                result.error = std::current_exception();
+            }
+            {
+                std::lock_guard lock(state->mutex);
+                state->ring[state->write] = std::move(result);
+                state->write = (state->write + 1) % state->ring.size();
+                ++state->count;
+            }
+            state->ready.notify_one();
+        };
+        if (hash)
+            resources_.submit_hash(std::move(publish), hint);
+        else
+            resources_.submit(std::move(publish), hint);
         ++pending_;
     }
+
+public:
     /// 等待任意任务完成，不按提交顺序阻塞。 / Wait for any completion, not submission order.
     Result next() {
         if (!pending_)

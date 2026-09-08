@@ -22,16 +22,41 @@ measured short-scan regressions and was replaced, not shipped as the default pol
 6. 实际块/显存预算下，一块与八块的全部三组配对样本都须GPU至少快20%，完整校验摘要。
 7. 多文件还在真实工作线程上比较全CPU与1GPU+其余CPU，使用动态任务领取；
    任务数不超过实际待处理文件数，最多四倍参与线程数。单文件复用串行证据。
-8. 用CPU最快、混合最慢样本保守估计待处理批次收益，至少覆盖两倍设置与探测成本才保留GPU。
-9. 最多启用一路GPU；首个最大待处理文件指定GPU，其余共享普通队列。每轮最多探索一次。
+8. 用CPU最快、混合最慢样本保守估计待处理批次收益；极值之间仍须至少快20%，
+   且收益至少覆盖两倍设置与探测成本才保留GPU。单线程也使用串行样本极值而非中位数。
+9. 最多启用一路GPU；暂存批次先按大小降序提交，首个最大文件固定GPU以兑现探测，
+   此后所有合格哈希持续携带GPU提示。
+   GPU优先领取合格哈希，CPU优先普通任务、空闲时窃取合格哈希；不把整批固定到GPU。
+   每轮最多探索一次。
 
 Auto starts CPU-only and buffers bounded metadata/handles, not contents. Only unprocessed eligible
 work can trigger a probe. Below the 4GiB exploration threshold there is no CUDA initialization.
 The coordinator drains all jobs before changing a backend. Serial evidence must pass a 20% margin;
 multi-file evidence additionally uses the real worker pool and a bounded dynamic CPU/mixed probe.
-Fastest CPU and slowest mixed samples feed a conservative amortization estimate. Only one GPU lane
-is retained, and the largest first candidate is routed to it explicitly. Explicit CPU/CUDA semantics
-remain separate from automatic profitability selection.
+Fastest CPU and slowest mixed samples must retain a 20% margin before feeding the amortization
+estimate; serial-only amortization also uses extrema rather than medians. One GPU lane is retained.
+Buffered candidates are submitted largest-first, with the first pinned to the GPU to realize the
+probe's first-job guarantee. Every later eligible hash carries the same stealable hint.
+The GPU prioritizes eligible hashes; CPUs prefer ordinary work and steal eligible hashes when idle.
+Explicit CPU/CUDA semantics remain separate from automatic profitability selection.
+
+## 持续调度与背压 / Continuous scheduling and backpressure
+
+`Resources::submit_hash` 是可窃取的资格提示（work stealing），不是设备绑定。
+原有 `submit(operation,true)` 保持固定首通道语义，供校准启动门使用；普通提交不变。
+固定任务、合格哈希、普通任务三类队列的**总和**受 `queue_capacity` 约束，完成环还限制
+在途及未收取结果数。GPU失败后原通道原地回退CPU，队列仍可排空，不丢弃任务。
+
+The hash hint is stealable, not device binding. The existing pinned submission contract remains for
+probe gates. All three queue classes share one admission bound; the completion ring additionally
+bounds running and uncollected results. A failed GPU lane becomes CPU in place and still drains work.
+The pure queue-selection policy is exhaustively tested for all 16 lane/queue-presence combinations,
+without requiring CUDA or timing-dependent profitability decisions.
+
+该策略不承诺每个大文件都走GPU，也不在任务开始后迁移Hasher。它避免小文件抢占合格
+哈希的队列优先级，但不能消除已经运行中的任务、冷IO和不等长尾部带来的偏差。
+It does not promise GPU execution for every large file or migrate a live hasher. Queue priority does
+not eliminate already-running work, cold I/O or unequal-length tails.
 
 ## 配置 / Configuration
 
@@ -90,3 +115,22 @@ counts, not proof that every byte executed on a physical GPU.
 
 See [GPU profiling](gpu-profiling.md), [dispatch benchmarks](dispatch-benchmark.md),
 [file benchmark protocol](file-dispatch-benchmark.md), and [policy research](dispatch-policy-design.md).
+
+## 设计依据 / Design rationale
+
+- [NVIDIA CUDA Best Practices](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html)：
+  决策包含主机传输与同步，复用有界注册缓冲；不是单独比较kernel时间。
+  Include transfer/synchronization costs and reuse bounded registered buffers, not kernel-only timing.
+- [BLAKE3 1.8.2 C implementation](https://github.com/BLAKE3-team/BLAKE3/tree/1.8.2/c)：
+  CPU沿用上游运行时SIMD分派，不强制本机ISA、不重复实现摘要算法。
+  Retain upstream runtime SIMD dispatch rather than forcing a host-specific ISA or duplicating hashing.
+- [StarPU, CCPE 2011](https://doi.org/10.1002/cpe.1631) 与
+  [StarPU features](https://starpu.gitlabpages.inria.fr/features.html)：
+  异构任务调度同时考虑性能、数据位置与可用资源；这里只借鉴任务亲和性与动态领取，
+  不引入完整运行时或在线学习模型。后者需要真实任务成本观测与独立实验才能采用。
+  Borrow affinity and dynamic task acquisition, not an entire runtime or unvalidated online model.
+- [Gonthier et al., JPDC 2025](https://doi.org/10.1016/j.jpdc.2025.105170)：
+  数据局部性与内存受限调度是值得跟进的方向，但其线性代数任务具有复用结构，
+  不能直接外推到一次性流式文件哈希；本轮维持有界缓冲和简单资格队列。
+  Memory-constrained locality-aware scheduling is relevant future work, but reusable linear-algebra
+  task data differs from one-pass streaming hashes; retain bounded buffers and a simple hint queue.

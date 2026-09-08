@@ -51,6 +51,18 @@ public:
 /// 验证决策边界与完整摘要检查。 / Verify decision boundaries and full digest checks.
 int main() {
     try {
+        using same::detail::WorkQueue;
+        // 穷尽队列快照，包括关闭排空时仅剩固定任务的 CPU 空闲情形。
+        // Exhaust every snapshot, including CPU idleness with only pinned work during draining.
+        const std::array<WorkQueue, 16> expected{
+            WorkQueue::none,   WorkQueue::normal, WorkQueue::eligible, WorkQueue::normal,
+            WorkQueue::none,   WorkQueue::normal, WorkQueue::eligible, WorkQueue::normal,
+            WorkQueue::none,   WorkQueue::normal, WorkQueue::eligible, WorkQueue::eligible,
+            WorkQueue::pinned, WorkQueue::pinned, WorkQueue::pinned,   WorkQueue::pinned};
+        for (unsigned mask = 0; mask < expected.size(); ++mask)
+            require(same::detail::select_work_queue(mask & 8, mask & 4, mask & 2, mask & 1) ==
+                        expected[mask],
+                    "incorrect queue priority or stealing decision");
         using same::detail::stable_gpu_win;
         require(stable_gpu_win({10, 10, 10}, {7, 8, 6}), "stable margin rejected");
         require(!stable_gpu_win({10, 10, 10}, {7, 8.01, 6}), "unstable margin accepted");
@@ -61,6 +73,27 @@ int main() {
                 "infinite timing accepted");
         require(!stable_gpu_win({10, 10, 10}, {std::numeric_limits<double>::quiet_NaN(), 1, 1}),
                 "NaN timing accepted");
+        using same::detail::conservative_gpu_saving;
+        using same::detail::gpu_setup_amortized;
+        require(conservative_gpu_saving(10, 8, 1024, 4096) == 8, "wrong batch normalization");
+        require(conservative_gpu_saving(10, 8.01, 1024, 4096) == 0, "weak mixed win accepted");
+        require(conservative_gpu_saving(10, -1, 1024, 4096) == 0, "negative GPU accepted");
+        require(conservative_gpu_saving(10, 8, 0, 4096) == 0, "zero sample accepted");
+        require(conservative_gpu_saving(10, 8, 1024, 0) == 0, "empty pending accepted");
+        require(conservative_gpu_saving(10, 8, std::numeric_limits<double>::infinity(), 4096) == 0,
+                "infinite sample accepted");
+        require(conservative_gpu_saving(std::numeric_limits<double>::quiet_NaN(), 8, 1024, 4096) ==
+                    0,
+                "NaN CPU accepted");
+        require(conservative_gpu_saving(1e308, 1, 1, 4096) == 0, "overflow saving accepted");
+        require(gpu_setup_amortized(8, 4), "amortization boundary rejected");
+        require(!gpu_setup_amortized(7.99, 4), "unamortized setup accepted");
+        require(!gpu_setup_amortized(0, 0), "zero saving accepted");
+        require(!gpu_setup_amortized(8, -1), "negative setup accepted");
+        require(!gpu_setup_amortized(std::numeric_limits<double>::infinity(), 4),
+                "infinite savings accepted");
+        require(!gpu_setup_amortized(8, std::numeric_limits<double>::quiet_NaN()),
+                "NaN setup accepted");
         auto cpu = same::make_cpu_compute();
         WrongCompute wrong;
         WrongCompute failing(true);
@@ -90,6 +123,10 @@ int main() {
         require(report.cpu_block_ms > 0 && report.gpu_block_ms > 0 && report.cpu_stream_ms > 0 &&
                     report.gpu_stream_ms > 0,
                 "missing calibration evidence");
+        require(report.cpu_stream_fastest_ms > 0 &&
+                    report.cpu_stream_fastest_ms <= report.cpu_stream_ms &&
+                    report.gpu_stream_slowest_ms >= report.gpu_stream_ms,
+                "missing conservative serial extremes");
         require(report.elapsed_ms > 0, "missing calibration cost");
         std::cout << "dispatch margin, samples and digest validation passed\n";
     } catch (const std::exception& error) {

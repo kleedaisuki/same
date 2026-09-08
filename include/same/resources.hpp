@@ -92,11 +92,20 @@ public:
     template <class F>
     auto submit(F&& operation, bool prefer_gpu = false)
         -> std::future<std::invoke_result_t<F, Worker&>> {
-        using Task = std::packaged_task<std::invoke_result_t<F, Worker&>(Worker&)>;
-        auto task = std::make_shared<Task>(std::forward<F>(operation));
-        auto future = task->get_future();
-        enqueue([task](Worker& worker) { (*task)(worker); }, prefer_gpu);
-        return future;
+        return submit_impl(std::forward<F>(operation), prefer_gpu, false);
+    }
+    /** 有资格的哈希优先送 GPU 通道，但 CPU 可在普通队列空时领取。
+     * Eligible hashes prefer the GPU lane; CPU workers steal when their normal queue is empty.
+     * 与固定通道 submit(..., true) 不同，这不会将整批哈希串行化；总队列容量不变。
+     * Unlike pinned submit(..., true), this does not serialize a batch; capacity stays shared.
+     * @code
+     * auto result = resources.submit_hash(operation, file_size >= gpu_floor);
+     * @endcode
+     */
+    template <class F>
+    auto submit_hash(F&& operation, bool gpu_eligible)
+        -> std::future<std::invoke_result_t<F, Worker&>> {
+        return submit_impl(std::forward<F>(operation), false, gpu_eligible);
     }
     /** 排空调用方全部任务后至多调用一次；不允许并发提交。 / Call at most once after
      * draining all caller jobs; concurrent submission is forbidden. Only pending, unread bytes
@@ -149,6 +158,16 @@ public:
     }
 
 private:
+    /// 统一打包与异常传递，仅排队类别不同。 / Shared packaging/exception contract for all routes.
+    template <class F>
+    auto submit_impl(F&& operation, bool pinned, bool eligible)
+        -> std::future<std::invoke_result_t<F, Worker&>> {
+        using Task = std::packaged_task<std::invoke_result_t<F, Worker&>(Worker&)>;
+        auto task = std::make_shared<Task>(std::forward<F>(operation));
+        auto future = task->get_future();
+        enqueue([task](Worker& worker) { (*task)(worker); }, pinned, eligible);
+        return future;
+    }
     /// 单次运行的性能选择，不跨机器/驱动/配置持久化。
     /// Per-run performance selection; never persisted across hardware/driver/config changes.
     detail::DispatchEvidence dispatch_;
@@ -156,7 +175,7 @@ private:
     /// only at idle barriers.
     bool auto_mode_{}, auto_attempted_{}, preferred_enabled_{};
     /// 等待队列空间；关闭后拒绝新任务。 / Wait for queue space; reject work after closure.
-    void enqueue(std::function<void(Worker&)> task, bool prefer_gpu);
+    void enqueue(std::function<void(Worker&)> task, bool prefer_gpu, bool gpu_eligible);
     /// 同步启动指定数量的真实工作线程，首线程可用 GPU。 / Gate real workers, optionally GPU on lane
     /// zero.
     double probe_mixed(std::size_t count, std::size_t jobs, bool gpu, const Digest& expected);
@@ -182,6 +201,9 @@ private:
     std::deque<std::function<void(Worker&)>> queue_;
     /// 与普通队列共享总容量，仅第零线程消费。 / Shares total capacity; consumed only by lane zero.
     std::deque<std::function<void(Worker&)>> gpu_queue_;
+    /// GPU 优先、CPU 可窃取的哈希队列；与其他队列共享容量。
+    /// GPU-preferred, CPU-stealable hash queue sharing the same total capacity.
+    std::deque<std::function<void(Worker&)>> hash_queue_;
     /// mutex 下的执行中任务数，处理 future 就绪早于任务返回的短窗口。
     /// Active jobs under mutex, covering the gap between future readiness and task return.
     std::size_t active_{};

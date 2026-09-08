@@ -228,16 +228,22 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
     bool probed = config.backend != "auto";
     auto submit = [&](HashInput input, bool prefer_gpu = false) {
         const auto submitted = Clock::now();
-        pending.submit(
-            [root, gpu_min_bytes = config.gpu_min_bytes, record = std::move(input.record),
-             opened = std::move(input.reader)](Worker& worker) mutable {
-                const auto start = Clock::now();
-                auto hashed = worker.execute([&] {
-                    return hash_file(root, record, worker, gpu_min_bytes, std::move(opened));
-                });
-                return HashResult{std::move(hashed), milliseconds(start, Clock::now())};
-            },
-            prefer_gpu);
+        const bool gpu_eligible =
+            input.record.stamp.size >= std::max(config.gpu_min_bytes, config.block_bytes);
+        auto operation = [root, gpu_min_bytes = config.gpu_min_bytes,
+                          record = std::move(input.record),
+                          opened = std::move(input.reader)](Worker& worker) mutable {
+            const auto start = Clock::now();
+            auto hashed = worker.execute(
+                [&] { return hash_file(root, record, worker, gpu_min_bytes, std::move(opened)); });
+            return HashResult{std::move(hashed), milliseconds(start, Clock::now())};
+        };
+        // 保证接受校准后的首个大文件确实使用 GPU，其余任务保持可窃取。
+        // Guarantee the first accepted candidate reaches the GPU; keep later work stealable.
+        if (prefer_gpu)
+            pending.submit(std::move(operation), true);
+        else
+            pending.submit_hash(std::move(operation), gpu_eligible);
         counters.hash_wait_ms += milliseconds(submitted, Clock::now());
         if (pending.pending() >= config.queue_capacity)
             drain();

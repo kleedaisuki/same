@@ -66,13 +66,18 @@ void Resources::close() {
 }
 /// 谓词在锁下同时检查关闭和容量，避免丢失唤醒及超量入队。 / Check closure and capacity under lock
 /// to avoid lost wakeups and over-admission.
-void Resources::enqueue(std::function<void(Worker&)> task, bool prefer_gpu) {
+void Resources::enqueue(std::function<void(Worker&)> task, bool prefer_gpu, bool gpu_eligible) {
     std::unique_lock lock(mutex_);
-    space_.wait(lock, [this] { return closed_ || queue_.size() + gpu_queue_.size() < capacity_; });
+    space_.wait(lock, [this] {
+        return closed_ || queue_.size() + gpu_queue_.size() + hash_queue_.size() < capacity_;
+    });
     if (closed_)
         throw std::runtime_error("resource manager is closed");
     if (prefer_gpu && preferred_enabled_) {
         gpu_queue_.push_back(std::move(task));
+        ready_.notify_all();
+    } else if (gpu_eligible && preferred_enabled_) {
+        hash_queue_.push_back(std::move(task));
         ready_.notify_all();
     } else {
         queue_.push_back(std::move(task));
@@ -88,11 +93,18 @@ void Resources::run(Worker& worker) {
             std::unique_lock lock(mutex_);
             const bool first = &worker == workers_.front().get();
             ready_.wait(lock, [this, first] {
-                return closed_ || !queue_.empty() || (first && !gpu_queue_.empty());
+                return closed_ || !queue_.empty() || !hash_queue_.empty() ||
+                       (first && !gpu_queue_.empty());
             });
-            auto& source = first && !gpu_queue_.empty() ? gpu_queue_ : queue_;
-            if (source.empty())
+            // 固定校准任务优先；GPU 优先大哈希，CPU 优先普通工作后窃取。
+            // Pinned probes first; GPU prefers eligible hashes, CPUs steal after normal work.
+            const auto selected = detail::select_work_queue(first, !gpu_queue_.empty(),
+                                                            !hash_queue_.empty(), !queue_.empty());
+            if (selected == detail::WorkQueue::none)
                 return;
+            auto& source = selected == detail::WorkQueue::pinned     ? gpu_queue_
+                           : selected == detail::WorkQueue::eligible ? hash_queue_
+                                                                     : queue_;
             task = std::move(source.front());
             source.pop_front();
             ++active_;
@@ -187,7 +199,7 @@ void Resources::prepare_auto(const Config& config, std::uint64_t pending_bytes,
         return;
     {
         std::unique_lock lock(mutex_);
-        if (closed_ || !queue_.empty() || !gpu_queue_.empty())
+        if (closed_ || !queue_.empty() || !gpu_queue_.empty() || !hash_queue_.empty())
             throw std::logic_error("prepare_auto requires drained jobs");
         space_.wait(lock, [&] { return active_ == 0; });
     }
@@ -233,7 +245,7 @@ void Resources::prepare_auto(const Config& config, std::uint64_t pending_bytes,
     };
     try {
         check_budget();
-        double cpu = dispatch_.cpu_stream_ms, device = dispatch_.gpu_stream_ms;
+        double cpu = dispatch_.cpu_stream_fastest_ms, device = dispatch_.gpu_stream_slowest_ms;
         const auto lanes = std::min(pending_files, workers_.size());
         const auto jobs = std::min(pending_files, 4 * lanes);
         if (lanes > 1) {
@@ -273,10 +285,9 @@ void Resources::prepare_auto(const Config& config, std::uint64_t pending_bytes,
         const double sampled_bytes = static_cast<double>(first.first.size()) *
                                      (lanes == 1 ? 8.0 : 2.0 * static_cast<double>(jobs));
         dispatch_.expected_saving_ms =
-            std::max(0.0, cpu - device) * static_cast<double>(pending_bytes) / sampled_bytes;
+            detail::conservative_gpu_saving(cpu, device, sampled_bytes, pending_bytes);
         dispatch_.setup_ms = elapsed();
-        if (std::isfinite(dispatch_.expected_saving_ms) &&
-            dispatch_.expected_saving_ms >= 2 * dispatch_.setup_ms) {
+        if (detail::gpu_setup_amortized(dispatch_.expected_saving_ms, dispatch_.setup_ms)) {
             gpu_workers_ = 1;
             return;
         }

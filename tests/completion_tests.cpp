@@ -77,6 +77,32 @@ void single_slot(same::Resources& resources) {
     }
     require(rejected, "zero capacity accepted");
 }
+/// 哈希提示保持完成环容量、移动捕获及异常传播，不依赖 GPU 是否存在。
+/// Hash hints preserve ring bounds, move-only captures and exceptions without requiring a GPU.
+void hash_admission(same::Resources& resources) {
+    same::detail::CompletionJobs<int> jobs(resources, 1);
+    for (const bool eligible : {false, true}) {
+        jobs.submit_hash([value = std::make_unique<int>(42)](same::Worker&) { return *value; },
+                         eligible);
+        bool rejected = false;
+        try {
+            jobs.submit_hash([](same::Worker&) { return -1; }, eligible);
+        } catch (const std::logic_error&) {
+            rejected = true;
+        }
+        require(rejected && jobs.pending() == 1, "hash admission exceeded capacity");
+        require(jobs.next() == 42, "hash move-only capture lost");
+        jobs.submit_hash([](same::Worker&) -> int { throw std::runtime_error("hash failure"); },
+                         eligible);
+        bool failed = false;
+        try {
+            (void)jobs.next();
+        } catch (const std::runtime_error&) {
+            failed = true;
+        }
+        require(failed && jobs.pending() == 0, "hash failure did not release capacity");
+    }
+}
 /// 异常结果消费后销毁协调器，在途任务仍拥有完成存储。
 /// Destroy the coordinator after an exception while another task retains completion storage.
 void exception_lifetime(same::Resources& resources) {
@@ -120,6 +146,7 @@ int main() {
         same::Resources resources(config);
         completion_order(resources);
         single_slot(resources);
+        hash_admission(resources);
         exception_lifetime(resources);
         std::cout << "completion order, bounds and exception lifetime passed\n";
     } catch (const std::exception& error) {

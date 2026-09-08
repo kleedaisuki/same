@@ -5,6 +5,14 @@
 #include <stdexcept>
 
 namespace same::detail {
+WorkQueue select_work_queue(bool first, bool pinned, bool eligible, bool normal) {
+    if (first && pinned)
+        return WorkQueue::pinned;
+    if (eligible && (first || !normal))
+        return WorkQueue::eligible;
+    return normal ? WorkQueue::normal : WorkQueue::none;
+}
+
 namespace {
 using Clock = std::chrono::steady_clock;
 /// 墙钟计时包含同步传输和 finish。 / Wall-clock timing includes synchronous transfers and finish.
@@ -43,6 +51,18 @@ bool stable_gpu_win(const std::array<double, 3>& cpu, const std::array<double, 3
             return false;
     }
     return true;
+}
+double conservative_gpu_saving(double cpu_ms, double gpu_ms, double sampled_bytes,
+                               std::uint64_t pending_bytes) {
+    if (!std::isfinite(cpu_ms) || !std::isfinite(gpu_ms) || !std::isfinite(sampled_bytes) ||
+        cpu_ms <= 0 || gpu_ms <= 0 || sampled_bytes <= 0 || !pending_bytes || gpu_ms > 0.8 * cpu_ms)
+        return 0;
+    const double saving = (cpu_ms - gpu_ms) * (static_cast<double>(pending_bytes) / sampled_bytes);
+    return std::isfinite(saving) ? saving : 0;
+}
+bool gpu_setup_amortized(double saving_ms, double setup_ms) {
+    return std::isfinite(saving_ms) && std::isfinite(setup_ms) && saving_ms > 0 && setup_ms >= 0 &&
+           saving_ms / 2 >= setup_ms;
 }
 /// 采样主体；仅外层将设备错误转换为失败证据。 / Sampling core; only the wrapper converts device
 /// errors to failed evidence.
@@ -91,6 +111,8 @@ static DispatchEvidence probe(Compute& cpu, Compute& gpu, std::span<std::byte> s
         } else {
             result.cpu_stream_ms = median(cpu_ms);
             result.gpu_stream_ms = median(gpu_ms);
+            result.cpu_stream_fastest_ms = *std::min_element(cpu_ms.begin(), cpu_ms.end());
+            result.gpu_stream_slowest_ms = *std::max_element(gpu_ms.begin(), gpu_ms.end());
         }
         wins = wins && stable_gpu_win(cpu_ms, gpu_ms);
     }

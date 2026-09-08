@@ -15,6 +15,33 @@ void require(bool condition, const char* message) {
     if (!condition)
         throw std::runtime_error(message);
 }
+/** 阻塞固定 GPU 通道，验证 CPU 可领取有资格哈希；调用方提供容量一且至少双线程的池。
+ * Block the pinned GPU lane and verify CPU stealing; caller supplies capacity one and at least
+ * two workers. 自动策略可合理拒绝设备，因此明确记录跳过而不要求硬件必须加速。
+ * Auto may legitimately reject the device, so log a skip instead of requiring a performance win.
+ */
+void verify_gpu_stealing(same::Resources& resources, const char* scenario) {
+    if (!resources.gpu_workers()) {
+        std::cout << "GPU stealing " << scenario << ": SKIPPED (auto selected CPU)\n";
+        return;
+    }
+    std::promise<void> release_gpu, gpu_started;
+    auto gpu_gate = release_gpu.get_future().share();
+    auto pinned = resources.submit(
+        [gpu_gate, &gpu_started](same::Worker&) {
+            gpu_started.set_value();
+            gpu_gate.wait();
+        },
+        true);
+    gpu_started.get_future().wait();
+    auto stolen =
+        resources.submit_hash([](same::Worker& worker) { return worker.compute->name(); }, true);
+    const bool ready = stolen.wait_for(2s) == std::future_status::ready;
+    release_gpu.set_value();
+    pinned.get();
+    require(ready && stolen.get() == "cpu", "CPU failed to steal GPU-eligible work");
+    std::cout << "GPU stealing " << scenario << ": EXECUTED capacity=1\n";
+}
 /// 运行本文件全部回归场景，断言失败即返回非零。 / Run all regressions; assertion failures produce a
 /// nonzero exit.
 int main() {
@@ -84,6 +111,10 @@ int main() {
             require(lazy.submit([](same::Worker& worker) { return worker.compute->name(); }, true)
                             .get() == "cpu",
                     "preferred submission before calibration must remain CPU");
+            require(
+                lazy.submit_hash([](same::Worker& worker) { return worker.compute->name(); }, true)
+                        .get() == "cpu",
+                "eligible hashes before probing must remain CPU");
             lazy.prepare_auto(lazy_config, 0, 0);
             require(lazy.dispatch_evidence().decision ==
                         same::detail::DispatchEvidence::Decision::deferred,
@@ -106,11 +137,21 @@ int main() {
                     .get();
             require(selected == (calibrated.gpu_workers() ? "cuda" : "cpu"),
                     "preferred lane routing failed");
+            verify_gpu_stealing(calibrated, "mixed-pool");
             calibrated.prepare_auto(probe, 128ULL * 1024 * 1024 * 1024, 16);
             require(calibrated.dispatch_evidence().setup_ms == evidence.setup_ms,
                     "auto probed twice");
             std::cout << "mixed probe capacity=1 cpu_ms=" << evidence.mixed_cpu_ms
                       << " mixed_ms=" << evidence.mixed_gpu_ms << '\n';
+            // 单文件证据不要求混合池提速，但保留另一 CPU 线程来验证窃取。
+            // Single-file evidence bypasses mixed-pool speedup, retaining a CPU lane for stealing.
+            probe.workers = 2;
+            same::Resources serial(probe);
+            serial.prepare_auto(probe, 64ULL * 1024 * 1024 * 1024, 1);
+            verify_gpu_stealing(serial, "single-file");
+            const auto& serial_evidence = serial.dispatch_evidence();
+            std::cout << "single-file probe capacity=1 cpu_ms=" << serial_evidence.mixed_cpu_ms
+                      << " gpu_ms=" << serial_evidence.mixed_gpu_ms << '\n';
         }
         config.memory_bytes = 1;
         threw = false;
