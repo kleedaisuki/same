@@ -1,5 +1,9 @@
 # Hash routing and store validation / 哈希分流与数据库验证
 
+> 历史阶段（`04419ff`）报告。数据库结果仍对应该提交；哈希调度现已演进为
+> [独立服务与双向互助](adaptive-routing-design.md)，勿将下面旧策略结果视为新策略测量。
+> Historical `04419ff` report; hashing has since moved to independent-service adaptive routing.
+
 ## Scope / 范围
 
 2026-09-08，Windows 11，Intel Core i9-12900H，RTX 3070 Ti Laptop 8 GiB，驱动572.61，
