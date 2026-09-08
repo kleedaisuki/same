@@ -198,6 +198,8 @@ A bounded queue and dedicated writer keep SQL, batched commits and checkpoints o
 
 配置、表结构、时间口径和只读 SQL 示例见 [遥测设计与检索](docs/telemetry.md)。 / See [telemetry design and queries](docs/telemetry.md) for configuration, schema, timing semantics and read-only SQL examples.
 
+多个运行库可用独立的 [Python 合并脚本](scripts/telemetry/README.md) 汇总为新分析归档；只读源库，不向 same 主程序添加查询命令。 / Use the standalone [Python merger](scripts/telemetry/README.md) to combine journals into a new analysis archive without modifying source data or adding same query commands.
+
 ## 状态与配置 / State and configuration
 
 程序自动创建真实目录 `.same`，持久化状态位于 `.same/state.db`。配置是 **`.same/config.toml`**，忽略规则是 **`.same/ignore`**；两者均可省略。`.same/run.lock` 防止同一状态目录的并发扫描；不要在运行期间删除锁文件。
