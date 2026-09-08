@@ -755,13 +755,32 @@ void size_routing(const fs::path& exe) {
     f.config({{"gpu_min_bytes", "0"}, {"rehash", "true"}});
     f.expect(expected);
     check(f.stats["cpu_routed_hashes"] == 0 && f.stats["hashed"] == 4, "size route disabled");
-    f.config({{"backend", "\"auto\""}, {"gpu_min_bytes", "0"}, {"rehash", "true"}});
+    // 小载荷资格下界，而不是退役的批次字节门槛，阻止设备初始化。
+    // The payload floor, not the retired volume gate, prevents GPU setup for small files.
+    f.config({{"backend", "\"auto\""},
+              {"gpu_min_bytes", "4097"},
+              {"gpu_probe_bytes", "0"},
+              {"rehash", "true"}});
     f.expect(expected);
     check(f.stats["gpu_workers"] == 0 && f.stats["calibration_ms"] == 0 &&
               f.stats["gpu_setup_ms"] == 0 && f.stats["cpu_hashes"] == 4,
-          "small pending batch must not pay CUDA setup or calibration");
+          "below-floor payloads must not pay CUDA setup or calibration");
     check(read(f.base / "stderr").find("using CPU fallback") == std::string::npos,
           "intentional auto CPU policy must not report unavailable CUDA");
+    f.config({{"backend", "\"auto\""},
+              {"gpu_min_bytes", "0"},
+              {"gpu_probe_bytes", "4294967296"},
+              {"rehash", "true"}});
+    f.expect(expected);
+    check(f.stats["cpu_hashes"] + f.stats["gpu_hashes"] == 4 && f.stats["cpu_fallbacks"] == 0,
+          "adaptive attempts or retry accounting changed");
+    if (std::getenv("SAME_REQUIRE_CUDA"))
+        check(f.stats["gpu_workers"] == 1 && f.stats["gpu_setup_ms"] > 0,
+              "retired volume gate still blocks eligible work");
+    f.config({{"backend", "\"auto\""}, {"gpu_min_bytes", "0"}});
+    f.expect(expected);
+    check(f.stats["cached"] == 4 && f.stats["gpu_workers"] == 0 && f.stats["gpu_setup_ms"] == 0,
+          "cached eligible files initialized CUDA");
 }
 
 /// 跨进程锁必须拒绝第二个扫描器，Windows 状态目录大小写不敏感。 / Reject a competing scanner;

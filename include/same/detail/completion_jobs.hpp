@@ -67,19 +67,25 @@ public:
     /// 达到容量前提交；调用方先 drain，再接收更多任务。
     /// Submit below capacity; callers drain before admitting further work.
     template <class F> void submit(F&& operation, bool prefer_gpu = false) {
-        submit_impl(std::forward<F>(operation), prefer_gpu, false);
+        submit_impl(std::forward<F>(operation), prefer_gpu, std::nullopt);
     }
     /// 哈希任务携带可窃取的 GPU 资格，不固定到单一工作线程。
     /// Hash work carries a stealable GPU eligibility hint, not a fixed worker assignment.
     template <class F> void submit_hash(F&& operation, bool gpu_eligible) {
-        submit_impl(std::forward<F>(operation), gpu_eligible, true);
+        submit_hash(std::forward<F>(operation),
+                    gpu_eligible ? HashRoute::gpu_preferred : HashRoute::cpu_only);
+    }
+    /// 显式区分不可卸载与可忙时互补的载荷。 / Distinguish CPU-only work from saturation spill.
+    template <class F> void submit_hash(F&& operation, HashRoute route) {
+        submit_impl(std::forward<F>(operation), false, route);
     }
 
 private:
     /// 两类接收共用完成发布和容量契约，仅资源调度入口不同。
     /// Both admission routes share publication and capacity contracts, differing only in
     /// scheduling.
-    template <class F> void submit_impl(F&& operation, bool hint, bool hash) {
+    template <class F>
+    void submit_impl(F&& operation, bool pinned, std::optional<HashRoute> route) {
         if (pending_ == state_->ring.size())
             throw std::logic_error("completion admission capacity exceeded");
         auto publish = [state = state_,
@@ -98,10 +104,10 @@ private:
             }
             state->ready.notify_one();
         };
-        if (hash)
-            resources_.submit_hash(std::move(publish), hint);
+        if (route)
+            resources_.submit_hash(std::move(publish), *route);
         else
-            resources_.submit(std::move(publish), hint);
+            resources_.submit(std::move(publish), pinned);
         ++pending_;
     }
 

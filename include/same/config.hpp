@@ -18,8 +18,8 @@ struct Config {
     /// 小于阈值的文件使用 CPU SIMD；0 禁用大小路由以便对照实验。
     /// Files below this threshold use CPU SIMD; zero disables size routing for ablations.
     std::size_t gpu_min_bytes{16 * 1024 * 1024};
-    /// 自动探测前须有这么多尚未处理的合格字节；0 仅供显式对照实验。
-    /// Unprocessed eligible bytes required before auto probing; zero is for explicit ablations.
+    /// 兼容读取旧配置的退役字段；自适应分流不再由全局字节门槛禁止 GPU。
+    /// Retired compatibility input; adaptive routing is no longer gated by aggregate bytes.
     std::uint64_t gpu_probe_bytes{4ULL * 1024 * 1024 * 1024};
     /// I/O block size, a multiple of one BLAKE3 chunk (1024 bytes).
     /// I/O 块大小，必须是 BLAKE3 分块大小（1024 字节）的整数倍。
@@ -30,8 +30,8 @@ struct Config {
     std::size_t device_memory_bytes{64 * 1024 * 1024};
     /// Bound both queued work and retained futures. 同时限制排队任务与保留的 future 数量。
     std::size_t queue_capacity;
-    /// auto measures profitability before enabling one GPU worker; cuda preserves explicit offload.
-    /// auto 校准收益后至多启用一路 GPU；cuda 保留显式卸载。二者允许 CPU 回退；cpu 不探测设备。
+    /// auto keeps CPU workers plus a budgeted GPU service with measured per-payload preferences.
+    /// auto 保留 CPU 工作者与独立 GPU 服务，按载荷及忙闲分流；cuda 保留显式卸载，cpu 不探测。
     std::string backend{"auto"};
     /// Ignore stored hashes even when file stamps match. 即使文件戳匹配也重新计算哈希。
     bool rehash{false};

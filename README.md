@@ -198,6 +198,7 @@ The configuration file is capped at 64 KiB; integer settings reject implicit con
 # 示例为 4 个内容线程；same new 写入本机实际默认值。 / Four-worker example; new resolves host defaults.
 workers = 4
 metadata_workers = 4
+# 旧配置兼容输入，不再充当全局门槛 / Retired compatibility input, not a global gate
 gpu_probe_bytes = 4294967296
 gpu_min_bytes = 16777216
 block_bytes = 1048576
@@ -212,7 +213,7 @@ rehash = false
 |---|---|---|
 | `workers` | 硬件并发数限制在 1–8 / hardware concurrency clamped to 1–8 | 1–256 |
 | `metadata_workers` | `min(workers, 4)` | 1–256；独立的目录与元数据线程 / separate directory and metadata workers |
-| `gpu_probe_bytes` | 4294967296 (4 GiB) | 自动探测所需未处理逻辑字节；非RAM分配，0仅供对照 / Pending bytes before auto exploration, not RAM; zero for ablation |
+| `gpu_probe_bytes` | 4294967296 (legacy) | 非负兼容保留值；不再控制自动分流 / Nonnegative retired input; no longer gates routing |
 | `gpu_min_bytes` | 16777216 (16 MiB) | 非负整数；小于阈值走 CPU SIMD，0 禁用大小路由 / smaller files use CPU SIMD; 0 disables size routing |
 | `block_bytes` | 1048576 (1 MiB) | 1024 的正整数倍，最大 64 MiB / positive multiple of 1024, ≤64 MiB |
 | `memory_bytes` | 67108864 (64 MiB) | ≥ `workers * (2*block_bytes + block_bytes/32 + 4096)` |
@@ -221,9 +222,17 @@ rehash = false
 | `backend` | `"auto"` | `"auto"`, `"cpu"`, `"cuda"` |
 | `rehash` | `false` | 布尔值 / boolean |
 
-`auto` 默认只启动CPU，暂存的大文件逻辑字节达到 `gpu_probe_bytes`（默认4GiB）才探索GPU。小文件、短扫描及全缓存扫描不付CUDA初始化费用。实际块/显存预算下，串行配对样本须GPU至少快20%，多文件还测真实CPU/混合池；预计收益须覆盖两倍设置和探测费用，才启用一路GPU，其余线程仍CPU。`cuda` 保留显式CUDA请求和大小下界；二者计算失败仍完整重试CPU，不混用半个摘要。
+`auto` 保留全部 `workers` 路CPU，首个未缓存的合格载荷后台初始化独立GPU服务，不阻塞CPU流水线。
+默认小于16MiB直接CPU SIMD；CPU仍用1MiB块，GPU在主机预算允许时独立使用16MiB块。
+64MiB起的长类与较短载荷分别校准，明显GPU优势形成偏好；CPU全忙时GPU也可接手其他合格载荷，
+GPU忙时CPU接手GPU优先任务。小文件和比较任务不进入GPU。设置费用不保证在短批次摊销。
+`cuda` 保留显式选择和大小下界；失败仍完整CPU重试，不混用半个摘要。
 
-Auto starts CPU-only and explores GPU only when bounded, unprocessed large-file work reaches the 4GiB default trigger. Serial probes must win by 20%; multi-file work also measures the real mixed pool, and estimated savings must cover twice the setup/probe cost. At most one GPU worker is enabled. Explicit CUDA keeps its user-selected size floor and full CPU error retry.
+Auto keeps all CPU workers and lazily adds one budgeted GPU service. CPU uses its configured block;
+GPU prefers a separate 16MiB block. Small and long eligible shapes have independent measured preferences.
+Saturated CPUs spill eligible work to an idle GPU; a busy GPU spills preferred work to idle CPUs.
+Small-only and cache-only scans skip setup. Short eligible batches may not amortize initialization.
+Explicit modes and full failure retries are preserved. See [the routing design](docs/adaptive-routing-design.md).
 
 ### 有界扫描流水线 / Bounded scanning pipeline
 
@@ -235,9 +244,12 @@ Directory and file-metadata work form a dynamic task graph. Metadata workers sha
 
 Metadata handles transfer directly to hashing or close on cache hits, avoiding a duplicate open while retaining fresh pre/post-read object and path-binding checks. Each result carries at most one open file; active workers and depth-first directory cursors add resources outside queue lengths. Budgets are not hard handle/process-memory limits.
 
-小文件默认走 CPU SIMD，`cpu_routed_hashes` 统计此策略的哈希尝试数，不算错误回退。`gpu_min_bytes` 是用户下界而非保证 GPU 更快的交叉点；自动模式还要求至少一个完整配置块，`gpu_min_bytes=0` 不会关闭自动收益检查，显式 `backend="cuda"` 才绕过性能门槛。精确字节比较始终使用主机缓冲区。
+小文件默认走 CPU SIMD，`cpu_routed_hashes` 不算错误回退。自动资格下界为
+`max(gpu_min_bytes,block_bytes)`；0不取消CPU块下界，也不凭空建立GPU偏好。
+显式 `backend="cuda"` 保留独立选择契约。精确字节比较始终使用主机缓冲区。
 
-Small files use CPU SIMD; policy counts are separate from error fallbacks. The user size floor is not a proven crossover. Auto also requires at least one full configured block, and `gpu_min_bytes=0` does not bypass its profitability gate; explicit `backend="cuda"` does. Exact comparisons remain host-side.
+Auto eligibility uses the larger of the user floor and CPU block size; zero removes neither the
+CPU-block lower bound nor the need for measured preference. Exact comparisons remain host-side.
 
 分界取决于文件大小、单次块大小、显存预算和并发。新的 ncu 驱动优化后，同样 64 MiB 输入，16 MiB 更新块可让 GPU 胜过 CPU，而 1 MiB 更新块不具相同优势。旧的固定 16 MiB 文件阈值不能表达这个差异。探测使用2秒软预算，完整操作后检查，不强行中断驱动；费用计入Scan/Elapsed，摘要不一致直接失败。
 
@@ -246,6 +258,13 @@ The decision depends on file size, update block size, device budget and concurre
 `cpu_hashes` / `gpu_hashes` 报告实际文件哈希尝试数，不含校准；`auto_backend`、`gpu_setup_ms`、`calibration_ms` 和 `probe_*_ms` 字段展示决策证据。单实例校准不是整盘加速证明；短扫描或全缓存扫描可显式选择 CPU 避免探测费用。详见[自动分派契约](docs/auto-dispatch.md)、[ncu 证据](docs/gpu-profiling.md)与[实测分派基准](docs/dispatch-benchmark.md)。
 
 Actual CPU/GPU hash attempts exclude calibration; `auto_backend`, `calibration_ms`, and four `probe_*_ms` fields expose the decision evidence. A single-instance probe does not prove whole-drive speedup. Explicit CPU avoids probing for short or fully cached scans.
+
+`auto_backend=adaptive` 表示独立GPU服务可用，不代表每项任务均走GPU。
+`gpu_overflow_jobs` 记录CPU全忙时的GPU接手次数，`cpu_spill_jobs`记录CPU接手GPU偏好任务
+（GPU忙或优先队列有积压）；`gpu_block_bytes`及两个
+`gpu_*_preferred`字段报告实际输入块和短/长偏好。旧混合/摊销统计字段保留为0。
+Adaptive service availability is not per-job GPU execution. New routing counters expose assistance;
+block size and shape preferences expose policy. Retired mixed/amortization fields remain zero.
 
 合格哈希在GPU优先、CPU可窃取的有界队列中持续分流；缓存验证与已见更新合并为一次数据库操作。
 实现边界、CPU/CUDA回归与分阶段实测见[哈希分流及数据库验证](docs/hash-store-validation.md)。

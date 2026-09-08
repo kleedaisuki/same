@@ -12,7 +12,6 @@
 #include <deque>
 #include <future>
 #include <iomanip>
-#include <limits>
 #include <locale>
 #include <numeric>
 #include <optional>
@@ -198,6 +197,84 @@ struct HashResult {
     /// Worker wall time; queue residence excluded. 工作线程墙钟时间，不含排队。
     double work_ms;
 };
+/// 待哈希记录与未读句柄；仅协调线程转移所有权。
+/// Pending hash metadata and unread handle, moved only by the coordinator.
+struct HashInput {
+    /// 待处理的缓存记录。 / Pending cache record.
+    FileRecord record;
+    /// 从元数据阶段移交的未读取句柄。 / Unread handle from metadata work.
+    std::unique_ptr<FileReader> reader;
+};
+/// 后台初始化与 CPU 流水线重叠，只保留一个最大的候选句柄。
+/// Overlap background initialization with CPU work, retaining only the largest candidate.
+class AutoHashStartup {
+public:
+    /// 借用扫描作用域外的服务；future 析构在服务销毁前等待初始化。
+    /// Borrow scan-external services; future destruction joins before those services die.
+    AutoHashStartup(const Config& config, Resources& resources)
+        : config_(config), resources_(resources),
+          floor_(std::max(config.gpu_min_bytes, config.block_bytes)),
+          ready_(config.backend != "auto") {}
+
+    /// 不迁移已排队任务；初始化期间以更大候选替换唯一保留项。
+    /// Never migrate queued work; replace the sole retained candidate with larger input.
+    template <class Submit> void accept(HashInput input, Submit& submit) {
+        if (startup_.valid() &&
+            startup_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            finish(submit);
+        if (ready_ || input.record.stamp.size < floor_) {
+            send(std::move(input), submit);
+            return;
+        }
+        if (!startup_.valid()) {
+            const auto bytes = input.record.stamp.size;
+            startup_ = std::async(std::launch::async,
+                                  [this, bytes] { resources_.prepare_auto(config_, bytes, 1); });
+            held_ = std::move(input);
+            return;
+        }
+        if (input.record.stamp.size > held_->record.stamp.size)
+            std::swap(input, *held_);
+        send(std::move(input), submit);
+    }
+
+    /// EOF 等待时已提交的 CPU 任务继续运行；get 发布探测证据后再读取。
+    /// At EOF submitted CPU work keeps running; get publishes evidence before any read.
+    template <class Submit> void finish(Submit& submit) {
+        if (!startup_.valid())
+            return;
+        startup_.get();
+        ready_ = true;
+        auto input = std::move(*held_);
+        held_.reset();
+        send(std::move(input), submit);
+    }
+
+private:
+    /// 未发布证据时只按载荷底线分类，避免与后台初始化的数据竞争。
+    /// Before evidence publication classify by the size floor only, avoiding startup races.
+    template <class Submit> void send(HashInput input, Submit& submit) {
+        auto route = input.record.stamp.size < floor_ ? detail::HashRoute::cpu_only
+                                                      : detail::HashRoute::cpu_preferred;
+        if (ready_)
+            route =
+                detail::classify_hash(input.record.stamp.size, floor_, resources_.gpu_block_bytes(),
+                                      resources_.dispatch_evidence());
+        submit(std::move(input), route);
+    }
+    /// 配置及资源由 run 持有，覆盖后台任务。 / Run owns services beyond background work.
+    const Config& config_;
+    Resources& resources_;
+    /// 不卸载的小载荷上界。 / Floor below which payloads are never offloaded.
+    std::size_t floor_;
+    /// 仅协调线程访问；为真意味着初始化证据可读。 / Coordinator-only publication state.
+    bool ready_;
+    /// 初始化期间至多一个尚未提交的句柄。 / At most one unsubmitted startup handle.
+    std::optional<HashInput> held_;
+    /// 最后声明以便异常展开时首先 join，保护捕获的 this 及借用服务。
+    /// Declared last to join first on unwinding, protecting captured this and borrowed services.
+    std::future<void> startup_;
+};
 /// Stream the tree into bounded worker jobs; keep every SQLite mutation on this thread.
 /// 流式遍历目录并提交有界任务；所有 SQLite 修改留在当前线程。
 void scan(const fs::path& root, const Config& config, Store& store, Resources& resources,
@@ -215,21 +292,8 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
         counters.hash_work_ms += result.work_ms;
         save(result.record);
     };
-    // 只保留句柄与记录，不预读大文件内容；暂存数量与任务容量同阶。
-    // Retain handles/records only, not file payloads; buffering is bounded by task capacity.
-    struct HashInput {
-        /// 待处理的缓存记录。 / Pending cache record.
-        FileRecord record;
-        /// 从元数据阶段移交的未读取句柄。 / Unread handle from metadata work.
-        std::unique_ptr<FileReader> reader;
-    };
-    std::vector<HashInput> deferred;
-    std::uint64_t deferred_bytes = 0;
-    bool probed = config.backend != "auto";
-    auto submit = [&](HashInput input, bool prefer_gpu = false) {
+    auto submit = [&](HashInput input, detail::HashRoute route) {
         const auto submitted = Clock::now();
-        const bool gpu_eligible =
-            input.record.stamp.size >= std::max(config.gpu_min_bytes, config.block_bytes);
         auto operation = [root, gpu_min_bytes = config.gpu_min_bytes,
                           record = std::move(input.record),
                           opened = std::move(input.reader)](Worker& worker) mutable {
@@ -238,36 +302,14 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
                 [&] { return hash_file(root, record, worker, gpu_min_bytes, std::move(opened)); });
             return HashResult{std::move(hashed), milliseconds(start, Clock::now())};
         };
-        // 保证接受校准后的首个大文件确实使用 GPU，其余任务保持可窃取。
-        // Guarantee the first accepted candidate reaches the GPU; keep later work stealable.
-        if (prefer_gpu)
-            pending.submit(std::move(operation), true);
-        else
-            pending.submit_hash(std::move(operation), gpu_eligible);
+        // 只提交偏好；领取时在同一锁下决定真实设备忙闲，不固定首个大文件。
+        // Submit a preference; resolve live device occupancy under the queue lock at dequeue.
+        pending.submit_hash(std::move(operation), route);
         counters.hash_wait_ms += milliseconds(submitted, Clock::now());
         if (pending.pending() >= config.queue_capacity)
             drain();
     };
-    auto flush = [&](bool explore) {
-        bool prefer_gpu = false;
-        if (explore && !probed) {
-            while (pending.pending())
-                drain();
-            resources.prepare_auto(config, deferred_bytes, deferred.size());
-            probed = true;
-            prefer_gpu = resources.gpu_workers() != 0;
-        }
-        if (prefer_gpu)
-            std::sort(deferred.begin(), deferred.end(), [](const auto& a, const auto& b) {
-                return a.record.stamp.size > b.record.stamp.size;
-            });
-        for (auto& input : deferred) {
-            submit(std::move(input), prefer_gpu);
-            prefer_gpu = false;
-        }
-        deferred.clear();
-        deferred_bytes = 0;
-    };
+    AutoHashStartup startup(config, resources);
     store.begin_scan();
     ParallelWalk walk(root, config.metadata_workers, config.queue_capacity, recursive);
     for (;;) {
@@ -288,21 +330,12 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
             continue;
         }
         ++counters.hashed;
-        if (!probed && record.stamp.size >= std::max(config.gpu_min_bytes, config.block_bytes)) {
-            deferred_bytes += std::min(record.stamp.size,
-                                       std::numeric_limits<std::uint64_t>::max() - deferred_bytes);
-            deferred.push_back({std::move(record), std::move(entry->reader)});
-            if (deferred_bytes >= config.gpu_probe_bytes)
-                flush(true);
-            else if (deferred.size() >= config.queue_capacity)
-                flush(false);
-        } else {
-            submit({std::move(record), std::move(entry->reader)});
-        }
+        startup.accept({std::move(record), std::move(entry->reader)}, submit);
     }
-    flush(false);
+    startup.finish(submit);
     while (pending.pending())
         drain();
+    resources.wait_idle();
     const auto stats = walk.stats();
     counters.enumerate_work_ms = stats.enumerate_ms;
     counters.metadata_work_ms = stats.metadata_ms;
@@ -473,6 +506,8 @@ std::string_view dispatch_name(detail::DispatchEvidence::Decision decision) {
         return "cuda";
     case Decision::failed:
         return "cpu-probe-failed";
+    case Decision::adaptive:
+        return "adaptive";
     }
     return "invalid";
 }
@@ -536,6 +571,10 @@ void render_pretty_profile(const Counters& counters, const Resources& resources,
     const auto [cpu_attempts, gpu_attempts] = resources.hash_attempts();
     row("Hash backends",
         std::to_string(cpu_attempts) + " CPU | " + std::to_string(gpu_attempts) + " GPU attempts");
+    const auto [overflow, spill] = resources.route_counts();
+    row("Busy routing",
+        std::to_string(overflow) + " GPU overflow | " + std::to_string(spill) + " CPU spill jobs");
+    row("GPU input", human_bytes(static_cast<double>(resources.gpu_block_bytes())));
     row("Auto dispatch", std::string(dispatch_name(dispatch.decision)) + " | " +
                              human_duration(dispatch.setup_ms) + " setup (included in scan)");
     if (dispatch.elapsed_ms > 0) {
@@ -594,7 +633,12 @@ void render_profile(const Counters& counters, const Resources& resources,
     profile << "cpu_routed_hashes=" << resources.cpu_routed_hashes() << '\n';
     const auto& dispatch = resources.dispatch_evidence();
     const auto [cpu_attempts, gpu_attempts] = resources.hash_attempts();
+    const auto [overflow, spill] = resources.route_counts();
     profile << "cpu_hashes=" << cpu_attempts << " gpu_hashes=" << gpu_attempts
+            << " gpu_overflow_jobs=" << overflow << " cpu_spill_jobs=" << spill
+            << " gpu_block_bytes=" << resources.gpu_block_bytes()
+            << " gpu_block_preferred=" << dispatch.block_gpu_preferred
+            << " gpu_stream_preferred=" << dispatch.stream_gpu_preferred
             << " auto_backend=" << dispatch_name(dispatch.decision)
             << " gpu_setup_ms=" << dispatch.setup_ms
             << " probe_mixed_cpu_ms=" << dispatch.mixed_cpu_ms
@@ -625,6 +669,7 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
     scan(root, config, store, resources, counters, options.recursive);
     const auto scanned = Clock::now();
     partition(root, store, resources, config.queue_capacity);
+    resources.wait_idle();
     const auto compared = Clock::now();
     validate_results(root, store, options.unique_files);
     // end_scan committed exactly the visited records; measure before emitting any output.

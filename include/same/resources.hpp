@@ -15,6 +15,10 @@
 #include <vector>
 
 namespace same {
+namespace detail {
+/// 可注入设备创建器；返回空表示不可用。 / Injectable device factory; null means unavailable.
+using CudaFactory = std::function<std::unique_ptr<Compute>(std::size_t, std::size_t)>;
+} // namespace detail
 /// 单线程独占的复用缓冲及可降级后端。 / Reusable buffers and fallback-capable backend exclusively
 /// owned by one worker thread.
 struct Worker {
@@ -79,6 +83,15 @@ public:
     /// 校验并预分配缓冲；auto 不探测 GPU，显式 cuda 在启动线程前探测。
     /// Reserve validated buffers; auto defers probing, explicit cuda probes before thread startup.
     explicit Resources(const Config& config);
+    /// 注入设备工厂供确定性验证。 / Inject a device factory for deterministic validation.
+    Resources(const Config& config, detail::CudaFactory factory);
+    /// 等待排队及执行中任务归零。 / Wait until queued and executing tasks are empty.
+    void wait_idle();
+    /// 空闲后读取溢出 GPU 和回流 CPU 的任务数。 / Read GPU overflow and CPU spill counts after
+    /// idle.
+    std::pair<std::uint64_t, std::uint64_t> route_counts() const {
+        return {gpu_overflow_jobs_, cpu_spill_jobs_};
+    }
     /// 排空已接收任务并等待所有工作线程。 / Drain admitted tasks and join every worker.
     ~Resources();
     /// 线程及队列具有唯一所有权。 / Threads and queue have unique ownership.
@@ -87,12 +100,12 @@ public:
     Resources& operator=(const Resources&) = delete;
 
     /// 有界阻塞提交；返回的 future 保存结果或任务异常。 / Bounded blocking submission; the future
-    /// holds the result or task exception. prefer_gpu only pins auto-enabled lane zero; otherwise
-    /// admission remains generic. prefer_gpu 仅固定已启用的 auto 第零通道，否则仍普通提交。
+    /// holds the result or task exception. prefer_gpu pins the live automatic GPU service;
+    /// fallback is CPU-reclaimable. prefer_gpu 固定存活的自动 GPU 服务，失败后 CPU 可回收。
     template <class F>
     auto submit(F&& operation, bool prefer_gpu = false)
         -> std::future<std::invoke_result_t<F, Worker&>> {
-        return submit_impl(std::forward<F>(operation), prefer_gpu, false);
+        return submit_impl(std::forward<F>(operation), prefer_gpu, detail::HashRoute::cpu_only);
     }
     /** 有资格的哈希优先送 GPU 通道，但 CPU 可在普通队列空时领取。
      * Eligible hashes prefer the GPU lane; CPU workers steal when their normal queue is empty.
@@ -105,11 +118,20 @@ public:
     template <class F>
     auto submit_hash(F&& operation, bool gpu_eligible)
         -> std::future<std::invoke_result_t<F, Worker&>> {
-        return submit_impl(std::forward<F>(operation), false, gpu_eligible);
+        return submit_hash(std::forward<F>(operation), gpu_eligible
+                                                           ? detail::HashRoute::gpu_preferred
+                                                           : detail::HashRoute::cpu_only);
     }
-    /** 排空调用方全部任务后至多调用一次；不允许并发提交。 / Call at most once after
-     * draining all caller jobs; concurrent submission is forbidden. Only pending, unread bytes
-     * may amortize setup. 仅尚未读取的待处理字节可摊销初始化成本。
+    /// 按载荷偏好提交；CPU-only 永不进入自动 GPU 服务。 / Submit by payload preference;
+    /// CPU-only work never enters the automatic GPU service.
+    template <class F>
+    auto submit_hash(F&& operation, detail::HashRoute route)
+        -> std::future<std::invoke_result_t<F, Worker&>> {
+        return submit_impl(std::forward<F>(operation), false, route);
+    }
+    /** 使用独立缓冲同步探测一次，可与已有 CPU 工作重叠。 / Probe synchronously once using
+     * independent buffers, overlapping existing CPU work. 不得并发调用本函数或读取统计。
+     * Do not call this method concurrently with itself or statistics access.
      */
     void prepare_auto(const Config& config, std::uint64_t pending_bytes, std::size_t pending_files);
     /// 构造或惰性探测实际启用的 GPU 数，支持并发读取，不扣除运行时降级。
@@ -117,6 +139,10 @@ public:
     /// fallback is not subtracted.
     std::size_t gpu_workers() const {
         return gpu_workers_.load(std::memory_order_relaxed);
+    }
+    /// 自动服务实际输入块；未启用时返回 CPU 配置块。 / Auto service block, or configured CPU block.
+    std::size_t gpu_block_bytes() const {
+        return gpu_worker_ ? gpu_worker_->first.size() : workers_.front()->first.size();
     }
     /// 运行时整体重试次数，不包含启动探测失败。 / Runtime retry count, excluding failed startup
     /// probes.
@@ -132,6 +158,10 @@ public:
             hashed += worker->hash_bytes;
             compared += worker->compare_bytes;
         }
+        if (gpu_worker_) {
+            hashed += gpu_worker_->hash_bytes;
+            compared += gpu_worker_->compare_bytes;
+        }
         return {hashed, compared};
     }
     /// 所有任务完成后读取策略计数，不得并发访问。 / Read policy counts only after all jobs finish.
@@ -139,9 +169,11 @@ public:
         std::uint64_t result = 0;
         for (const auto& worker : workers_)
             result += worker->cpu_routed_hashes;
+        if (gpu_worker_)
+            result += gpu_worker_->cpu_routed_hashes;
         return result;
     }
-    /// 空闲屏障探测后读取；不得与 prepare_auto 并发访问。 / Read after idle-barrier probing;
+    /// 同步探测完成后读取；不得与 prepare_auto 并发访问。 / Read after synchronous probing;
     /// never access concurrently with prepare_auto.
     const detail::DispatchEvidence& dispatch_evidence() const {
         return dispatch_;
@@ -154,66 +186,74 @@ public:
             cpu += worker->cpu_hashes;
             gpu += worker->gpu_hashes;
         }
+        if (gpu_worker_) {
+            cpu += gpu_worker_->cpu_hashes;
+            gpu += gpu_worker_->gpu_hashes;
+        }
         return {cpu, gpu};
     }
 
 private:
     /// 统一打包与异常传递，仅排队类别不同。 / Shared packaging/exception contract for all routes.
     template <class F>
-    auto submit_impl(F&& operation, bool pinned, bool eligible)
+    auto submit_impl(F&& operation, bool pinned, detail::HashRoute route)
         -> std::future<std::invoke_result_t<F, Worker&>> {
         using Task = std::packaged_task<std::invoke_result_t<F, Worker&>(Worker&)>;
         auto task = std::make_shared<Task>(std::forward<F>(operation));
         auto future = task->get_future();
-        enqueue([task](Worker& worker) { (*task)(worker); }, pinned, eligible);
+        enqueue([task](Worker& worker) { (*task)(worker); }, pinned, route);
         return future;
     }
     /// 单次运行的性能选择，不跨机器/驱动/配置持久化。
     /// Per-run performance selection; never persisted across hardware/driver/config changes.
     detail::DispatchEvidence dispatch_;
-    /// 自动模式仅探测一次；preferred 标志仅空闲屏障期间修改。 / Probe auto once; change routing
-    /// only at idle barriers.
+    /// 自动探测状态；服务可用状态由队列锁保护。 / Auto probe state; service availability is locked.
     bool auto_mode_{}, auto_attempted_{}, preferred_enabled_{};
-    /// 等待队列空间；关闭后拒绝新任务。 / Wait for queue space; reject work after closure.
-    void enqueue(std::function<void(Worker&)> task, bool prefer_gpu, bool gpu_eligible);
-    /// 同步启动指定数量的真实工作线程，首线程可用 GPU。 / Gate real workers, optionally GPU on lane
-    /// zero.
-    double probe_mixed(std::size_t count, std::size_t jobs, bool gpu, const Digest& expected);
-    /// 队列锁外执行任务，关闭后继续排空队列。 / Execute outside the queue lock and drain queued
-    /// work after closure.
-    void run(Worker& worker);
-    /// 唤醒等待者并 join；仅由拥有者从非工作线程调用。 / Wake waiters and join; owner calls only
-    /// from a non-worker thread.
+    /// 创建后端，不持有队列锁。 / Backend factory, invoked without the queue lock.
+    detail::CudaFactory cuda_factory_;
+    /// 等待共享容量后按类别排队。 / Wait for shared capacity and enqueue by class.
+    void enqueue(std::function<void(Worker&)> task, bool pinned, detail::HashRoute route);
+    /// 队列锁下决定当前线程能否领取。 / Decide eligibility under the queue lock.
+    bool can_run(bool gpu) const;
+    /// 锁内领取并更新活动/路由计数；必须持有 mutex_ 且 can_run(gpu) 为真。
+    /// Dequeue and update activity/routing; requires mutex_ held and can_run(gpu) true.
+    std::function<void(Worker&)> take_task(bool gpu);
+    /// 执行任务并发布活动状态，服务错误后退出。 / Execute and publish activity; failed service
+    /// exits.
+    void run(Worker& worker, bool gpu = false);
+    /// 关闭并排空所有已接收任务。 / Close and drain all admitted work.
     void close();
-    /// 跨工作线程共享的原子降级计数。 / Atomic fallback count shared across workers.
+    /// 跨线程重试计数。 / Cross-thread retry counter.
     std::atomic<std::size_t> fallbacks_{0};
-    /// 构造或惰性探测启用的 GPU 数；不扣除任务错误降级。 / GPU lanes enabled at construction
-    /// or lazy probing; runtime failure fallback does not decrement this count.
+    /// 曾启用的 GPU 通道数。 / Number of GPU lanes ever enabled.
     std::atomic<std::size_t> gpu_workers_{0};
-    /// 排队任务上限，不含正在执行的任务。 / Maximum queued tasks, excluding running tasks.
+    /// 所有队列共享容量。 / Shared capacity across queues.
     std::size_t capacity_;
-    /// 地址稳定的工作上下文，在线程退出后释放。 / Stable-address worker contexts released after
-    /// threads exit.
+    /// 构造时冻结的主机/设备预算及 GPU 下界；惰性初始化不得绕过这些契约。
+    /// Constructor-frozen host/device budgets and GPU floor; lazy setup cannot bypass these
+    /// contracts.
+    const std::size_t memory_bytes_, device_memory_bytes_, gpu_min_bytes_;
+    /// 构造后不再扩容的 CPU/显式后端上下文。 / Fixed CPU/explicit-backend contexts.
     std::vector<std::unique_ptr<Worker>> workers_;
-    /// 每个线程固定使用一个 Worker。 / Each thread permanently uses one Worker.
+    /// 独立自动 GPU 缓冲，不替换 CPU 工作者。 / Independent auto GPU buffers, never replacing CPU.
+    std::unique_ptr<Worker> gpu_worker_;
+    /// 固定线程及至多一个延迟启动的 GPU 线程。 / Fixed threads plus at most one lazy GPU thread.
     std::vector<std::thread> threads_;
-    /// 由 mutex_ 保护的先进先出任务队列。 / FIFO task queue protected by mutex_.
-    std::deque<std::function<void(Worker&)>> queue_;
-    /// 与普通队列共享总容量，仅第零线程消费。 / Shares total capacity; consumed only by lane zero.
-    std::deque<std::function<void(Worker&)>> gpu_queue_;
-    /// GPU 优先、CPU 可窃取的哈希队列；与其他队列共享容量。
-    /// GPU-preferred, CPU-stealable hash queue sharing the same total capacity.
-    std::deque<std::function<void(Worker&)>> hash_queue_;
-    /// mutex 下的执行中任务数，处理 future 就绪早于任务返回的短窗口。
-    /// Active jobs under mutex, covering the gap between future readiness and task return.
-    std::size_t active_{};
-    /// 同时保护 queue_ 和 closed_。 / Protects both queue_ and closed_.
+    /// 普通、固定 GPU、GPU 优先及 CPU 优先队列，均由 mutex_ 保护。
+    /// Ordinary, pinned GPU, GPU-preferred and CPU-preferred queues, protected by mutex_.
+    std::deque<std::function<void(Worker&)>> queue_, gpu_queue_, hash_queue_, cpu_hash_queue_;
+    /// 锁内活动数量；future 就绪不等于执行器已归还。 / Locked activity; ready futures may precede
+    /// return.
+    std::size_t cpu_active_{};
+    /// 专用 GPU 是否执行任务。 / Whether the dedicated GPU is executing.
+    bool gpu_active_{};
+    /// 锁内累计实际出队路由。 / Actual dequeue routing totals, updated under lock.
+    std::uint64_t gpu_overflow_jobs_{}, cpu_spill_jobs_{};
+    /// 保护队列、服务存活及活动状态。 / Protect queues, service liveness and activity.
     std::mutex mutex_;
-    /// 分别通知消费者有任务、生产者有空间或两者关闭。 / Signal work, space, or closure to consumers
-    /// and producers.
+    /// 任务和活动变化，以及队列空间/空闲屏障。 / Work/activity changes and space/idle barriers.
     std::condition_variable ready_, space_;
-    /// 单向关闭状态；关闭不丢弃已排队任务。 / One-way closure flag; closure does not discard queued
-    /// tasks.
+    /// 单向关闭，仍排空队列。 / One-way closure that still drains queues.
     bool closed_{false};
 };
 } // namespace same

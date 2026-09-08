@@ -70,7 +70,7 @@ target_link_libraries(store_benchmark PRIVATE same_core)
 target_compile_definitions(store_benchmark PRIVATE SAME_STORE_FUSED_LOOKUP=1)
 
 if(BUILD_TESTING)
-  foreach(test compute files config store resources run_lock terminal walk completion hash_retry dispatch workspace)
+  foreach(test compute files config store resources adaptive_routing async_scan run_lock terminal walk completion hash_retry dispatch workspace)
     add_executable(${test}_tests tests/${test}_tests.cpp)
     target_link_libraries(${test}_tests PRIVATE same_core)
     add_test(NAME ${test} COMMAND ${test}_tests)

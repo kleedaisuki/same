@@ -141,8 +141,8 @@ int main() {
             calibrated.prepare_auto(probe, 128ULL * 1024 * 1024 * 1024, 16);
             require(calibrated.dispatch_evidence().setup_ms == evidence.setup_ms,
                     "auto probed twice");
-            std::cout << "mixed probe capacity=1 cpu_ms=" << evidence.mixed_cpu_ms
-                      << " mixed_ms=" << evidence.mixed_gpu_ms << '\n';
+            std::cout << "adaptive capacity=1 cpu_stream_ms=" << evidence.cpu_stream_ms
+                      << " gpu_stream_ms=" << evidence.gpu_stream_ms << '\n';
             // 单文件证据不要求混合池提速，但保留另一 CPU 线程来验证窃取。
             // Single-file evidence bypasses mixed-pool speedup, retaining a CPU lane for stealing.
             probe.workers = 2;

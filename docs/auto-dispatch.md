@@ -1,136 +1,99 @@
-# 惰性、可摊销的 CPU/GPU 分派 / Lazy, amortized CPU/GPU dispatch
+# 按载荷与设备可用性分流 / Payload- and availability-aware dispatch
 
-## 为什么不是固定文件大小阈值 / Why a size threshold is insufficient
+本文定义 `backend="auto"` 的当前目标契约，取代旧版“累计 4 GiB 待处理任务后才探测”的策略。
+历史测量仍保留在 [dispatch-results.md](dispatch-results.md)，不能将其旧版路由结果当作本策略的新测量。
+This contract supersedes the pending-4-GiB probe gate. Historical measurements describe earlier routing,
+not measured performance of this policy. Design rationale: [adaptive-routing-design.md](adaptive-routing-design.md).
 
-64 MiB 输入在16 MiB分块时单GPU可胜CPU，但20个GPU实例竞争反而显著变慢。
-热内存基准的胜利也不能覆盖CUDA初始化、校准、文件读取和pageable输入复制成本。
-开发中曾实测512MiB短扫描被无条件启动校准拖慢；该方案已被替换，而不是作为默认留下。
+## 载荷分类 / Payload classes
 
-A large update block can make one GPU profitable, while many GPU instances reverse the advantage.
-Warm-memory wins exclude startup and file I/O. An early unconditional calibration prototype caused
-measured short-scan regressions and was replaced, not shipped as the default policy.
+CPU 使用上游 BLAKE3 单指令多数据运行时分派（SIMD runtime dispatch），默认读取块仍为 1 MiB。
+GPU 有独立服务与输入缓冲，优先采用 `max(block_bytes,16 MiB)` 更新块；若预算不足，则尝试
+配置的 `block_bytes`，仍不足时禁用自动 GPU 服务，而不是使原本合法的 CPU 配置失效。
+CPU retains upstream SIMD dispatch and the default 1 MiB block. The independent GPU service prefers
+`max(block_bytes,16 MiB)`, falls back to the configured block if budgets require, then disables only
+automatic GPU service if that also cannot fit. Existing valid CPU configurations remain valid.
 
-## 最终流程 / Final flow
+令 `C` 为 CPU 块大小，`G` 为实际 GPU 块大小，`E=max(gpu_min_bytes,C)`，
+`L=max(64 MiB,4*G)`。默认 `gpu_min_bytes=16 MiB`，是自动卸载资格下界，不是通用性能交叉点。
+Let `C` and `G` be actual CPU and GPU block sizes, `E=max(gpu_min_bytes,C)`, and
+`L=max(64 MiB,4*G)`. The default 16 MiB eligibility floor is not a universal crossover.
 
-1. `backend="cpu"` 不探测CUDA；`backend="cuda"` 保留显式选择、大小下界及失败后的CPU重试。
-2. `backend="auto"` 启动时只创建CPU后端，摘要缓存命中不触发GPU探测。
-3. 暂存达到 `max(gpu_min_bytes,block_bytes)` 的未处理文件，只有记录与打开句柄，不预读内容；
-   数量最多 `queue_capacity`。小文件照常在CPU流水线处理。
-4. 暂存逻辑字节达到 `gpu_probe_bytes`（默认4GiB）才允许一次有界探索。
-   容量先满或EOF不足直接CPU处理，不付CUDA初始化费用；已处理字节不能拿来摊销未来工作。
-5. 排空在途哈希并等待线程真正空闲，再建立第一GPU后端，注册其稳定输入缓冲区。
-6. 实际块/显存预算下，一块与八块的全部三组配对样本都须GPU至少快20%，完整校验摘要。
-7. 多文件还在真实工作线程上比较全CPU与1GPU+其余CPU，使用动态任务领取；
-   任务数不超过实际待处理文件数，最多四倍参与线程数。单文件复用串行证据。
-8. 用CPU最快、混合最慢样本保守估计待处理批次收益；极值之间仍须至少快20%，
-   且收益至少覆盖两倍设置与探测成本才保留GPU。单线程也使用串行样本极值而非中位数。
-9. 最多启用一路GPU；暂存批次先按大小降序提交，首个最大文件固定GPU以兑现探测，
-   此后所有合格哈希持续携带GPU提示。
-   GPU优先领取合格哈希，CPU优先普通任务、空闲时窃取合格哈希；不把整批固定到GPU。
-   每轮最多探索一次。
+| 类别 / Class | 判据 / Rule | 默认执行与互助 / Execution and assistance |
+|---|---|---|
+| `cpu_only` | 文件小于 `E` / size below `E` | 仅 CPU，即使 CPU 全忙 / CPU only, even when CPUs are busy |
+| `cpu_preferred` | 达到 `E`，对应校准未证明稳定 GPU 优势 / eligible without demonstrated GPU advantage | CPU 优先；全部 CPU 正在执行任务时，空闲 GPU 可接手 / CPU first; idle GPU assists when all CPUs are active |
+| `gpu_preferred` | 达到 `E`，对应校准证明 GPU 至少快 20% / eligible with stable ≥20% GPU advantage | GPU 优先；GPU 忙时空闲 CPU 可接手 / GPU first; idle CPU assists when GPU is busy |
 
-Auto starts CPU-only and buffers bounded metadata/handles, not contents. Only unprocessed eligible
-work can trigger a probe. Below the 4GiB exploration threshold there is no CUDA initialization.
-The coordinator drains all jobs before changing a backend. Serial evidence must pass a 20% margin;
-multi-file evidence additionally uses the real worker pool and a bounded dynamic CPU/mixed probe.
-Fastest CPU and slowest mixed samples must retain a 20% margin before feeding the amortization
-estimate; serial-only amortization also uses extrema rather than medians. One GPU lane is retained.
-Buffered candidates are submitted largest-first, with the first pinned to the GPU to realize the
-probe's first-job guarantee. Every later eligible hash carries the same stealable hint.
-The GPU prioritizes eligible hashes; CPUs prefer ordinary work and steal eligible hashes when idle.
-Explicit CPU/CUDA semantics remain separate from automatic profitability selection.
+小于 `L` 的合格文件使用单 GPU 块形状证据；达到 `L` 的长载荷使用四 GPU 块流式证据。
+两种形状独立决策，不能用长流收益替小载荷背书，也不能因短流不胜而抹掉长流机会。
+Eligible files below `L` use one-GPU-block evidence; long payloads use four-block streaming evidence.
+The shapes are independent: long-stream wins do not justify short-stream preference, and short-stream
+losses do not erase long-stream opportunities.
+每类三轮交替CPU/GPU采样，最慢GPU仍须比最快CPU快20%，避免中位数掩盖抖动。
+Three alternating paired rounds per shape require slowest GPU to beat fastest CPU by 20%.
+未达到实际GPU单块输入长度的任务不外推单块优势，仍为CPU偏好、可在饱和时卸载。
+Below the actual GPU block length, do not extrapolate a block win; prefer CPU with saturation spill.
 
-## 持续调度与背压 / Continuous scheduling and backpressure
+## 服务与调度 / Services and scheduling
 
-`Resources::submit_hash` 是可窃取的资格提示（work stealing），不是设备绑定。
-原有 `submit(operation,true)` 保持固定首通道语义，供校准启动门使用；普通提交不变。
-固定任务、合格哈希、普通任务三类队列的**总和**受 `queue_capacity` 约束，完成环还限制
-在途及未收取结果数。GPU失败后原通道原地回退CPU，队列仍可排空，不丢弃任务。
+- `N` 路 CPU 加最多一路独立 GPU；不拿走一条 CPU 通道充当 GPU。
+  Keep `N` CPU lanes plus at most one independent GPU service, not `N-1` CPUs plus a GPU.
+- 第一个未缓存、合格哈希触发一次后台 GPU 设置与有界校准；CPU 流水线继续运行。
+  初始化仍有真实延迟，不承诺小批次能摊销。纯小文件与缓存命中不触发 GPU 设置。
+  The first uncached eligible hash triggers background bounded setup/calibration while CPU work
+  continues. Setup still costs time; short scans may not amortize it. Small-only/cached scans do not probe.
+  初始化期间只保留一个最大候选句柄，其余正常入队；EOF等待或异常展开会先等待后台初始化。
+  暂存一项元数据不预读内容，完成环的容量不变；不会迁移已运行的Hasher。
+  Retain only one largest candidate handle during startup; submit other work normally. EOF/unwinding
+  joins startup. This extra metadata slot does not prefetch bytes or enlarge the completion ring.
+- GPU 可用性与性能偏好是两件事。校准未胜出不删除可工作的 GPU，它仍可在 CPU 全忙时互助。
+  Availability differs from preference: a functioning GPU that loses calibration remains available
+  for CPU-saturation assistance.
+- “CPU 全忙”是锁内维护的 `cpu_active == N`，不是“CPU 队列非空”。任务领取、活动计数与唤醒
+  必须保持一致。GPU 不领取 `cpu_only` 或文件比较任务。
+  CPU saturation uses lock-protected active counts, not queue nonemptiness. Selection, counters, and
+  wakeups stay consistent. GPU never takes CPU-only hashes or file-comparison jobs.
+- 互助只在任务领取边界发生，不迁移进行中的哈希状态。队列与未收取结果仍保持有界背压
+  （backpressure）；独立 GPU 缓冲必须计入资源预算。
+  Assistance happens at job acquisition, never by migrating a live hasher. Queue/completion admission
+  remains bounded, and the additional GPU buffer belongs in resource budgets.
+- GPU空闲时为它预留一项优先任务；有多项积压时CPU可从队尾领取其余任务，不白等。
+  Reserve one preferred job for an idle GPU; CPUs may take excess backlog from the tail immediately.
 
-The hash hint is stealable, not device binding. The existing pinned submission contract remains for
-probe gates. All three queue classes share one admission bound; the completion ring additionally
-bounds running and uncollected results. A failed GPU lane becomes CPU in place and still drains work.
-The pure queue-selection policy is exhaustively tested for all 16 lane/queue-presence combinations,
-without requiring CUDA or timing-dependent profitability decisions.
+## 兼容与失败 / Compatibility and failure
 
-该策略不承诺每个大文件都走GPU，也不在任务开始后迁移Hasher。它避免小文件抢占合格
-哈希的队列优先级，但不能消除已经运行中的任务、冷IO和不等长尾部带来的偏差。
-It does not promise GPU execution for every large file or migrate a live hasher. Queue priority does
-not eliminate already-running work, cold I/O or unequal-length tails.
+`backend="cpu"` 不初始化 CUDA；显式 `backend="cuda"` 保留其原有选择、大小下界与完整 CPU
+重试语义。本次只改变自动模式的偏好与互助策略。
+Explicit CPU avoids CUDA setup; explicit CUDA retains its prior selection, floor, and complete CPU retry.
+Only automatic preference and assistance change here.
 
-## 配置 / Configuration
+`gpu_probe_bytes` 原配置键和字段继续接受，但退役为兼容输入；包括 `0`、默认 `4294967296`
+在内均不再控制自动 GPU 初始化。移除 4 GiB 门槛是用户要求的行为变更：不能因为尚未累计
+足够批次，就禁止 GPU 在 CPU 全忙时帮助合格任务。旧值不再代表摊销保证。
+The existing `gpu_probe_bytes` key/field remains accepted as a retired compatibility input. Neither
+zero nor the old 4-GiB default gates setup now. This deliberate change implements requested assistance
+without a batch-volume prerequisite; the old value no longer implies amortization protection.
 
-```toml
-backend = "auto"
-gpu_min_bytes = 16777216
-# 尚未处理批次的探测门槛，不是RAM分配量 / Pending logical bytes, not RAM allocation
-gpu_probe_bytes = 4294967296
-```
+CUDA 设置/计算不可用时走 CPU。哈希计算失败须从头完整 CPU 重试，不拼接不同后端的部分
+状态；GPU 服务失败后退休，由 CPU 排空余下队列。不得让失败的独立服务成为额外、未预算的
+CPU 工作线程。错误摘要不能被当作有效结果。
+Unavailable CUDA falls back to CPU. Failed hashing retries fully from the beginning, never by joining
+partial backend states. Failed GPU service retires and CPUs drain pending work; it must not become an
+extra unbudgeted CPU lane. Incorrect digests are never accepted as valid results.
 
-`gpu_probe_bytes=0` 仅绕过工作量门槛，不绕过性能与摊销检查；用于显式对照实验。
-4GiB是限制探索风险的默认值，不是经过证明的硬件性能交叉点。过小队列可令许多小批次
-始终走CPU，这保证有界资源，但可能放弃潜在GPU机会。
+## 验证范围 / Verification scope
 
-Zero disables only the work-volume gate, not profitability/amortization checks. The default is a
-risk-control policy, not a proven crossover. Small queue capacities may forgo GPU opportunities
-because bounded batches never reach the exploration volume.
+本次验收须覆盖：分类边界、两种形状分别胜/负、全部 CPU 活动时 GPU 互助、GPU 忙时 CPU
+互助、CPU 未满时保留 CPU 偏好、小文件与比较任务不进 GPU、预算降级、缓存跳过初始化、
+GPU 失败后完整重试及队列排空、显式模式与旧配置兼容。
+Acceptance covers class boundaries, independent shape outcomes, bidirectional assistance, CPU preference
+without saturation, CPU-only exclusions, budget fallback, cache-only laziness, full retry/draining,
+explicit modes, and old configuration acceptance.
 
-## 成本与资源 / Cost and resources
-
-输入通过 `cudaHostRegister` 一次注册既有工作缓冲区，无额外同大小staging分配；Compute/
-Hasher最后一个所有者同步后注销。调用方必须保证该缓冲区覆盖注册生命周期，Resources
-的字段析构顺序满足此约束。锁页内存是既有预算的一部分，但不可被操作系统换出。
-
-The stable worker input is registered once, not copied into a second staging allocation. Its lifetime
-must cover all sharing Compute/Hasher owners; Resources destroys compute before its input vectors.
-Registered pages belong to the existing buffer budget but become nonpageable.
-
-两秒软预算覆盖CUDA设置及后续探测，完整操作返回后检查；无法强行中断驱动或文件系统调用。
-计算错误选择CPU，错误摘要直接失败。首次探索本身仍可能不划算；不存在未知设备上的免费预知。
-收益估计采用等大小缩放，不能证明大小不均、冷IO、温度/功耗变化下的性能保证。
-
-The two-second soft budget stops subsequent work after complete operations; it cannot interrupt a
-driver. Compute failures select CPU, digest mismatches fail closed. Exploration itself can still cost
-more than it saves. Equal-shape scaling is not a guarantee for heterogeneous sizes, cold I/O or changing
-thermal/power conditions. No performance state is persisted across runs.
-
-## 统计 / Metrics
-
-`gpu_setup_ms` 是全部设置与探测时间，包含在Scan/Elapsed而非Initialize中。
-`calibration_ms` 是串行校准部分；`probe_mixed_cpu_ms`、`probe_mixed_gpu_ms` 是并发采样证据；
-`expected_gpu_saving_ms` 是模型估计而非实际节省。`cpu_hashes`/`gpu_hashes` 是后端尝试数，
-不含探测，CUDA后端仍可在CPU处理边界；不能据此推断每个字节都在GPU运算。
-自动模式尚未探测时 `auto_backend=cpu-unprobed` 且 `gpu_setup_ms=0`；
-显式CPU/CUDA模式显示 `explicit`。
-
-Setup is included in scan time; serial calibration and mixed samples are separate metrics.
-Expected savings are a model estimate. CPU/CUDA attempt counts exclude probing and are backend
-counts, not proof that every byte executed on a physical GPU.
-
-## 工具与证据 / Tools and evidence
-
-已探查 ncu2025.1.1、nsys2026.1.3、VTune2025.3、WPR10.0.26100、Python3.14、Lean4.33.1。
-实际使用ncu硬件计数器、Python基准及CUDA内存/竞争检查；nsys因内部NumTpcs异常未产生
-有效跟踪。WPR检查时无活动记录，没有改变驱动权限或系统跟踪。未声称使用未执行的工具。
-
-See [GPU profiling](gpu-profiling.md), [dispatch benchmarks](dispatch-benchmark.md),
-[file benchmark protocol](file-dispatch-benchmark.md), and [policy research](dispatch-policy-design.md).
-
-## 设计依据 / Design rationale
-
-- [NVIDIA CUDA Best Practices](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html)：
-  决策包含主机传输与同步，复用有界注册缓冲；不是单独比较kernel时间。
-  Include transfer/synchronization costs and reuse bounded registered buffers, not kernel-only timing.
-- [BLAKE3 1.8.2 C implementation](https://github.com/BLAKE3-team/BLAKE3/tree/1.8.2/c)：
-  CPU沿用上游运行时SIMD分派，不强制本机ISA、不重复实现摘要算法。
-  Retain upstream runtime SIMD dispatch rather than forcing a host-specific ISA or duplicating hashing.
-- [StarPU, CCPE 2011](https://doi.org/10.1002/cpe.1631) 与
-  [StarPU features](https://starpu.gitlabpages.inria.fr/features.html)：
-  异构任务调度同时考虑性能、数据位置与可用资源；这里只借鉴任务亲和性与动态领取，
-  不引入完整运行时或在线学习模型。后者需要真实任务成本观测与独立实验才能采用。
-  Borrow affinity and dynamic task acquisition, not an entire runtime or unvalidated online model.
-- [Gonthier et al., JPDC 2025](https://doi.org/10.1016/j.jpdc.2025.105170)：
-  数据局部性与内存受限调度是值得跟进的方向，但其线性代数任务具有复用结构，
-  不能直接外推到一次性流式文件哈希；本轮维持有界缓冲和简单资格队列。
-  Memory-constrained locality-aware scheduling is relevant future work, but reusable linear-algebra
-  task data differs from one-pass streaming hashes; retain bounded buffers and a simple hint queue.
+确定性 CPU 持续集成（continuous integration, CI）使用注入式假 CUDA 后端验证调度，不依赖
+本机有设备或偶然的计时胜出；实机正确性与端到端性能须另行记录。此节列出验收要求，
+不宣称任何尚未执行的测试通过，也不从历史微基准推导本实现的加速比例。
+Deterministic CPU CI uses an injected fake CUDA backend, not hardware presence or lucky timing wins.
+Real-device correctness and end-to-end performance require separate evidence. These are acceptance
+requirements, not claims of completed tests or speedups extrapolated from historical microbenchmarks.

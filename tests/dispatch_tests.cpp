@@ -13,6 +13,33 @@ void require(bool condition, const char* message) {
     if (!condition)
         throw std::runtime_error(message);
 }
+/// 按研究阈值验证独立短/长证据，避免单块落败否决整个 GPU。
+/// Research-band boundaries and independent short/long evidence, not one global GPU veto.
+void payload_bands() {
+    using namespace same::detail;
+    constexpr std::size_t mib = 1024 * 1024;
+    DispatchEvidence evidence;
+    evidence.calibration_complete = true;
+    evidence.stream_gpu_preferred = true;
+    const auto route = [&](std::uint64_t size) {
+        return classify_hash(size, 16 * mib, 16 * mib, evidence);
+    };
+    require(route(0) == HashRoute::cpu_only, "empty payload spilled");
+    require(route(16 * mib - 1) == HashRoute::cpu_only, "small floor violated");
+    require(route(16 * mib) == HashRoute::cpu_preferred, "unknown short advantage invented");
+    require(route(64 * mib - 1) == HashRoute::cpu_preferred, "long evidence leaked below band");
+    require(route(64 * mib) == HashRoute::gpu_preferred, "stream win vetoed by short loss");
+    require(route(std::numeric_limits<std::uint64_t>::max()) == HashRoute::gpu_preferred,
+            "large size overflow");
+    evidence.block_gpu_preferred = true;
+    evidence.stream_gpu_preferred = false;
+    require(route(16 * mib) == HashRoute::gpu_preferred, "short evidence discarded");
+    require(route(64 * mib) == HashRoute::cpu_preferred, "short win leaked into losing stream");
+    evidence.calibration_complete = false;
+    require(route(16 * mib) == HashRoute::cpu_preferred, "partial calibration preferred GPU");
+    require(classify_hash(0, 0, mib, evidence) == HashRoute::cpu_only,
+            "zero floor offloaded empty file");
+}
 /// 错误摘要不可通过校准后悄悄参与文件处理。 / Incorrect digests must never pass calibration.
 class WrongHasher final : public same::Hasher {
 public:
@@ -51,49 +78,19 @@ public:
 /// 验证决策边界与完整摘要检查。 / Verify decision boundaries and full digest checks.
 int main() {
     try {
-        using same::detail::WorkQueue;
-        // 穷尽队列快照，包括关闭排空时仅剩固定任务的 CPU 空闲情形。
-        // Exhaust every snapshot, including CPU idleness with only pinned work during draining.
-        const std::array<WorkQueue, 16> expected{
-            WorkQueue::none,   WorkQueue::normal, WorkQueue::eligible, WorkQueue::normal,
-            WorkQueue::none,   WorkQueue::normal, WorkQueue::eligible, WorkQueue::normal,
-            WorkQueue::none,   WorkQueue::normal, WorkQueue::eligible, WorkQueue::eligible,
-            WorkQueue::pinned, WorkQueue::pinned, WorkQueue::pinned,   WorkQueue::pinned};
-        for (unsigned mask = 0; mask < expected.size(); ++mask)
-            require(same::detail::select_work_queue(mask & 8, mask & 4, mask & 2, mask & 1) ==
-                        expected[mask],
-                    "incorrect queue priority or stealing decision");
+        payload_bands();
         using same::detail::stable_gpu_win;
         require(stable_gpu_win({10, 10, 10}, {7, 8, 6}), "stable margin rejected");
         require(!stable_gpu_win({10, 10, 10}, {7, 8.01, 6}), "unstable margin accepted");
         require(!stable_gpu_win({10, 10, 10}, {1, 1, 11}), "one slow trial hidden by median");
+        require(!stable_gpu_win({10, 100, 100}, {7, 70, 70}),
+                "paired drift masked unstable preference");
         require(!stable_gpu_win({0, 10, 10}, {0, 1, 1}), "zero timings accepted");
         require(!stable_gpu_win({10, 10, 10}, {-1, 1, 1}), "negative timings accepted");
         require(!stable_gpu_win({std::numeric_limits<double>::infinity(), 10, 10}, {1, 1, 1}),
                 "infinite timing accepted");
         require(!stable_gpu_win({10, 10, 10}, {std::numeric_limits<double>::quiet_NaN(), 1, 1}),
                 "NaN timing accepted");
-        using same::detail::conservative_gpu_saving;
-        using same::detail::gpu_setup_amortized;
-        require(conservative_gpu_saving(10, 8, 1024, 4096) == 8, "wrong batch normalization");
-        require(conservative_gpu_saving(10, 8.01, 1024, 4096) == 0, "weak mixed win accepted");
-        require(conservative_gpu_saving(10, -1, 1024, 4096) == 0, "negative GPU accepted");
-        require(conservative_gpu_saving(10, 8, 0, 4096) == 0, "zero sample accepted");
-        require(conservative_gpu_saving(10, 8, 1024, 0) == 0, "empty pending accepted");
-        require(conservative_gpu_saving(10, 8, std::numeric_limits<double>::infinity(), 4096) == 0,
-                "infinite sample accepted");
-        require(conservative_gpu_saving(std::numeric_limits<double>::quiet_NaN(), 8, 1024, 4096) ==
-                    0,
-                "NaN CPU accepted");
-        require(conservative_gpu_saving(1e308, 1, 1, 4096) == 0, "overflow saving accepted");
-        require(gpu_setup_amortized(8, 4), "amortization boundary rejected");
-        require(!gpu_setup_amortized(7.99, 4), "unamortized setup accepted");
-        require(!gpu_setup_amortized(0, 0), "zero saving accepted");
-        require(!gpu_setup_amortized(8, -1), "negative setup accepted");
-        require(!gpu_setup_amortized(std::numeric_limits<double>::infinity(), 4),
-                "infinite savings accepted");
-        require(!gpu_setup_amortized(8, std::numeric_limits<double>::quiet_NaN()),
-                "NaN setup accepted");
         auto cpu = same::make_cpu_compute();
         WrongCompute wrong;
         WrongCompute failing(true);
@@ -128,6 +125,14 @@ int main() {
                     report.gpu_stream_slowest_ms >= report.gpu_stream_ms,
                 "missing conservative serial extremes");
         require(report.elapsed_ms > 0, "missing calibration cost");
+        require(report.calibration_complete && !expired.calibration_complete &&
+                    !failed.calibration_complete,
+                "availability confused with partial calibration");
+        // 同一字节流按不同CPU/GPU更新粒度仍必须完整校验成功。
+        // Different actual CPU/GPU update sizes must validate the same complete byte stream.
+        const auto segmented = same::detail::calibrate_dispatch(
+            *cpu, *cpu, bytes, std::chrono::milliseconds(2000), 257);
+        require(segmented.calibration_complete, "different backend segment sizes changed digest");
         std::cout << "dispatch margin, samples and digest validation passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

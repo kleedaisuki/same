@@ -5,62 +5,62 @@
 #include <span>
 
 namespace same::detail {
-/// 排队类别而非计算后端；none 表示当前工作线程无可领取任务。
-/// Queue class, not compute backend; none means no work available to this worker.
-enum class WorkQueue { none, normal, pinned, eligible };
-/** 纯调度策略：固定任务仅首通道；首通道优先有资格哈希，其他线程优先普通工作后窃取。
- * Pure policy: pinned work belongs to lane zero; it prefers eligible hashes, while other lanes
- * prefer ordinary work and then steal hashes. Empty eligible work never blocks ordinary progress.
- * 空队列不阻止其他可处理工作。此函数不读取共享状态；调用方在队列锁下提供快照。
- * No shared state is read here; the caller supplies its snapshot under the queue mutex.
- */
-WorkQueue select_work_queue(bool first, bool pinned, bool eligible, bool normal);
+/// 载荷约束与偏好分离；CPU-only 不得因 CPU 忙而卸载。
+/// Separate payload eligibility from preference; CPU-only never spills to a busy CPU's GPU.
+enum class HashRoute { cpu_only, cpu_preferred, gpu_preferred };
 
 /// 自动选择的保守证据，不是所有文件大小/并发度的性能保证。
 /// Conservative auto-dispatch evidence, not a guarantee for every size or concurrency.
 struct DispatchEvidence {
-    /// 显式、延迟探测、CPU、GPU、失败五种互斥状态。
-    /// Mutually exclusive explicit, deferred, CPU, GPU, and failed-probe decisions.
-    enum class Decision { untested, deferred, cpu, gpu, failed } decision{Decision::untested};
-    /// 实际块和八块流的 CPU/GPU 中位毫秒，包含摘要创建、传输及完成。
-    /// Median CPU/GPU milliseconds for one block and eight blocks, including
+    /// 校准结论与服务状态；adaptive 表示按载荷和忙闲分流。
+    /// Calibration/service state; adaptive routes by payload and live occupancy.
+    enum class Decision {
+        untested,
+        deferred,
+        cpu,
+        gpu,
+        failed,
+        adaptive
+    } decision{Decision::untested};
+    /// 两类摘要均完整验证并计时；设备可用性不等同于任何一类性能胜出。
+    /// Both shapes were fully validated/timed; availability is distinct from winning either shape.
+    bool calibration_complete{};
+    /// 独立的短块/长流偏好，单块不胜不得否决长流胜出。
+    /// Independent block/stream preferences; losing one block must not veto a winning stream.
+    bool block_gpu_preferred{}, stream_gpu_preferred{};
+    /// 实际块和四块流的 CPU/GPU 中位毫秒，包含摘要创建、传输及完成。
+    /// Median CPU/GPU milliseconds for one block and four blocks, including
     /// creation/transfers/finish.
     double cpu_block_ms{}, gpu_block_ms{}, cpu_stream_ms{}, gpu_stream_ms{};
-    /// 单通道摊销使用极值，不能用中位数掩盖抖动。 / Single-lane amortization uses extremes,
-    /// preventing medians from hiding jitter.
+    /// 保留样本极值用于检查抖动。 / Retain timing extremes for jitter inspection.
     double cpu_stream_fastest_ms{}, gpu_stream_slowest_ms{};
     /// 串行校准时间（含预热），属于 scan 中的 setup_ms，不是额外可相加阶段。
     /// Serial calibration including warmup; part of scan setup_ms, not an additional phase.
     double elapsed_ms{};
-    /// 实际混合池样本、预测待处理批次节省及全部设置费用。
-    /// Actual mixed-pool samples, predicted pending-batch savings and total setup cost.
+    /// 旧混合/摊销字段保持零以兼容统计；setup_ms 仍记录全部设置成本。
+    /// Retired mixed/amortization fields stay zero for metric compatibility; setup_ms remains real.
     double mixed_cpu_ms{}, mixed_gpu_ms{}, expected_saving_ms{}, setup_ms{};
 };
 
-/// 每一对样本都须至少快 20%，拒绝零、负值及非有限测量。
-/// Every sample pair must win by at least 20%; reject zero, negative or nonfinite timings.
+/// 默认下界16MiB；长类为64MiB或四个GPU块的较大值。
+/// Default floor is 16MiB; long class starts at max(64MiB, four GPU blocks).
+/// 未知形状保持CPU偏好；饱和溢出仍可用，下界不得绕过。
+/// Unknown shapes prefer CPU but permit saturation spill; the floor is never bypassed.
+HashRoute classify_hash(std::uint64_t bytes, std::size_t floor, std::size_t gpu_block,
+                        const DispatchEvidence& evidence);
+
+/// 最慢GPU样本仍须比最快CPU快20%；拒绝零、负值及非有限测量。
+/// Slowest GPU must beat fastest CPU by 20%; reject invalid or nonfinite timings.
 bool stable_gpu_win(const std::array<double, 3>& cpu, const std::array<double, 3>& gpu);
 
-/** 保守批次收益；最快 CPU 与最慢 GPU 仍须有 20% 余量。
- * Conservative batch savings: fastest CPU versus slowest GPU must retain a 20% margin.
- * 非法、非有限或溢出输入返回零；这是同形状线性估计，不是实际节省保证。
- * Invalid/nonfinite/overflowing inputs return zero; same-shape linear estimate, not a guarantee.
- */
-double conservative_gpu_saving(double cpu_ms, double gpu_ms, double sampled_bytes,
-                               std::uint64_t pending_bytes);
-/// 收益至少覆盖两倍非负设置成本；无效值拒绝。 / Require positive savings covering twice
-/// nonnegative setup cost; reject invalid values.
-bool gpu_setup_amortized(double saving_ms, double setup_ms);
-
-/** 使用实际工作缓冲区与后端校准，复用输入八次而不分配八倍内存。
- * Calibrate real worker buffers/backends; repeat input eight times without allocating eight
- * buffers. 调用方独占后端和缓冲区；修改输入，不读取用户文件。摘要不一致属于错误，不隐藏。 Call
- * in an exclusive idle phase; mutates scratch, never reads user files. Digest mismatch is an error.
- * 软预算在完整操作后检查，超时选 CPU；无法中断阻塞的驱动调用。
- * Check the soft budget after complete operations and choose CPU on expiry; driver calls cannot be
- * interrupted.
- */
+/// 用独立GPU缓冲校准一块和四块输入，CPU按cpu_block_bytes实际切分。
+/// Probe one/four GPU blocks; CPU uses its actual update size, zero means the whole input.
+/// 调用方独占这两个后端及缓冲；完整摘要不一致直接抛错。
+/// Exclusively own these backends/buffer; full digest mismatches throw.
+/// 两秒软期限不能中断驱动；超时结果不标记calibration_complete。
+/// The soft deadline cannot interrupt a driver; expiry leaves calibration incomplete.
 DispatchEvidence
 calibrate_dispatch(Compute& cpu, Compute& gpu, std::span<std::byte> scratch,
-                   std::chrono::milliseconds budget = std::chrono::milliseconds(2000));
+                   std::chrono::milliseconds budget = std::chrono::milliseconds(2000),
+                   std::size_t cpu_block_bytes = 0);
 } // namespace same::detail
