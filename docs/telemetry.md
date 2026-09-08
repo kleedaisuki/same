@@ -149,3 +149,8 @@ Retention always keeps the current run and the newest remaining runs by UTC star
 库仅写本地，不上传数据，不记录文件内容；根路径、采样相对路径、配置和错误仍可能敏感。事件文本有界截断并标记 `truncated`，不能当作完整路径索引。共享日志前检查/脱敏整库；同目录访问权限与本地备份策略由用户管理。
 
 Storage is local without uploads or file contents. Roots, sampled relative paths, configuration and errors can still be sensitive. Bounded event text may be truncated and is not a complete path index. Review/redact before sharing; directory permissions and backup policy remain user-managed.
+
+## 验证 / Validation
+
+功能回归、实测开销、原始配对指标与局限见 [遥测验证记录](telemetry-validation.md)。
+See [telemetry validation](telemetry-validation.md) for regressions, measured overhead, paired metrics and limitations.
