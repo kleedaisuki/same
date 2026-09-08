@@ -123,7 +123,7 @@ def run(a, root, oracle, arm, trial, phase, reference, configuration):
     (a.output / f'{name}.stdout').write_bytes(result.stdout)
     (a.output / f'{name}.stderr').write_bytes(result.stderr)
     raw = result.stderr.decode('utf-8', errors='replace')
-    metrics = {k: float(v) if '.' in v else int(v) for k, v in re.findall(r'(\w+)=([0-9]+(?:\.[0-9]+)?)', raw)}
+    metrics = {k: float(v) if '.' in v else int(v) for k, v in re.findall(r'(?<!\S)([\w.]+)=([0-9]+(?:\.[0-9]+)?)(?=\s|$)', raw)}
     actual = digests(root / '.same', oracle) if result.returncode == 0 else {}
     fresh = phase == 'fresh'
     valid = (result.returncode == 0 and not result.stdout.strip() and actual == reference

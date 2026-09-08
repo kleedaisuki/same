@@ -115,7 +115,7 @@ def run(args, root, expected, trial, arm, phase, config, reference):
     (args.output / f'{name}.stdout').write_bytes(result.stdout)
     (args.output / f'{name}.stderr').write_bytes(result.stderr)
     raw = result.stderr.decode('utf-8', errors='replace')
-    metrics = {k: float(v) if '.' in v else int(v) for k, v in re.findall(r'(?<!\S)(\w+)=([0-9]+(?:\.[0-9]+)?)(?=\s|$)', raw)}
+    metrics = {k: float(v) if '.' in v else int(v) for k, v in re.findall(r'(?<!\S)([\w.]+)=([0-9]+(?:\.[0-9]+)?)(?=\s|$)', raw)}
     actual = digests(root / '.same', expected) if result.returncode == 0 else {}
     fresh = phase in ('fresh', 'rehash')
     verified = (result.returncode == 0 and not result.stdout.strip()
@@ -143,8 +143,11 @@ def run(args, root, expected, trial, arm, phase, config, reference):
                            and bool(json.loads(row['config_json'])) for row in snapshot.get('runs', [])))
         for run_id in run_ids:
             bands = [p for p in parameters if p['run_id'] == run_id
-                     and re.fullmatch(r'model\.(cpu|gpu)\.[0-9]+', p['category'])]
-            healthy = healthy and len(bands) >= 256 and len({p['category'] for p in bands}) == 64
+                     and re.fullmatch(r'worker\.[0-9]+\.model\.(cpu|gpu)\.[0-9]+', p['category'])]
+            healthy = healthy and len(bands) >= 256 * args.workers
+            for worker in range(args.workers):
+                local = [p for p in bands if p['category'].startswith(f'worker.{worker}.model.')]
+                healthy = healthy and len(local) >= 256 and len({p['category'] for p in local}) == 64
         verified = verified and healthy
     return dict(telemetry_database=snapshot, trial=trial, warmup=trial < 0, arm=arm, phase=phase, command=command,
                 config=config, process_ms=process_ms, pipeline_ms=pipeline_ms,
