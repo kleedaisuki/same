@@ -50,8 +50,6 @@ Result run(std::size_t workers, bool pgo, bool eligible, std::uint64_t batch_job
     same::Resources resources(config);
     std::array<std::future<TaskResult>, 64> ring;
     const auto bytes = eligible ? 64ULL * 1024 * 1024 : 4096ULL;
-    const auto route =
-        eligible ? same::detail::HashRoute::cpu_preferred : same::detail::HashRoute::cpu_only;
     std::uint64_t jobs = 0, checksum = 0, expected = 0;
     const auto begin = std::chrono::steady_clock::now();
     auto end = begin;
@@ -75,7 +73,7 @@ Result run(std::size_t workers, bool pgo, bool eligible, std::uint64_t batch_job
                         worker.sample = {bytes, 1.0, false, true};
                     return TaskResult{value, sampled};
                 },
-                route, bytes);
+                bytes);
         }
         for (auto& future : ring) {
             if (future.valid()) {

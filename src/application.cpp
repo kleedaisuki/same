@@ -74,8 +74,11 @@ FileRecord hash_file(const fs::path& root, FileRecord record, Worker& worker,
     const bool small = record.stamp.size < std::max(gpu_min_bytes, worker.gpu_floor);
     if (small)
         ++worker.cpu_routed_hashes;
-    auto& selected = small ? worker.cpu_compute : worker.compute;
-    if (selected->name() == "cuda")
+    // 资源工作线程已选择独有后端及匹配缓冲，应用层不二次路由。
+    // The worker has selected its private backend and matching buffer; do not reroute here.
+    auto& selected = worker.compute;
+    const bool gpu = selected->name() == "cuda";
+    if (gpu)
         ++worker.gpu_hashes;
     else
         ++worker.cpu_hashes;
@@ -84,6 +87,10 @@ FileRecord hash_file(const fs::path& root, FileRecord record, Worker& worker,
     for (;;) {
         const auto count = reader.read(worker.first);
         worker.hash_bytes += count;
+        if (gpu)
+            worker.gpu_hash_bytes += count;
+        else
+            worker.cpu_hash_bytes += count;
         if (!count)
             break;
         if (count > record.stamp.size - total)
@@ -206,87 +213,6 @@ struct HashInput {
     /// 从元数据阶段移交的未读取句柄。 / Unread handle from metadata work.
     std::unique_ptr<FileReader> reader;
 };
-/// 后台初始化与 CPU 流水线重叠，只保留一个最大的候选句柄。
-/// Overlap background initialization with CPU work, retaining only the largest candidate.
-class AutoHashStartup {
-public:
-    /// 借用扫描作用域外的服务；future 析构在服务销毁前等待初始化。
-    /// Borrow scan-external services; future destruction joins before those services die.
-    AutoHashStartup(const Config& config, Resources& resources)
-        : config_(config), resources_(resources),
-          floor_(std::max<std::size_t>(1, config.gpu_min_bytes)), ready_(config.backend != "auto") {
-    }
-
-    /// 不迁移已排队任务；初始化期间以更大候选替换唯一保留项。
-    /// Never migrate queued work; replace the sole retained candidate with larger input.
-    template <class Submit> void accept(HashInput input, Submit& submit) {
-        if (startup_.valid() &&
-            startup_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
-            finish(submit);
-        if (ready_ || input.record.stamp.size < floor_) {
-            send(std::move(input), submit);
-            return;
-        }
-        if (!startup_.valid()) {
-            const auto bytes = input.record.stamp.size;
-            startup_ = std::async(std::launch::async,
-                                  [this, bytes] { resources_.prepare_auto(config_, bytes, 1); });
-            held_ = std::move(input);
-            return;
-        }
-        if (input.record.stamp.size > held_->record.stamp.size)
-            std::swap(input, *held_);
-        send(std::move(input), submit);
-    }
-
-    /// EOF 等待时已提交的 CPU 任务继续运行；get 发布探测证据后再读取。
-    /// At EOF submitted CPU work keeps running; get publishes evidence before any read.
-    template <class Submit> void finish(Submit& submit) {
-        if (!startup_.valid())
-            return;
-        startup_.get();
-        ready_ = true;
-        auto input = std::move(*held_);
-        held_.reset();
-        send(std::move(input), submit);
-    }
-
-private:
-    /// 未发布证据时只按载荷底线分类，避免与后台初始化的数据竞争。
-    /// Before evidence publication classify by the size floor only, avoiding startup races.
-    template <class Submit> void send(HashInput input, Submit& submit) {
-        auto route = input.record.stamp.size < floor_ ? detail::HashRoute::cpu_only
-                                                      : detail::HashRoute::cpu_preferred;
-        if (ready_)
-            route =
-                detail::classify_hash(input.record.stamp.size, floor_, resources_.gpu_block_bytes(),
-                                      resources_.dispatch_evidence());
-        // 没有合成校准时以研究阈值冷启动，真实任务模型在出队时修正偏好。
-        // Without synthetic calibration start from the research threshold; real-task models
-        // refine the preference at dequeue. Explicit backends and the eligibility floor remain.
-        if (ready_ && config_.backend == "auto") {
-            const auto& evidence = resources_.dispatch_evidence();
-            const bool initial =
-                !config_.pgo || (!evidence.block_complete && !evidence.stream_complete);
-            if (initial && input.record.stamp.size >= floor_ &&
-                input.record.stamp.size >= detail::RoutingParameters::static_gpu_floor_bytes)
-                route = detail::HashRoute::gpu_preferred;
-        }
-        submit(std::move(input), route);
-    }
-    /// 配置及资源由 run 持有，覆盖后台任务。 / Run owns services beyond background work.
-    const Config& config_;
-    Resources& resources_;
-    /// 不卸载的小载荷上界。 / Floor below which payloads are never offloaded.
-    std::size_t floor_;
-    /// 仅协调线程访问；为真意味着初始化证据可读。 / Coordinator-only publication state.
-    bool ready_;
-    /// 初始化期间至多一个尚未提交的句柄。 / At most one unsubmitted startup handle.
-    std::optional<HashInput> held_;
-    /// 最后声明以便异常展开时首先 join，保护捕获的 this 及借用服务。
-    /// Declared last to join first on unwinding, protecting captured this and borrowed services.
-    std::future<void> startup_;
-};
 /// Stream the tree into bounded worker jobs; keep every SQLite mutation on this thread.
 /// 流式遍历目录并提交有界任务；所有 SQLite 修改留在当前线程。
 void scan(const fs::path& root, const Config& config, Store& store, Resources& resources,
@@ -305,10 +231,10 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
         counters.hash_work_ms += result.work_ms;
         save(result.record);
     };
-    // 提交顺序独立于发现计数，延迟启动也不会复用跨度 ID。 / Submission order remains unique
-    // even when startup releases multiple deferred files.
+    // 单调提交编号保证所有工作线程的跨度 ID 唯一。
+    // Monotonic submission IDs keep trace spans unique across every worker.
     std::uint64_t next_hash_span = 16;
-    auto submit = [&](HashInput input, detail::HashRoute route) {
+    auto submit = [&](HashInput input) {
         const auto submitted = Clock::now();
         const auto bytes = input.record.stamp.size;
         const auto span_id = next_hash_span++;
@@ -377,14 +303,13 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
                 worker.sample = {hashed.stamp.size, elapsed, worker.gpu_hashes != gpu_before, true};
             return HashResult{std::move(hashed), elapsed};
         };
-        // 只提交偏好；领取时在同一锁下决定真实设备忙闲，不固定首个大文件。
-        // Submit a preference; resolve live device occupancy under the queue lock at dequeue.
-        pending.submit_hash(std::move(operation), route, bytes);
+        // 统一队列只携带载荷；工作线程在锁外选择并学习自己的后端。
+        // The common queue carries bytes only; each worker selects and learns outside its lock.
+        pending.submit_hash(std::move(operation), bytes);
         counters.hash_wait_ms += milliseconds(submitted, Clock::now());
         if (pending.pending() >= config.queue_capacity)
             drain();
     };
-    AutoHashStartup startup(config, resources);
     store.begin_scan();
     ParallelWalk walk(root, config.metadata_workers, config.queue_capacity, recursive);
     for (;;) {
@@ -405,9 +330,8 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
             continue;
         }
         ++counters.hashed;
-        startup.accept({std::move(record), std::move(entry->reader)}, submit);
+        submit({std::move(record), std::move(entry->reader)});
     }
-    startup.finish(submit);
     while (pending.pending())
         drain();
     resources.wait_idle();
@@ -567,36 +491,6 @@ void render_results(Store& store, Counters& counters, std::ostream& output, Outp
     if (!output)
         throw std::runtime_error("cannot write results");
 }
-/// 稳定的自动分派诊断名称。 / Stable automatic-dispatch diagnostic names.
-std::string_view dispatch_name(detail::DispatchEvidence::Decision decision) {
-    using Decision = detail::DispatchEvidence::Decision;
-    switch (decision) {
-    case Decision::untested:
-        return "explicit";
-    case Decision::deferred:
-        return "cpu-unprobed";
-    case Decision::cpu:
-        return "cpu";
-    case Decision::gpu:
-        return "cuda";
-    case Decision::failed:
-        return "cpu-probe-failed";
-    case Decision::adaptive:
-        return "adaptive";
-    }
-    return "invalid";
-}
-/// 校准终止原因独立于设备与性能偏好。 / Calibration stop is independent of device/preference.
-std::string_view calibration_stop(const detail::DispatchEvidence& evidence) {
-    using Stop = detail::DispatchEvidence::StopReason;
-    if (evidence.stop_reason == Stop::deadline)
-        return "deadline";
-    if (evidence.stop_reason == Stop::device_error)
-        return "device-error";
-    if (evidence.calibration_complete)
-        return "complete";
-    return evidence.device_validated ? "not-run-device-checked" : "not-completed";
-}
 /// 返回微秒直方图的分位桶范围，不伪装成精确延迟；空分布为未知。
 /// Report a quantile bucket's microsecond range, not exact latency; empty means unknown.
 std::string histogram_quantile(const std::array<std::uint64_t, 32>& histogram, unsigned percent) {
@@ -623,18 +517,15 @@ void render_online_profile(const Resources& resources, std::ostream& out, bool p
     const auto p50 = histogram_quantile(profile.latency_histogram, 50);
     const auto p95 = histogram_quantile(profile.latency_histogram, 95);
     const auto residual95 = histogram_quantile(profile.residual_histogram, 95);
-    const auto error =
-        profile.predicted_samples ? std::to_string(profile.mean_absolute_error_ms) : "unknown";
     if (pretty) {
         out << "  Online PGO      " << (enabled ? "enabled" : "disabled") << " | "
             << profile.samples << " samples (" << profile.cpu_samples << " CPU | "
             << profile.gpu_samples << " GPU) | " << resources.exploration_jobs()
             << " exploration jobs\n"
             << "  Model coverage  " << profile.cpu_known_bands << " CPU | "
-            << profile.gpu_known_bands << " GPU observed size bands\n"
-            << "  Model error     " << error << " ms absolute-error EWMA | "
-            << profile.predicted_samples << " predictions checked | p95 residual " << residual95
-            << " us\n"
+            << profile.gpu_known_bands << " GPU observed worker-band pairs\n"
+            << "  Model residual  " << profile.predicted_samples
+            << " predictions checked | p95 residual " << residual95 << " us\n"
             << "  Sample latency  p50 " << p50 << " us | p95 " << p95
             << " us (bucket ranges; service incl. I/O)\n";
         return;
@@ -645,9 +536,84 @@ void render_online_profile(const Resources& resources, std::ostream& out, bool p
         << " pgo_cpu_known_bands=" << profile.cpu_known_bands
         << " pgo_gpu_known_bands=" << profile.gpu_known_bands
         << " pgo_rejected_samples=" << profile.rejected_samples
-        << " pgo_predicted_samples=" << profile.predicted_samples << " pgo_mae_ms=" << error
+        << " pgo_predicted_samples=" << profile.predicted_samples
         << " pgo_residual_p95_bucket_us=" << residual95 << " pgo_latency_p50_bucket_us=" << p50
         << " pgo_latency_p95_bucket_us=" << p95 << '\n';
+}
+/// 空闲后展示每工作线程的真实贡献；模型误差不跨线程合并。
+/// Show worker contributions after idle; never merge independent model error EWMAs.
+void render_worker_profiles(const Resources& resources, std::ostream& out, bool pretty) {
+    const auto workers = resources.worker_profiles();
+    out << (pretty ? "  Worker count    " : "worker_count=") << workers.size() << '\n';
+    std::uint64_t cpu_bytes = 0, gpu_bytes = 0;
+    std::size_t gpu_peak = 0, gpu_available = 0;
+    for (const auto& worker : workers) {
+        cpu_bytes += worker.cpu_hash_bytes;
+        gpu_bytes += worker.gpu_hash_bytes;
+        gpu_peak = std::max(gpu_peak, worker.gpu_peak_concurrency);
+        gpu_available += worker.gpu_enabled ? 1 : 0;
+    }
+    if (pretty)
+        out << "  Backend reads   " << human_bytes(static_cast<double>(cpu_bytes)) << " CPU | "
+            << human_bytes(static_cast<double>(gpu_bytes)) << " GPU | peak " << gpu_peak
+            << " concurrent GPU tasks\n";
+    else
+        out << "cpu_hash_read_bytes=" << cpu_bytes << " gpu_hash_read_bytes=" << gpu_bytes
+            << " gpu_peak_concurrency=" << gpu_peak << " gpu_available_workers=" << gpu_available
+            << '\n';
+    for (const auto& worker : workers) {
+        const auto& profile = worker.snapshot;
+        const auto error =
+            profile.predicted_samples ? std::to_string(profile.mean_absolute_error_ms) : "unknown";
+        if (pretty) {
+            out << "  Worker " << worker.index << "        " << worker.cpu_hashes << " CPU | "
+                << worker.gpu_hashes << " GPU attempts | " << worker.cpu_hash_bytes << " CPU B | "
+                << worker.gpu_hash_bytes << " GPU B\n"
+                << "                  " << profile.samples << " samples | local error EWMA "
+                << error << " ms | GPU setup " << human_duration(worker.setup_ms) << " | init "
+                << (worker.gpu_attempted ? "attempted" : "not-needed") << " | GPU "
+                << (worker.gpu_enabled ? "available" : "unavailable") << " | "
+                << worker.gpu_init_failures << " init failures | " << worker.fallbacks
+                << " retries | " << worker.cold_start_cpu << " cold-start CPU bypasses\n";
+            continue;
+        }
+        const auto prefix = "worker." + std::to_string(worker.index) + ".";
+#define WORKER_VALUE(field) out << prefix << #field << '=' << worker.field << ' '
+        WORKER_VALUE(cpu_hashes);
+        WORKER_VALUE(gpu_hashes);
+        WORKER_VALUE(cpu_hash_bytes);
+        WORKER_VALUE(gpu_hash_bytes);
+        WORKER_VALUE(hash_bytes);
+        WORKER_VALUE(compare_bytes);
+        WORKER_VALUE(cpu_routed_hashes);
+        WORKER_VALUE(setup_ms);
+        WORKER_VALUE(gpu_attempted);
+        WORKER_VALUE(gpu_enabled);
+        WORKER_VALUE(gpu_init_failures);
+        WORKER_VALUE(fallbacks);
+        WORKER_VALUE(exploration_jobs);
+        WORKER_VALUE(model_cpu);
+        WORKER_VALUE(model_gpu);
+        WORKER_VALUE(static_cpu);
+        WORKER_VALUE(static_gpu);
+        WORKER_VALUE(size_cpu);
+        WORKER_VALUE(unavailable_cpu);
+        WORKER_VALUE(cold_start_cpu);
+        WORKER_VALUE(gpu_inflight_at_selection);
+        WORKER_VALUE(gpu_peak_concurrency);
+        WORKER_VALUE(contended_samples);
+        WORKER_VALUE(cpu_block_bytes);
+        WORKER_VALUE(gpu_block_bytes);
+        WORKER_VALUE(device_budget_bytes);
+#undef WORKER_VALUE
+        out << prefix << "samples=" << profile.samples << ' ' << prefix
+            << "cpu_samples=" << profile.cpu_samples << ' ' << prefix
+            << "gpu_samples=" << profile.gpu_samples << ' ' << prefix
+            << "predicted_samples=" << profile.predicted_samples << ' ' << prefix
+            << "cpu_known_bands=" << profile.cpu_known_bands << ' ' << prefix
+            << "gpu_known_bands=" << profile.gpu_known_bands << ' ' << prefix
+            << "local_error_ewma_ms=" << error << '\n';
+    }
 }
 /// Human-facing profile; machine metrics use a separate unchanged renderer.
 /// 面向人的统计展示；机器统计使用独立且保持不变的渲染器。
@@ -701,35 +667,17 @@ void render_pretty_profile(const Counters& counters, const Resources& resources,
                                         (elapsed / 1000)
                                   : 0;
     row("Read rate", human_bytes(rate) + "/s");
-    row("Backend", std::to_string(resources.gpu_workers()) + " GPU workers | " +
+    row("Backend", std::to_string(resources.gpu_workers()) + " workers initialized CUDA | " +
                        std::to_string(resources.fallbacks()) + " CPU fallbacks");
     row("CPU size route",
         std::to_string(resources.cpu_routed_hashes()) + " hash attempts (policy, not failure)");
-    const auto& dispatch = resources.dispatch_evidence();
     const auto [cpu_attempts, gpu_attempts] = resources.hash_attempts();
     row("Hash backends",
         std::to_string(cpu_attempts) + " CPU | " + std::to_string(gpu_attempts) + " GPU attempts");
-    const auto [overflow, spill] = resources.route_counts();
-    row("Busy routing",
-        std::to_string(overflow) + " GPU overflow | " + std::to_string(spill) + " CPU spill jobs");
+    row("Scheduling", "one queue | worker-local CPU/GPU selection and models");
     row("GPU input", human_bytes(static_cast<double>(resources.gpu_block_bytes())));
-    row("Auto dispatch", std::string(dispatch_name(dispatch.decision)) + " | " +
-                             human_duration(dispatch.setup_ms) + " setup (included in scan)");
-    row("Calibration", std::string(calibration_stop(dispatch)) + " | device " +
-                           (dispatch.device_validated ? "validated" : "not-validated") +
-                           " | auto service " +
-                           (resources.gpu_service_enabled() ? "active" : "inactive"));
-    if (dispatch.elapsed_ms > 0) {
-        row("Probe block", dispatch.block_complete
-                               ? human_duration(dispatch.cpu_block_ms) + " CPU | " +
-                                     human_duration(dispatch.gpu_block_ms) + " GPU"
-                               : "unknown (incomplete)");
-        row("Probe stream", dispatch.stream_complete
-                                ? human_duration(dispatch.cpu_stream_ms) + " CPU | " +
-                                      human_duration(dispatch.gpu_stream_ms) + " GPU"
-                                : "unknown (incomplete)");
-    }
     render_online_profile(resources, out, true);
+    render_worker_profiles(resources, out, true);
 }
 /// Print phase wall times and successful read bytes, not CPU time or physical I/O.
 /// 输出各阶段墙钟耗时及成功读取字节，不代表 CPU 时间或物理 I/O。
@@ -778,30 +726,12 @@ void render_profile(const Counters& counters, const Resources& resources,
             << " walk_task_peak=" << counters.walk_task_peak
             << " walk_result_peak=" << counters.walk_result_peak << '\n';
     profile << "cpu_routed_hashes=" << resources.cpu_routed_hashes() << '\n';
-    const auto& dispatch = resources.dispatch_evidence();
     const auto [cpu_attempts, gpu_attempts] = resources.hash_attempts();
-    const auto [overflow, spill] = resources.route_counts();
     profile << "cpu_hashes=" << cpu_attempts << " gpu_hashes=" << gpu_attempts
-            << " gpu_overflow_jobs=" << overflow << " cpu_spill_jobs=" << spill
             << " gpu_block_bytes=" << resources.gpu_block_bytes()
-            << " gpu_block_preferred=" << dispatch.block_gpu_preferred
-            << " gpu_stream_preferred=" << dispatch.stream_gpu_preferred
-            << " auto_backend=" << dispatch_name(dispatch.decision)
-            << " gpu_setup_ms=" << dispatch.setup_ms
-            << " probe_mixed_cpu_ms=" << dispatch.mixed_cpu_ms
-            << " probe_mixed_gpu_ms=" << dispatch.mixed_gpu_ms
-            << " expected_gpu_saving_ms=" << dispatch.expected_saving_ms
-            << " calibration_ms=" << dispatch.elapsed_ms
-            << " probe_cpu_block_ms=" << dispatch.cpu_block_ms
-            << " probe_gpu_block_ms=" << dispatch.gpu_block_ms
-            << " probe_cpu_stream_ms=" << dispatch.cpu_stream_ms
-            << " probe_gpu_stream_ms=" << dispatch.gpu_stream_ms << '\n';
-    profile << "calibration_stop=" << calibration_stop(dispatch)
-            << " probe_block_complete=" << dispatch.block_complete
-            << " probe_stream_complete=" << dispatch.stream_complete
-            << " gpu_device_validated=" << dispatch.device_validated
-            << " gpu_service_enabled=" << resources.gpu_service_enabled() << '\n';
+            << " scheduler=worker-local single_queue=1" << '\n';
     render_online_profile(resources, profile, false);
+    render_worker_profiles(resources, profile, false);
     diagnostics << profile.str();
 }
 
@@ -883,14 +813,18 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
     parameter("model", "band_shift", detail::OnlineModel::band_shift);
     parameter("model", "band_count", detail::OnlineModel::band_count);
     parameter("model", "backend_count", detail::OnlineModel::backend_count);
-    parameter("model", "training_scope", "current-run-only");
+    parameter("model", "training_scope", "worker-local-current-run-only");
     if (!resources)
         return;
     metric("gpu_workers", static_cast<double>(resources->gpu_workers()));
     metric("cpu_fallbacks", static_cast<double>(resources->fallbacks()));
     metric("cpu_routed_hashes", static_cast<double>(resources->cpu_routed_hashes()));
     metric("gpu_block_bytes", static_cast<double>(resources->gpu_block_bytes()), "bytes");
-    metric("gpu_service_enabled", resources->gpu_service_enabled());
+    const auto workers = resources->worker_profiles();
+    metric("worker_count", static_cast<double>(workers.size()));
+    metric("gpu_available_workers", static_cast<double>(std::count_if(
+                                        workers.begin(), workers.end(),
+                                        [](const auto& worker) { return worker.gpu_enabled; })));
     metric("pgo_enabled", resources->profiling_enabled());
     metric("pgo_exploration_jobs", static_cast<double>(resources->exploration_jobs()));
     const auto [hashed, compared] = resources->read_bytes();
@@ -905,31 +839,7 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
     const auto [cpu, gpu] = resources->hash_attempts();
     metric("cpu_hashes", static_cast<double>(cpu));
     metric("gpu_hashes", static_cast<double>(gpu));
-    const auto [overflow, spill] = resources->route_counts();
-    metric("gpu_overflow_jobs", static_cast<double>(overflow));
-    metric("cpu_spill_jobs", static_cast<double>(spill));
-    const auto& dispatch = resources->dispatch_evidence();
-#define DISPATCH(field, unit) metric("dispatch." #field, static_cast<double>(dispatch.field), unit)
-    DISPATCH(block_complete, "bool");
-    DISPATCH(stream_complete, "bool");
-    DISPATCH(block_gpu_preferred, "bool");
-    DISPATCH(stream_gpu_preferred, "bool");
-    DISPATCH(calibration_complete, "bool");
-    DISPATCH(device_validated, "bool");
-    DISPATCH(setup_ms, "ms");
-    DISPATCH(elapsed_ms, "ms");
-    DISPATCH(cpu_block_ms, "ms");
-    DISPATCH(gpu_block_ms, "ms");
-    DISPATCH(cpu_stream_fastest_ms, "ms");
-    DISPATCH(gpu_stream_slowest_ms, "ms");
-    DISPATCH(cpu_stream_ms, "ms");
-    DISPATCH(gpu_stream_ms, "ms");
-    DISPATCH(mixed_cpu_ms, "ms");
-    DISPATCH(mixed_gpu_ms, "ms");
-    DISPATCH(expected_saving_ms, "ms");
-#undef DISPATCH
-    parameter("dispatch", "decision", dispatch_name(dispatch.decision));
-    parameter("dispatch", "calibration_stop", calibration_stop(dispatch));
+    parameter("routing", "model_scope", "worker-local-current-run");
     const auto profile = resources->profile_snapshot();
 #define PROFILE(field, unit) metric("pgo." #field, static_cast<double>(profile.field), unit)
     PROFILE(samples, "count");
@@ -939,7 +849,6 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
     PROFILE(predicted_samples, "count");
     PROFILE(cpu_known_bands, "count");
     PROFILE(gpu_known_bands, "count");
-    PROFILE(mean_absolute_error_ms, "ms");
 #undef PROFILE
     for (std::size_t i = 0; i < profile.latency_histogram.size(); ++i) {
         metric("pgo.latency_bucket_us." + std::to_string(i),
@@ -947,13 +856,63 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
         metric("pgo.residual_bucket_us." + std::to_string(i),
                static_cast<double>(profile.residual_histogram[i]));
     }
-    for (const auto& band : resources->model_parameters()) {
-        const auto category =
-            std::string("model.") + (band.gpu ? "gpu." : "cpu.") + std::to_string(band.band_index);
-        parameter(category, "known", band.known);
-        parameter(category, "samples", band.samples);
-        parameter(category, "cost_ms_per_byte", band.cost_ms_per_byte);
-        parameter(category, "error_ms_per_byte", band.error_ms_per_byte);
+    for (const auto& worker : workers) {
+        const auto scope = "worker." + std::to_string(worker.index);
+#define WORKER_METRIC(field, unit)                                                                 \
+    metric(scope + "." #field, static_cast<double>(worker.field), unit)
+        WORKER_METRIC(cpu_hashes, "count");
+        WORKER_METRIC(gpu_hashes, "count");
+        WORKER_METRIC(cpu_hash_bytes, "bytes");
+        WORKER_METRIC(gpu_hash_bytes, "bytes");
+        WORKER_METRIC(hash_bytes, "bytes");
+        WORKER_METRIC(compare_bytes, "bytes");
+        WORKER_METRIC(cpu_routed_hashes, "count");
+        WORKER_METRIC(setup_ms, "ms");
+        WORKER_METRIC(gpu_attempted, "bool");
+        WORKER_METRIC(gpu_enabled, "bool");
+        WORKER_METRIC(gpu_init_failures, "count");
+        WORKER_METRIC(fallbacks, "count");
+        WORKER_METRIC(exploration_jobs, "count");
+        WORKER_METRIC(model_cpu, "count");
+        WORKER_METRIC(model_gpu, "count");
+        WORKER_METRIC(static_cpu, "count");
+        WORKER_METRIC(static_gpu, "count");
+        WORKER_METRIC(size_cpu, "count");
+        WORKER_METRIC(unavailable_cpu, "count");
+        WORKER_METRIC(cold_start_cpu, "count");
+        WORKER_METRIC(gpu_inflight_at_selection, "count");
+        WORKER_METRIC(gpu_peak_concurrency, "count");
+        WORKER_METRIC(contended_samples, "count");
+#undef WORKER_METRIC
+        parameter(scope, "cpu_block_bytes", worker.cpu_block_bytes);
+        parameter(scope, "gpu_block_bytes", worker.gpu_block_bytes);
+        parameter(scope, "device_budget_bytes", worker.device_budget_bytes);
+        const auto& local = worker.snapshot;
+#define LOCAL_PROFILE(field, unit)                                                                 \
+    metric(scope + ".pgo." #field, static_cast<double>(local.field), unit)
+        LOCAL_PROFILE(samples, "count");
+        LOCAL_PROFILE(cpu_samples, "count");
+        LOCAL_PROFILE(gpu_samples, "count");
+        LOCAL_PROFILE(rejected_samples, "count");
+        LOCAL_PROFILE(predicted_samples, "count");
+        LOCAL_PROFILE(cpu_known_bands, "count");
+        LOCAL_PROFILE(gpu_known_bands, "count");
+        LOCAL_PROFILE(mean_absolute_error_ms, "ms");
+#undef LOCAL_PROFILE
+        for (std::size_t i = 0; i < local.latency_histogram.size(); ++i) {
+            metric(scope + ".pgo.latency_bucket_us." + std::to_string(i),
+                   static_cast<double>(local.latency_histogram[i]));
+            metric(scope + ".pgo.residual_bucket_us." + std::to_string(i),
+                   static_cast<double>(local.residual_histogram[i]));
+        }
+        for (const auto& band : worker.parameters) {
+            const auto category =
+                scope + ".model." + (band.gpu ? "gpu." : "cpu.") + std::to_string(band.band_index);
+            parameter(category, "known", band.known);
+            parameter(category, "samples", band.samples);
+            parameter(category, "cost_ms_per_byte", band.cost_ms_per_byte);
+            parameter(category, "error_ms_per_byte", band.error_ms_per_byte);
+        }
     }
 }
 /// Append final writer health; legacy elapsed excludes this explicit exit drain.
@@ -1117,16 +1076,13 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
     if (resources && !failure) {
         if (options.summary)
             render_profile(counters, *resources, phases, summary, options);
-        if (config.backend == "cuda" && resources->gpu_workers() < config.workers)
-            diagnostics
-                << "CUDA initialization or input registration failed for some workers; using "
-                   "CPU fallback.\n";
-        if (resources->dispatch_evidence().decision == detail::DispatchEvidence::Decision::failed)
-            diagnostics << "CUDA probe failed; auto selected CPU.\n";
-        if (trace && (resources->fallbacks() ||
-                      (config.backend == "cuda" && resources->gpu_workers() < config.workers) ||
-                      resources->dispatch_evidence().decision ==
-                          detail::DispatchEvidence::Decision::failed)) {
+        std::uint64_t init_failures = 0;
+        for (const auto& worker : resources->worker_profiles())
+            init_failures += worker.gpu_init_failures;
+        if (init_failures)
+            diagnostics << "CUDA initialization failed for " << init_failures
+                        << " worker contexts; affected workers used CPU fallback.\n";
+        if (trace && (resources->fallbacks() || init_failures)) {
             event("log", "backend.fallback", stage_start, stage_start, 1, 0);
             if (!final.events.empty())
                 final.events.back().severity = "warn";

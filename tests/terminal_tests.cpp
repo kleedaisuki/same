@@ -184,7 +184,10 @@ void reports() {
     check(counter(err.str(), "database_records") == 2 &&
               out.str().find("Database") == std::string::npos,
           "deleted database record");
-    check(err.str().find("nan") == std::string::npos && err.str().find("inf") == std::string::npos,
+    // 只解析指标值，inflight 等合法字段名不属于浮点无穷。 / Inspect the value, not names such as
+    // inflight.
+    const auto rate = err.str().find("read_mib_s=");
+    check(rate != std::string::npos && std::isfinite(std::stod(err.str().substr(rate + 11))),
           "nonfinite rate");
 }
 /// Verify unit thresholds and zero/invalid input without timing-dependent assertions.

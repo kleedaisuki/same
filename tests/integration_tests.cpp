@@ -265,7 +265,7 @@ struct Fixture {
             parsed[std::stoi(line.substr(0, tab))].insert(line.substr(tab + 1));
         }
         stats.clear();
-        const std::regex counters("(\\w+)=(\\d+)");
+        const std::regex counters("([\\w.]+)=(\\d+)");
         for (auto it = std::sregex_iterator(errors.begin(), errors.end(), counters);
              it != std::sregex_iterator(); ++it)
             if ((*it)[1] != "telemetry_run_id")
@@ -711,6 +711,8 @@ void backends(const fs::path& exe) {
     }
     Fixture gpu(exe);
     gpu.config({{"backend", "\"cuda\""},
+                {"memory_bytes", "134217728"},
+                {"device_memory_bytes", "134217728"},
                 {"gpu_min_bytes", "0"},
                 {"workers", "3"},
                 {"block_bytes", "65536"},
@@ -723,25 +725,29 @@ void backends(const fs::path& exe) {
     content.back() ^= 1;
     gpu.file("distinct", content);
     gpu.expect({group({"a", "nested/b", "c", "d"})});
-    check(gpu.stats["gpu_workers"] == 3 && gpu.stats["cpu_fallbacks"] == 0 &&
-              gpu.stats["hashed"] == 5 && gpu.stats["gpu_hashes"] == 5 &&
-              gpu.stats["cpu_hashes"] == 0,
+    check(gpu.stats["gpu_workers"] >= 1 && gpu.stats["gpu_workers"] <= 3 &&
+              gpu.stats["cpu_fallbacks"] == 0 && gpu.stats["hashed"] == 5 &&
+              gpu.stats["gpu_hashes"] == 5 && gpu.stats["cpu_hashes"] == 0,
           "CUDA cold scan");
     gpu.expect({group({"a", "nested/b", "c", "d"})});
-    check(gpu.stats["gpu_workers"] == 3 && gpu.stats["cpu_fallbacks"] == 0 &&
-              gpu.stats["hashed"] == 0 && gpu.stats["cached"] == 5,
+    check(gpu.stats["gpu_workers"] >= 1 && gpu.stats["gpu_workers"] <= 3 &&
+              gpu.stats["cpu_fallbacks"] == 0 && gpu.stats["hashed"] == 0 &&
+              gpu.stats["cached"] == 5,
           "CUDA warm scan");
     // 自动选择结果依赖硬件；无论选择如何，摘要/输出必须保持不变。
     // Auto decisions depend on hardware; digest/output correctness must not depend on the decision.
     gpu.config({{"backend", "\"auto\""},
+                {"memory_bytes", "134217728"},
+                {"device_memory_bytes", "134217728"},
 
                 {"gpu_min_bytes", "0"},
                 {"workers", "3"},
                 {"block_bytes", "65536"},
                 {"rehash", "true"}});
     gpu.expect({group({"a", "nested/b", "c", "d"})});
-    check(gpu.stats["gpu_workers"] <= 1 && gpu.stats["cpu_hashes"] + gpu.stats["gpu_hashes"] == 5,
-          "auto must keep at most one calibrated GPU lane and account for real work");
+    check(gpu.stats["gpu_workers"] <= 3 && gpu.stats["worker_count"] == 3 &&
+              gpu.stats["cpu_hashes"] + gpu.stats["gpu_hashes"] == 5,
+          "auto must retain exactly the configured unified workers and account for real work");
 }
 
 /// 大小路由必须保留完整摘要/缓存语义，并能显式禁用。 / Size routing preserves hashes/cache and can
@@ -765,21 +771,31 @@ void size_routing(const fs::path& exe) {
     // The payload floor prevents unnecessary GPU setup for small files.
     f.config({{"backend", "\"auto\""}, {"gpu_min_bytes", "4097"}, {"rehash", "true"}});
     f.expect(expected);
-    check(f.stats["gpu_workers"] == 0 && f.stats["calibration_ms"] == 0 &&
-              f.stats["gpu_setup_ms"] == 0 && f.stats["cpu_hashes"] == 4,
+    check(f.stats["gpu_workers"] == 0 && f.stats["worker.0.gpu_attempted"] == 0 &&
+              f.stats["worker.1.gpu_attempted"] == 0 && f.stats["cpu_hashes"] == 4,
           "below-floor payloads must not pay CUDA setup or calibration");
     check(read(f.base / "stderr").find("using CPU fallback") == std::string::npos,
           "intentional auto CPU policy must not report unavailable CUDA");
-    f.config({{"backend", "\"auto\""}, {"gpu_min_bytes", "0"}, {"rehash", "true"}});
+    // 两种大小跨越区间边界；固定一个工作者，使每个区间的第二个任务必定拥有本地 CPU 样本。
+    // These sizes straddle model bands; one worker guarantees a local CPU sample before each
+    // repeat.
+    f.config({{"backend", "\"auto\""},
+              {"workers", "1"},
+              {"gpu_min_bytes", "0"},
+              {"rehash", "true"},
+              {"memory_bytes", "134217728"},
+              {"device_memory_bytes", "134217728"}});
     f.expect(expected);
     check(f.stats["cpu_hashes"] + f.stats["gpu_hashes"] == 4 && f.stats["cpu_fallbacks"] == 0,
           "adaptive attempts or retry accounting changed");
     if (std::getenv("SAME_REQUIRE_CUDA"))
-        check(f.stats["gpu_workers"] == 1 && f.stats["gpu_setup_ms"] > 0,
-              "eligible work did not initialize the available device");
+        check(f.stats["gpu_workers"] == 1 && f.stats["worker_count"] == 1 &&
+                  f.stats["gpu_hashes"] >= 1,
+              "repeated local-band input did not explore the available worker-local device");
     f.config({{"backend", "\"auto\""}, {"gpu_min_bytes", "0"}});
     f.expect(expected);
-    check(f.stats["cached"] == 4 && f.stats["gpu_workers"] == 0 && f.stats["gpu_setup_ms"] == 0,
+    check(f.stats["cached"] == 4 && f.stats["gpu_workers"] == 0 &&
+              f.stats["worker.0.gpu_attempted"] == 0 && f.stats["worker.1.gpu_attempted"] == 0,
           "cached eligible files initialized CUDA");
 }
 
@@ -800,13 +816,13 @@ void pgo_control(const fs::path& exe) {
     const auto pretty = read(f.base / "stderr");
     check(pretty.find("Online PGO") != std::string::npos &&
               pretty.find("2 samples (2 CPU | 0 GPU)") != std::string::npos &&
-              pretty.find("Model error") != std::string::npos &&
+              pretty.find("Model residual") != std::string::npos &&
               pretty.find("Sample latency") != std::string::npos,
           "pretty summary omitted online profiling evidence");
     check(f.run(0, {"scan", "-r", "--summary", "--rehash", "--no-pgo"}) == expected,
           "no-pgo changed duplicate groups");
     check(f.stats["pgo_enabled"] == 0 && f.stats["pgo_samples"] == 0 &&
-              f.stats["pgo_predicted_samples"] == 0 && f.stats["calibration_ms"] == 0,
+              f.stats["pgo_predicted_samples"] == 0,
           "no-pgo left performance analysis enabled");
     f.expect(expected);
     check(f.stats["cached"] == 2 && f.stats["pgo_samples"] == 0,
@@ -853,14 +869,20 @@ void telemetry_controls(const fs::path& exe) {
     check(!first_id.empty() && telemetry_scalar(f, "SELECT count(*) FROM runs") == "1" &&
               telemetry_scalar(f, "SELECT status FROM latest_run") == "completed",
           "quiet run not durably finalized");
-    check(telemetry_scalar(f, "SELECT count(DISTINCT category) FROM parameters "
-                              "WHERE category GLOB 'model.cpu.*' OR category GLOB 'model.gpu.*'") ==
-              "64",
-          "journal omitted model size bands");
-    check(telemetry_scalar(f, "SELECT count(*) FROM parameters "
-                              "WHERE category GLOB 'model.cpu.*' OR category GLOB 'model.gpu.*'") ==
-              "256",
-          "journal omitted raw band fields");
+    check(
+        telemetry_scalar(
+            f,
+            "SELECT count(DISTINCT category) FROM parameters "
+            "WHERE category GLOB 'worker.*.model.cpu.*' OR category GLOB 'worker.*.model.gpu.*'") ==
+            "128",
+        "journal omitted worker-local model size bands");
+    check(
+        telemetry_scalar(
+            f,
+            "SELECT count(*) FROM parameters "
+            "WHERE category GLOB 'worker.*.model.cpu.*' OR category GLOB 'worker.*.model.gpu.*'") ==
+            "512",
+        "journal omitted raw worker-local band fields");
     check(telemetry_scalar(f, "SELECT value FROM parameters WHERE category='model' "
                               "AND name='smoothing_alpha'") == "0.125",
           "journal omitted model algorithm parameter");
@@ -871,6 +893,19 @@ void telemetry_controls(const fs::path& exe) {
           "effective configuration snapshot incorrect");
     check(telemetry_scalar(f, "SELECT value FROM metrics WHERE name='pgo.samples'") == "2.0",
           "final profiler metrics omitted");
+    check(telemetry_scalar(
+              f, "SELECT (SELECT sum(value) FROM metrics WHERE name GLOB 'worker.*.pgo.samples')="
+                 "(SELECT value FROM metrics WHERE name='pgo.samples')") == "1",
+          "aggregate sample count differs from worker-local snapshots");
+    check(telemetry_scalar(
+              f, "SELECT (SELECT sum(value) FROM metrics WHERE name GLOB 'worker.*.cpu_hashes')="
+                 "(SELECT value FROM metrics WHERE name='cpu_hashes')") == "1",
+          "aggregate CPU attempts differ from worker-local accounting");
+    check(
+        telemetry_scalar(
+            f, "SELECT count(*) FROM metrics WHERE name GLOB 'worker.*.pgo.latency_bucket_us.*'") ==
+            "64",
+        "per-worker latency distributions omitted");
     check(telemetry_scalar(f, "SELECT count(*) FROM logs WHERE name='run.completed'") == "1",
           "completion log missing");
     check(execute(exe, f.root, f.base / "stdout", f.base / "stderr",
@@ -887,10 +922,18 @@ void telemetry_controls(const fs::path& exe) {
     check(telemetry_scalar(f, "SELECT count(*) FROM logs WHERE name='run.completed' "
                               "AND run_id=(SELECT run_id FROM latest_run)") == "1",
           "no-pgo disabled base lifecycle journal");
+    check(telemetry_scalar(
+              f, "SELECT count(*) FROM parameters WHERE run_id=(SELECT run_id FROM latest_run) "
+                 "AND category GLOB 'worker.*.model.*' AND name='known' AND value<>'0'") == "0",
+          "no-pgo populated worker-local model parameters");
     const auto summary = read(f.base / "stderr");
     check(summary.find("telemetry_run_id=" +
                        telemetry_scalar(f, "SELECT run_id FROM latest_run")) != std::string::npos &&
-              summary.find("telemetry_drain_ms=") != std::string::npos,
+              summary.find("telemetry_drain_ms=") != std::string::npos &&
+              summary.find("worker_count=2") != std::string::npos &&
+              summary.find("worker.0.cpu_hashes=") != std::string::npos &&
+              summary.find("worker.1.cpu_hashes=") != std::string::npos &&
+              summary.find("scheduler=worker-local single_queue=1") != std::string::npos,
           "current-run summary omitted journal identity/drain");
     const auto database = read(f.root / ".same/telemetry.db");
     check(execute(exe, f.root, f.base / "stdout", f.base / "stderr", {"scan", "--no-telemetry"}) ==
@@ -939,8 +982,8 @@ void telemetry_failures(const fs::path& exe) {
     check(read(failed.root / "a") == "unmodified", "failure modified scan input");
 }
 
-/// Deferred startup must assign a unique span to each submitted file, including the held one.
-/// 延迟启动保留的文件同样需要独立跨度编号，不能复用协调线程扫描计数。
+/// Worker-local scheduling preserves globally unique task span IDs within the run.
+/// 工作线程局部调度仍保留运行内唯一任务跨度编号。
 void telemetry_span_identity(const fs::path& exe) {
     Fixture f(exe);
     f.config({{"backend", "\"auto\""},
@@ -952,7 +995,7 @@ void telemetry_span_identity(const fs::path& exe) {
     f.expect({group({"a", "b"})});
     check(telemetry_scalar(f, "SELECT count(*)-count(DISTINCT span_id) FROM spans "
                               "WHERE name='hash'") == "0",
-          "deferred startup reused a hash span id");
+          "worker-local scheduling reused a hash span id");
     check(telemetry_scalar(f, "SELECT count(*) FROM spans WHERE name='hash' "
                               "AND (parent_span_id<>3 OR worker<0 OR backend<>'cpu' "
                               "OR bytes<>4096 OR duration_ns<=0)") == "0",

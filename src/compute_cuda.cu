@@ -289,6 +289,11 @@ std::unique_ptr<Compute> try_cuda_compute(std::size_t block_bytes, std::size_t d
         return {};
     }
     try {
+        // 在所属工作线程绑定当前设备的共享主上下文，不创建独立上下文或重置其他线程。
+        // Bind this worker to the current device's shared primary context; never reset peers.
+        int ordinal = 0;
+        check(cudaGetDevice(&ordinal));
+        check(cudaSetDevice(ordinal));
         auto device = std::make_shared<Device>(chunks * 1024);
         device->allocate();
         return std::make_unique<CudaCompute>(std::move(device));

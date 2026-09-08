@@ -66,33 +66,29 @@ public:
     CompletionJobs& operator=(const CompletionJobs&) = delete;
     /// 达到容量前提交；调用方先 drain，再接收更多任务。
     /// Submit below capacity; callers drain before admitting further work.
-    template <class F> void submit(F&& operation, bool prefer_gpu = false) {
-        submit_impl(std::forward<F>(operation), prefer_gpu, std::nullopt);
+    template <class F> void submit(F&& operation) {
+        submit_impl(std::forward<F>(operation), std::nullopt);
     }
-    /// 哈希任务携带可窃取的 GPU 资格，不固定到单一工作线程。
-    /// Hash work carries a stealable GPU eligibility hint, not a fixed worker assignment.
-    template <class F> void submit_hash(F&& operation, bool gpu_eligible) {
-        submit_hash(std::forward<F>(operation),
-                    gpu_eligible ? HashRoute::gpu_preferred : HashRoute::cpu_only);
-    }
-    /// 显式区分不可卸载与可忙时互补的载荷。 / Distinguish CPU-only work from saturation spill.
-    template <class F> void submit_hash(F&& operation, HashRoute route, std::uint64_t bytes = 0) {
-        submit_impl(std::forward<F>(operation), false, route, bytes);
+    /// 只传递文件大小；工作线程在统一队列外独立选择后端。
+    /// Carry only file size; the owning worker selects its backend outside the common queue.
+    template <class F> void submit_hash(F&& operation, std::uint64_t bytes) {
+        submit_impl(std::forward<F>(operation), bytes);
     }
 
 private:
     /// 两类接收共用完成发布和容量契约，仅资源调度入口不同。
     /// Both admission routes share publication and capacity contracts, differing only in
     /// scheduling.
-    template <class F>
-    void submit_impl(F&& operation, bool pinned, std::optional<HashRoute> route,
-                     std::uint64_t bytes = 0) {
+    template <class F> void submit_impl(F&& operation, std::optional<std::uint64_t> bytes) {
         if (pending_ == state_->ring.size())
             throw std::logic_error("completion admission capacity exceeded");
         auto publish = [state = state_,
                         operation = std::forward<F>(operation)](Worker& worker) mutable {
             Outcome result;
             try {
+                // 初始化失败也必须通过完成环发布，不依赖调用者执行 Worker.execute。
+                // Publish initialization failures through the ring even without Worker.execute.
+                worker.rethrow_startup();
                 result.value = operation(worker);
             } catch (...) {
                 result.error = std::current_exception();
@@ -105,10 +101,10 @@ private:
             }
             state->ready.notify_one();
         };
-        if (route)
-            resources_.submit_hash(std::move(publish), *route, bytes);
+        if (bytes)
+            resources_.submit_hash(std::move(publish), *bytes);
         else
-            resources_.submit(std::move(publish), pinned);
+            resources_.submit(std::move(publish));
         ++pending_;
     }
 

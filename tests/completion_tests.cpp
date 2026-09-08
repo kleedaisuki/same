@@ -81,19 +81,19 @@ void single_slot(same::Resources& resources) {
 /// Hash hints preserve ring bounds, move-only captures and exceptions without requiring a GPU.
 void hash_admission(same::Resources& resources) {
     same::detail::CompletionJobs<int> jobs(resources, 1);
-    for (const bool eligible : {false, true}) {
+    for (const std::uint64_t bytes : {0ULL, 4096ULL}) {
         jobs.submit_hash([value = std::make_unique<int>(42)](same::Worker&) { return *value; },
-                         eligible);
+                         bytes);
         bool rejected = false;
         try {
-            jobs.submit_hash([](same::Worker&) { return -1; }, eligible);
+            jobs.submit_hash([](same::Worker&) { return -1; }, bytes);
         } catch (const std::logic_error&) {
             rejected = true;
         }
         require(rejected && jobs.pending() == 1, "hash admission exceeded capacity");
         require(jobs.next() == 42, "hash move-only capture lost");
         jobs.submit_hash([](same::Worker&) -> int { throw std::runtime_error("hash failure"); },
-                         eligible);
+                         bytes);
         bool failed = false;
         try {
             (void)jobs.next();
@@ -134,9 +134,47 @@ void exception_lifetime(same::Resources& resources) {
     done.wait();
     require(threw, "worker exception was swallowed");
 }
+/// 延迟设备初始化异常必须通过完成环传播，不能执行回调或遗失完成通知。
+/// Lazy startup exceptions must publish completion without running callback side effects.
+void startup_exception_completion(bool allocation_failure) {
+    same::Config config;
+    config.workers = 1;
+    config.queue_capacity = 1;
+    config.backend = "cuda";
+    config.gpu_min_bytes = 0;
+    config.memory_bytes = config.device_memory_bytes = 128 * 1024 * 1024;
+    same::Resources resources(
+        config, [allocation_failure](std::size_t, std::size_t) -> std::unique_ptr<same::Compute> {
+            if (allocation_failure)
+                throw std::bad_alloc();
+            throw std::runtime_error("injected lazy initialization failure");
+        });
+    same::detail::CompletionJobs<int> jobs(resources, 1);
+    std::atomic<unsigned> callbacks{};
+    jobs.submit_hash(
+        [&](same::Worker&) {
+            ++callbacks;
+            return 7;
+        },
+        std::uint64_t{4096});
+    bool correct = false;
+    try {
+        (void)jobs.next();
+    } catch (const std::bad_alloc&) {
+        correct = allocation_failure;
+    } catch (const std::runtime_error& error) {
+        correct = !allocation_failure &&
+                  std::string(error.what()) == "injected lazy initialization failure";
+    }
+    require(correct && callbacks == 0 && jobs.pending() == 0,
+            "startup exception lost completion or executed callback side effects");
+    resources.wait_idle();
+}
 /// CPU 实例避免测试结果依赖 CUDA 可用性。 / CPU instance makes tests independent of CUDA.
 int main() {
     try {
+        startup_exception_completion(false);
+        startup_exception_completion(true);
         same::Config config;
         config.workers = 2;
         config.queue_capacity = 2;

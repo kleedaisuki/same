@@ -170,57 +170,8 @@ private:
     std::shared_ptr<std::atomic<bool>> fail_;
 };
 
-/// 异常时自动释放占用任务，任务不引用门闩本体。 / Exception-safe gate with no borrowed task state.
-class CpuGate {
-public:
-    /// 启动通知先于任务发布。 / Create the start notification before publishing the task.
-    CpuGate() : started_(state_->started.get_future()) {}
-    /// 本对象必须晚于池构造，确保先释放再等待池析构。 / Construct after the pool to release first.
-    ~CpuGate() {
-        open();
-    }
-    /// 共享所有权使任务在异常展开期间也安全。 / Shared ownership survives exceptional unwinding.
-    auto job() const {
-        return [state = state_](same::Worker&) {
-            state->started.set_value();
-            std::unique_lock lock(state->mutex);
-            state->changed.wait(lock, [&] { return state->open; });
-        };
-    }
-    /// 有界等待仅检测死锁，不根据计时判断速度优势。 / Bounded deadlock check, not a speed test.
-    void wait_started() {
-        require(started_.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
-                "CPU gate did not start");
-    }
-    /// 正常和异常路径均可重复释放。 / Idempotent release for normal and exceptional paths.
-    void open() {
-        {
-            std::lock_guard lock(state_->mutex);
-            state_->open = true;
-        }
-        state_->changed.notify_all();
-    }
-
-private:
-    /// 任务和控制线程共同拥有同步状态。 / Synchronization shared by job and controller.
-    struct State {
-        /// 保护释放位。 / Protect the release bit.
-        std::mutex mutex;
-        /// 唤醒阻塞工作者。 / Wake the blocked worker.
-        std::condition_variable changed;
-        /// 发布确定的 CPU 占用状态。 / Publish definite CPU occupancy.
-        std::promise<void> started;
-        /// 只从关闭变为打开。 / One-way closed-to-open transition.
-        bool open{};
-    };
-    /// 不依赖栈上门闩的任务状态。 / Task state independent of the stack gate.
-    std::shared_ptr<State> state_{std::make_shared<State>()};
-    /// 单次启动通知。 / One-shot start notification.
-    std::future<void> started_;
-};
-
-/// 大 GPU 缓冲不能误把已获资格的小文件送回 CPU；故障必须完整重读。
-/// Large GPU buffers must not override file eligibility; a device fault requires a full reread.
+/// 同一工作者必须能在 CPU 和 GPU 之间切换；故障必须完整重读并永久停用该设备。
+/// The same worker switches CPU/GPU; faults reread completely and retire its device.
 void routed_file_hash(bool inject_failure, bool profiling = true) {
     Fixture fixture;
     std::array<std::byte, 2048> content{};
@@ -235,67 +186,63 @@ void routed_file_hash(bool inject_failure, bool profiling = true) {
     auto reference = reference_cpu->hasher();
     reference->update(content);
     const auto expected = reference->finish();
-    auto opened = std::make_unique<same::FileReader>(fixture.root / "file");
-    same::FileRecord record{"file", opened->stamp(), {}};
+    same::FileRecord record{"file", same::stamp_path(fixture.root / "file"), {}};
     same::Config cfg;
-    cfg.backend = "auto";
+    cfg.backend = profiling ? "auto" : "cuda";
     cfg.workers = 1;
     cfg.queue_capacity = 8;
     cfg.block_bytes = 4096;
     cfg.gpu_min_bytes = 0;
     cfg.pgo = profiling;
-    cfg.memory_bytes = 64 * 1024 * 1024;
+    cfg.memory_bytes = cfg.device_memory_bytes = 128 * 1024 * 1024;
     auto fail = std::make_shared<std::atomic<bool>>(false);
-    same::Resources pool(
-        cfg, [fail](std::size_t, std::size_t) { return std::make_unique<RoutedCuda>(fail); });
-    pool.prepare_auto(cfg, content.size(), 1);
-    pool.wait_idle();
-    require(pool.gpu_workers() == 1 && pool.gpu_block_bytes() == 16 * 1024 * 1024,
-            "routed fixture requires an independent 16 MiB GPU buffer");
-    const auto route = same::detail::classify_hash(
-        content.size(), cfg.gpu_min_bytes, pool.gpu_block_bytes(), pool.dispatch_evidence());
-    require(route == same::detail::HashRoute::cpu_preferred,
-            "sub-buffer payload must prefer CPU without excluding GPU overflow");
-    if (!profiling) {
-        const auto& evidence = pool.dispatch_evidence();
-        require(evidence.device_validated && !evidence.calibration_complete &&
-                    !evidence.block_complete && !evidence.stream_complete &&
-                    evidence.elapsed_ms == 0 && evidence.cpu_block_ms == 0 &&
-                    evidence.gpu_block_ms == 0 && evidence.cpu_stream_ms == 0 &&
-                    evidence.gpu_stream_ms == 0,
-                "no-PGO must validate the device without performance calibration");
+    std::atomic<unsigned> factories{};
+    same::Resources pool(cfg, [fail, &factories](std::size_t, std::size_t) {
+        ++factories;
+        return std::make_unique<RoutedCuda>(fail);
+    });
+    if (profiling) {
+        pool.submit([bytes = content.size()](same::Worker& worker) {
+                // 确定性局部模型先验，只验证选择契约，不把墙钟噪声当作测试条件。
+                // Deterministic local priors verify selection without wall-clock noise.
+                worker.model.seed(false, bytes, 100.0);
+                worker.model.seed(true, bytes, 1.0);
+            })
+            .get();
     }
-    fail->store(inject_failure);
-    CpuGate cpu;
-    auto held = pool.submit(cpu.job());
-    cpu.wait_started();
-    auto hashed = pool.submit_hash(
-        [root = fixture.root, record, opened = std::move(opened)](same::Worker& worker) mutable {
-            return worker.execute(
-                [&] { return same::hash_file(root, record, worker, 0, std::move(opened)); });
-        },
-        route);
-    require(hashed.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
-            "CPU-saturated file hash did not complete on GPU service");
-    require(hashed.get().digest == expected, "routed file digest differs from CPU reference");
-    std::future<std::string> queued;
-    if (inject_failure)
-        queued = pool.submit_hash([](same::Worker& worker) { return worker.compute->name(); },
-                                  same::detail::HashRoute::gpu_preferred);
-    cpu.open();
-    held.get();
-    if (inject_failure) {
-        require(queued.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
-                "retired GPU stranded subsequent hash work");
-        require(queued.get() == "cpu", "retired GPU accepted subsequent hash work");
-    }
+    auto submit = [&](bool fault) {
+        return pool.submit_hash(
+            [root = fixture.root, record, fault, fail](same::Worker& worker) mutable {
+                require(worker.index == 0, "file migrated away from the sole worker");
+                // 初始化已经成功返回；只在真实文件读取时注入故障。
+                // Initialization already finished; inject faults only during actual file reads.
+                fail->store(fault);
+                auto input = std::make_unique<same::FileReader>(root / "file");
+                return worker.execute(
+                    [&] { return same::hash_file(root, record, worker, 0, std::move(input)); });
+            },
+            content.size());
+    };
+    require(submit(false).get().digest == expected, "first GPU digest differs from CPU reference");
+    auto cpu = pool.submit([](same::Worker& worker) {
+        require(worker.index == 0, "CPU task migrated away from the sole worker");
+        return worker.compute->name();
+    });
+    require(cpu.get() == (profiling ? "cpu" : "cuda"),
+            "same-worker generic backend violates auto/explicit mode contract");
+    require(submit(inject_failure).get().digest == expected,
+            "reselected GPU or full retry changed the digest");
+    require(submit(false).get().digest == expected,
+            "post-fault or repeated GPU task changed the digest");
     pool.wait_idle();
+    require(factories == 1, "worker initialized its GPU more than once");
     const auto [cpu_attempts, gpu_attempts] = pool.hash_attempts();
-    require(cpu_attempts == (inject_failure ? 1U : 0U) && gpu_attempts == 1,
-            "actual file hash attempts disagree with overflow and retry policy");
+    require(cpu_attempts == (inject_failure ? 2U : 0U) &&
+                gpu_attempts == (inject_failure ? 2U : 3U),
+            "same-worker switching or GPU retirement attempts incorrect");
     require(pool.fallbacks() == (inject_failure ? 1U : 0U),
             "routed compute fault must cause exactly one fallback");
-    require(pool.read_bytes().first == content.size() * (inject_failure ? 2U : 1U),
+    require(pool.read_bytes().first == content.size() * (inject_failure ? 4U : 3U),
             "routed fault did not reread the entire file");
     require(pool.cpu_routed_hashes() == 0,
             "GPU or CPU buffer capacity incorrectly changed file eligibility");

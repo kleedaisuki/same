@@ -72,19 +72,25 @@ struct Fixture {
 void scan_overlaps_startup() {
     Fixture fixture;
     same::Config config;
-    config.workers = config.metadata_workers = 1;
+    config.backend = "cuda";
+    config.workers = 2;
+    config.metadata_workers = 1;
     config.queue_capacity = 8;
     config.block_bytes = 8192;
     config.gpu_min_bytes = 1024;
-    config.memory_bytes = config.device_memory_bytes = 64 * 1024 * 1024;
+    config.memory_bytes = config.device_memory_bytes = 128 * 1024 * 1024;
     std::promise<void> entered, release;
     auto started = entered.get_future();
     auto gate = release.get_future().share();
-    same::Resources resources(config, [&](std::size_t, std::size_t) {
-        entered.set_value();
-        gate.wait();
-        return std::make_unique<FakeCuda>();
-    });
+    std::atomic<unsigned> factory_calls{};
+    same::Resources resources(config,
+                              [&](std::size_t, std::size_t) -> std::unique_ptr<same::Compute> {
+                                  if (factory_calls.fetch_add(1) != 0)
+                                      return nullptr;
+                                  entered.set_value();
+                                  gate.wait();
+                                  return std::make_unique<FakeCuda>();
+                              });
     auto scanning = std::async(std::launch::async, [&] {
         same::Store store(fixture.root / ".same" / "state.db");
         same::Counters counters;
@@ -106,8 +112,9 @@ void scan_overlaps_startup() {
         started.get();
         std::uint64_t completed = 0;
         while (completed < 3 && std::chrono::steady_clock::now() < deadline) {
-            // 工作线程内读取自身计数，不与 prepare_auto 的统计写入竞争。
-            // Read counters on their owning worker, without racing prepare_auto statistics.
+            // 工作线程内读取自身计数，不与其他工作线程的局部初始化竞争。
+            // Read counters on their owning worker, without racing another worker's local
+            // initialization.
             auto observed =
                 resources.submit([](same::Worker& worker) { return worker.cpu_hashes; });
             require(observed.wait_until(deadline) == std::future_status::ready,
@@ -128,102 +135,77 @@ void scan_overlaps_startup() {
         throw;
     }
 }
-/// 创建仅含路径和载荷大小的输入；hook 不执行文件 I/O。
-/// Build metadata-only input; the submission hook performs no file I/O.
-same::HashInput input(std::string path, std::uint64_t bytes) {
-    same::HashInput result{};
-    result.record.path = std::move(path);
-    result.record.stamp.size = bytes;
-    return result;
-}
-
-/// 固定最大候选保留规则，同时覆盖设备缺失与非设备异常的传播。
-/// Pin largest-candidate retention and cover missing devices versus non-device exceptions.
-void startup_boundary(bool factory_throws) {
+/// 设备缺失只影响所属工作者，所有真实文件仍必须生成完整摘要。
+/// A missing device affects only its owner; every real file still gets its complete digest.
+void missing_device_scan() {
+    Fixture fixture;
     same::Config config;
+    config.backend = "cuda";
     config.workers = config.metadata_workers = 1;
-    config.queue_capacity = 8;
-    config.block_bytes = 8192;
+    config.queue_capacity = 2;
     config.gpu_min_bytes = 1024;
-    std::promise<void> entered, release;
-    auto started = entered.get_future();
-    auto gate = release.get_future().share();
-    same::Resources resources(config,
-                              [&](std::size_t, std::size_t) -> std::unique_ptr<same::Compute> {
-                                  entered.set_value();
-                                  gate.wait();
-                                  if (factory_throws)
-                                      throw std::runtime_error("injected startup boundary failure");
-                                  return nullptr;
-                              });
-    same::AutoHashStartup startup(config, resources);
-    std::vector<std::string> submitted;
-    auto submit = [&](same::HashInput value, same::detail::HashRoute route) {
-        require(route == same::detail::HashRoute::cpu_preferred,
-                "uncalibrated eligible input must prefer CPU");
-        submitted.push_back(std::move(value.record.path));
-    };
-    bool released = false;
-    try {
-        startup.accept(input("smaller", 2048), submit);
-        require(started.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
-                "helper never entered the CUDA factory");
-        started.get();
-        require(submitted.empty(), "initial candidate was not retained");
-        startup.accept(input("largest", 4096), submit);
-        require(submitted == std::vector<std::string>{"smaller"},
-                "larger candidate must replace and release the smaller input");
-        release.set_value();
-        released = true;
-        bool propagated = false;
-        try {
-            startup.finish(submit);
-        } catch (const std::runtime_error& error) {
-            require(std::string(error.what()) == "injected startup boundary failure",
-                    "unexpected startup exception");
-            propagated = true;
-        }
-        require(propagated == factory_throws,
-                "startup exception propagation differs from contract");
-        const auto expected = factory_throws ? std::vector<std::string>{"smaller"}
-                                             : std::vector<std::string>{"smaller", "largest"};
-        require(submitted == expected, "held input submission differs from startup outcome");
-        // get 已消费 future；重复 finish 及后续析构都不能再次发送保留项。
-        // get consumed the future; repeated finish and destruction must not resubmit held input.
-        startup.finish(submit);
-        require(submitted == expected, "finish submitted held input twice");
-    } catch (...) {
-        // startup 在本 catch 之后析构，先解除工厂门闩再让其 future join。
-        // startup destructs after this catch; release its factory before the future joins.
-        if (!released)
-            release.set_value();
-        throw;
-    }
-}
-/// 空文件不消耗初始化机会，即使用户将资格下界设为零。
-/// Empty files must not consume startup eligibility even when the configured floor is zero.
-void empty_before_eligible() {
-    same::Config config;
-    config.workers = 1;
-    config.gpu_min_bytes = 0;
-    std::size_t factories = 0, submitted = 0;
+    config.memory_bytes = config.device_memory_bytes = 128 * 1024 * 1024;
+    std::atomic<unsigned> factories{};
     same::Resources resources(config,
                               [&](std::size_t, std::size_t) -> std::unique_ptr<same::Compute> {
                                   ++factories;
                                   return nullptr;
                               });
-    same::AutoHashStartup startup(config, resources);
-    auto submit = [&](same::HashInput value, same::detail::HashRoute route) {
-        if (!value.record.stamp.size)
-            require(route == same::detail::HashRoute::cpu_only, "empty input was GPU eligible");
-        ++submitted;
-    };
-    startup.accept(input("empty", 0), submit);
-    startup.finish(submit);
-    require(factories == 0 && submitted == 1, "empty input started the device factory");
-    startup.accept(input("nonempty", 65536), submit);
-    startup.finish(submit);
-    require(factories == 1 && submitted == 2, "empty input prevented later device initialization");
+    same::Store store(fixture.root / ".same" / "state.db");
+    same::Counters counters;
+    same::scan(fixture.root, config, store, resources, counters, false);
+    require(counters.scanned == 4 && counters.hashed == 4, "missing device lost scan input");
+    require(factories == 1, "missing device repeatedly initialized on the same worker");
+    for (int i = 0; i < 4; ++i) {
+        const auto record = store.cached("file-" + std::to_string(i));
+        require(record && record->digest == fixture.expected,
+                "missing-device scan changed a complete BLAKE3 digest");
+    }
+    const auto [cpu, gpu] = resources.hash_attempts();
+    require(cpu == 4 && gpu == 0, "missing device backend accounting incorrect");
+}
+
+/// 空文件不初始化设备，也不消耗后续非空任务的初始化机会。
+/// Empty input neither initializes a device nor consumes the later nonempty opportunity.
+void empty_before_eligible() {
+    Fixture fixture;
+    for (int i = 0; i < 4; ++i)
+        std::filesystem::remove(fixture.root / ("file-" + std::to_string(i)));
+    {
+        std::ofstream empty(fixture.root / "empty", std::ios::binary);
+    }
+    same::Config config;
+    config.backend = "cuda";
+    config.workers = config.metadata_workers = 1;
+    config.gpu_min_bytes = 0;
+    config.memory_bytes = config.device_memory_bytes = 128 * 1024 * 1024;
+    std::atomic<unsigned> factories{};
+    same::Resources resources(config,
+                              [&](std::size_t, std::size_t) -> std::unique_ptr<same::Compute> {
+                                  ++factories;
+                                  return nullptr;
+                              });
+    same::Store store(fixture.root / ".same" / "state.db");
+    same::Counters empty;
+    same::scan(fixture.root, config, store, resources, empty, false);
+    require(empty.scanned == 1 && empty.hashed == 1 && factories == 0,
+            "empty input initialized a device");
+    const auto record = store.cached("empty");
+    require(record && same::hex_digest(record->digest) ==
+                          "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+            "empty scan changed the BLAKE3 empty vector");
+    {
+        std::ofstream content(fixture.root / "nonempty", std::ios::binary);
+        content << "abc";
+    }
+    same::Counters later;
+    same::scan(fixture.root, config, store, resources, later, false);
+    require(later.scanned == 2 && later.cached == 1 && later.hashed == 1 && factories == 1,
+            "empty input consumed the later device initialization opportunity");
+    const auto actual = store.cached("nonempty");
+    require(actual && same::hex_digest(actual->digest) ==
+                          "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+            "post-empty scan changed the BLAKE3 abc vector");
 }
 } // namespace
 
@@ -232,8 +214,7 @@ int main() {
     try {
         scan_overlaps_startup();
         empty_before_eligible();
-        startup_boundary(false);
-        startup_boundary(true);
+        missing_device_scan();
         std::cout << "async scan tests passed\n";
         return 0;
     } catch (const std::exception& error) {
