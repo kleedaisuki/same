@@ -244,36 +244,32 @@ rehash = false
 | `telemetry_retention_runs` | `64` | 1–4096；包含本轮 / Retained runs including current |
 | `telemetry_max_events` | `16384` | 1–1000000；每轮队列事件上限，不含最终快照 / Per-run queued-event cap, excluding final snapshot |
 
-`auto` 保留全部 `workers` 路 CPU SIMD，首个未缓存的合格文件后台初始化独立 GPU 服务。
-默认小于 16 MiB 直接 CPU；资格仅由 `gpu_min_bytes` 控制，不再随 CPU 的 `block_bytes` 改变。
-GPU 默认独立采用 16 MiB 更新块，预算不足时降级或停用 GPU，不使合法 CPU 配置失效。
-启动仅执行最小设备正确性检查，不运行合成性能校准；在线模型仅从真实成功任务学习。
-未知区间先用静态偏好：合格文件达到 64 MiB 时 GPU 优先，其余 CPU 优先。
-在线模型结合真实任务统计、设备预计等待时间与预测误差选择后端；在任务边界双向互助，
-不迁移正在计算的摘要。初始化有成本，不保证短批次获益。
+`auto` 使用固定 `workers` 个统一工作线程，共享一个先入先出任务队列；每个线程根据自己的真实任务统计选择 CPU SIMD 或自己的 CUDA 执行流（stream）。没有额外 GPU 服务线程，也没有中央模型训练锁。
+默认小于 16 MiB 直接 CPU；资格仅由 `gpu_min_bytes` 控制，与 CPU `block_bytes` 无关。
+主机与显存总预算按线程分摊，GPU 按需初始化；预算不足时降级块大小或停用该线程 GPU。
+自动模式首次设备初始化期间，其他线程先用 CPU；就绪后各自 GPU 流可并发，不设置稳态单 GPU 门槛。
+启动只检查设备正确性，不运行合成性能校准；正常成功任务更新本地模型。可恢复设备错误回退 CPU，验证不一致等非设备异常仍使扫描失败。
+多流共享同一 GPU 主上下文（primary context），不等于多块 GPU；本地学习可能受样本分散和设备争用影响，不保证全局最优或短批次收益。
 
-Auto keeps all CPU workers and lazily initializes a separate budgeted GPU service. Eligibility depends
-on `gpu_min_bytes`, not CPU block size. GPU prefers an independent 16 MiB update block. Online routing
-combines observed task costs, estimated waits and prediction error; assistance occurs at job boundaries.
-Startup checks correctness without synthetic performance calibration. Only real successful tasks train
-the model; unknown bands start with GPU preference at 64 MiB and CPU preference below, subject to eligibility.
-Setup is not free and short batches need not benefit.
+Auto uses exactly `workers` unified workers and one FIFO. Each chooses CPU SIMD or its own CUDA stream from worker-local observations, without an extra GPU service or centralized training lock.
+Eligibility remains independent of CPU block size. Total host/device budgets are divided across workers; GPU initialization is lazy with budgeted fallback.
+During auto cold startup, peers run CPU; once ready, private GPU streams remain concurrent without a steady-state single-GPU gate. Startup checks correctness without synthetic performance calibration. Streams share one device primary context; fragmented samples and contention limit prediction quality and no global-optimality/speedup claim is made.
 
 `pgo=true` 默认启用运行时剖析引导优化（profile-guided optimization, PGO）。
 `--no-pgo` 覆盖配置，关闭采样、学习和模型决策，保留设备正确性检查与静态分流：
-合格文件达到 64 MiB 时 GPU 优先，其余 CPU 优先，忙时仍可互助。它不是 `--cpu`，
+合格文件达到 64 MiB 时选择该线程可用的 GPU，其余 CPU。它不是 `--cpu`，
 也不改变编译器 PGO。`--summary` 仅控制统计是否显示，不启停模型。
 
 Runtime PGO defaults on. `--no-pgo` disables sampling, learning and model
 placement, not device correctness checks or GPU support. Static eligible files at least 64 MiB prefer
-GPU, smaller eligible files prefer CPU, with busy-device assistance. This is neither forced CPU nor a
+GPU when available to that worker; smaller eligible files use CPU. This is neither forced CPU nor a
 compiler PGO switch. Summary visibility is independent of analyzer operation.
 
-详见[自动分流契约](docs/auto-dispatch.md)、[在线模型研究](docs/online-routing-design.md)与
+详见[自动分流契约](docs/auto-dispatch.md)、[统一线程设计](docs/unified-worker-design.md)与
 [实验计划](docs/online-routing-experiment-plan.md)。 / See the routing contract, research design and
 experiment plan; historical benchmarks do not establish the new model's speedup.
 
-完整实测、开销与限制见 [验证报告](docs/online-routing-validation.md)。 / See the validation report for measurements, overhead and limitations.
+先前中央模型的历史实测见 [旧架构验证报告](docs/online-routing-validation.md)，不作为当前线程私有模型的性能证明。 / Earlier centralized-model measurements are historical, not performance evidence for the current worker-private architecture.
 
 ### 有界扫描流水线 / Bounded scanning pipeline
 

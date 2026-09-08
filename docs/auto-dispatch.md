@@ -1,172 +1,87 @@
-# 在线剖析引导分流 / Online profile-guided dispatch
+# 统一线程在线分流 / Unified-worker online dispatch
 
-本文件说明当前运行时契约。旧版固定偏好与累计 4 GiB 门槛均不是本模型。
-研究依据见[在线模型设计](online-routing-design.md)，验收方案见
-[实验计划](online-routing-experiment-plan.md)。历史报告只证明各自版本的行为。
-This describes the runtime contract, not the former fixed-preference or aggregate-volume policy.
-Historical measurements do not establish this model's performance.
+本文件描述当前生产契约。设计与研究依据见 [统一线程设计](unified-worker-design.md)。旧 N+1 服务、中央最早完成时间（earliest finish time, EFT）模型及相关性能报告是历史版本，不证明本实现的性能。
 
-## 资格、缓冲与后端 / Eligibility, buffers and backends
+This is the current production contract. The former N+1 service, centralized EFT model and its benchmarks are historical, not evidence for this implementation.
 
-CPU 使用上游 BLAKE3 单指令多数据运行时分派（SIMD runtime dispatch）。CPU 块默认
-1 MiB；自动 GPU 资格下界仅为 `gpu_min_bytes`，默认 16 MiB，与 CPU 块无关。
-零长度文件保持 CPU；门槛设为零不代表每项任务都应该去 GPU。
-CPU uses upstream SIMD. Its default block is 1 MiB; the independent eligibility floor defaults to
-16 MiB. Empty files stay CPU; removing the floor does not force GPU placement.
+## 固定线程与队列 / Fixed workers and queue
 
-GPU 服务优先采用独立 16 MiB 更新块；剩余预算不足时使用可容纳的降级块，仍不足则仅
-停用自动 GPU。CPU 工作者预算与额外 GPU 缓冲均需满足既有资源限制，预算不是进程内存硬上限。
-The GPU service prefers a separate 16 MiB block, then tries `min(block_bytes, 16 MiB)`, disabling only
-automatic GPU if no supported block fits. Existing valid CPU configurations remain valid; budgets are
-not process-memory hard limits.
+`workers=N` 创建恰好 N 个内容工作线程，一个有界先入先出（first-in, first-out, FIFO）队列。线程取出任务后，在队列锁外使用自己的模型选择 CPU SIMD 或自己的 CUDA 流。模型预测、学习和探索计数均为线程私有；中央锁仅用于队列和活动数，不训练模型。完成顺序不要求等于取出顺序，关闭时排空已接纳任务。
 
-- 保留全部 N 路 CPU，加最多一路 GPU，不把 CPU 通道改造成 GPU 通道。
-  Keep N CPU lanes plus at most one independent GPU service.
-- 小于资格下界的文件与比较任务永不进入自动 GPU 队列。
-  Ineligible hashes and comparison tasks never enter automatic GPU execution.
-- 显式 `backend="cpu"` 不初始化 CUDA；显式 `backend="cuda"` 保留原有强制选择契约。
-  Explicit CPU avoids CUDA; explicit CUDA preserves its existing selection contract.
+Exactly N workers share one bounded FIFO. After dequeue, workers choose their own CPU/CUDA backend outside the queue lock. Prediction, learning and exploration are local; shared locking handles handoff/activity only. Shutdown drains admitted work; completion order need not match dequeue order.
 
-## 冷启动与设备验证 / Startup and device validation
+不存在单独 GPU 队列、额外 GPU 工作线程、全局忙闲切换或全局等待时间预测。多个工作线程可在同一设备主上下文（primary context）中使用各自执行流（stream）。实际重叠受 GPU、PCIe、内存和磁盘争用影响，流数量不是 GPU 数量。
 
-首个未缓存的合格文件触发后台初始化；CPU 继续工作。初始化期间最多保留一个最大候选
-句柄，不预读其内容；结束或异常展开时等待初始化线程，不让后台访问已销毁状态。
-纯小文件或全缓存扫描不初始化 GPU。
-The first uncached eligible file triggers background startup while CPUs continue. At most one largest
-candidate handle is retained without prefetch; completion/unwinding joins startup. Small-only and
-cache-only scans do not initialize GPU.
+There is no dedicated GPU queue/thread or global wait prediction. Worker streams share the device primary context; overlap remains subject to compute/transfer/memory/storage contention.
 
-生产扫描无论启用还是禁用 PGO，启动时均不运行合成性能校准，只执行
-`min(GPU_block_bytes, 64 KiB)` 输入的最小后端正确性检查。不会向在线模型播种合成性能
-先验；设备正确性通过不等于已知该设备的任务速度。启动成本仍计入扫描和总耗时。
-Both PGO modes use only a minimal backend correctness check with `min(GPU_block_bytes, 64 KiB)` input.
-Production startup does not run synthetic performance calibration or seed synthetic model priors.
-A valid device does not imply known task performance. Setup remains charged to scan and elapsed time.
+## 资格与预算 / Eligibility and budgets
 
-独立校准辅助函数仍用于测试、基准和兼容用途，并保留完整局部证据；它不属于生产扫描
-启动路径。因此旧两秒软预算与块级/长流探测不再解释当前运行时行为。
-The separate calibration helper retains complete partial evidence for tests, benchmarks and compatibility,
-but is not on production scan startup. Its former two-second budget and shape probes do not describe
-current runtime startup.
+CPU 使用上游 BLAKE3 单指令多数据运行时分派（SIMD runtime dispatch），默认块 1 MiB。文件 GPU 资格仅由 `gpu_min_bytes` 控制，默认 16 MiB；零长度文件留 CPU。它不是通用性能交叉点，CPU 块变化不改变资格。
 
-## 在线模型 / Online model
+CPU uses upstream BLAKE3 SIMD with a default 1 MiB block. GPU eligibility defaults to 16 MiB independently of CPU block size; empty files stay CPU. This is an eligibility policy, not a universal speed crossover.
 
-每个后端维护 32 个四倍大小区间，覆盖 uint64 大小范围。各区间保存每字节服务成本与
-绝对残差的指数加权移动平均（Exponentially Weighted Moving Average, EWMA），系数 1/8。
-只使用同后端同区间证据，不向未知区间无条件外推；生产模型仅学习真实成功文件样本。
-Each backend has 32 factor-four bands with per-byte cost/residual EWMA, alpha 1/8. Predictions remain
-within the same backend and band; production learning uses only real successful file observations.
+令 `B=block_bytes`，`H(b)=2b+b/32+4096`。首先为全部 CPU 线程保留 `N*H(B)`；自动 GPU 的每线程主机配额为 `floor((memory_bytes-N*H(B))/N)`。从 16 MiB 开始逐次减半选择可容纳的 GPU 块，最小 1 KiB；仍不满足则该配置不初始化自动 GPU。显存配额为 `floor(device_memory_bytes/N)`，不把总预算授予每个线程。显式 CUDA 复用 CPU 输入缓冲。预算限制工作缓冲，不是进程总内存硬上限。
 
-启用和禁用模式都使用相同初始静态偏好：合格文件达到 64 MiB 时 GPU 优先，其余 CPU
-优先。启用模式在取得统计后用在线预测改进选择，未知成本不是零成本。
-Both modes start with the same static preference: eligible files at least 64 MiB prefer GPU, smaller
-eligible files prefer CPU. Enabled mode refines placement as observations arrive; unknown is not zero.
+CPU reservations precede equal division of remaining host quota. Auto GPU block size halves from 16 MiB down to 1 KiB until its reservation fits. Device quota is total/N. Forced CUDA reuses CPU input buffers. These are working-buffer budgets, not process-memory limits.
 
-预计完成时间（Earliest Finish Time, EFT）结合可用等待、预计服务时间与误差余量：
+## 惰性初始化与失败 / Lazy initialization and failure
 
-`finish(d, s) = estimated_wait(d) + predicted_service(d, s) + uncertainty_margin(d, s)`
+只有线程首次选择 GPU 时，才在该线程初始化自己的后端。自动模式首个冷设备初始化用一次性 `cold/initializing/ready` 状态协调；其他线程遇到 initializing 时先执行 CPU，计入 `cold_start_cpu`，不会永久标记自身 GPU 不可用。ready 后各线程私有 GPU 流仍可并发，没有稳态单 GPU 准入门。显式 CUDA 不应用此冷启动协调。不是额外后台初始化服务，也不保留一个额外的大文件候选。其他线程继续执行，纯小文件和缓存命中不要求初始化 GPU。初始化执行至多 64 KiB 的正确性检查，不做合成性能校准或注入合成训练先验；初始化耗时单独逐线程记录，仍属于扫描时间。
 
-CPU 等待来自最早可接手的工作线程，不是所有 CPU 工作量的串行和。预测误差与滞回
-（hysteresis）抑制噪声，但不是统计置信区间。未知区间需要静态后备与受限探索，
-不能把未知当成零成本。设备竞争共享磁盘与内存，因此模型不保证调度最优。
-CPU waits concern the earliest available lane, not the sum across lanes. Residual margins and hysteresis
-are engineering safeguards, not confidence intervals. Unknown bands require bounded exploration or
-static fallback, never fictional zero costs. Shared I/O and memory contention limit optimality claims.
+Each worker lazily initializes its backend when it first selects GPU. Auto uses a one-time cold/initializing/ready transition: peers run CPU while initializing without marking their GPUs unavailable. After ready, private GPU streams remain concurrent; there is no steady-state admission gate. Forced CUDA bypasses this policy. There is no extra startup service or retained candidate. Startup validates at most 64 KiB without synthetic timing calibration/seeding; setup is measured per worker and remains scan work.
 
-未知区间最初最多允许两次 GPU 探索选择，要求 GPU 空闲且 CPU 全忙或初始 GPU 静态偏好。
-每区间每 64 次合格任务到达发出一次探索机会，CPU/GPU 交替，各后端每 128 次一次；
-仅在目标后端空闲时采用，否则按正常模型调度。机会绑定任务，队尾回收可能使机会不被
-执行，因此不保证每周期获得样本。`pgo_exploration_jobs` 计数实际探索选择，不是成功样本。
-Unknown bands allow at most two initial idle-GPU explorations when CPU is saturated or initial static
-preference favors GPU. Every 64 eligible arrivals per band offers alternating CPU/GPU exploration
-(each backend once per 128). Opportunities are best-effort and require a free target; tail reclamation
-may consume an opportunity without a sample. The counter measures actual exploration selections,
-not successful observations.
+CUDA 不可用或可恢复的设备计算错误使该线程回到 CPU，不停掉其他线程的 GPU。非设备初始化异常（如内存分配错误）通过任务传播，正常使扫描失败并保留原错误。计算失败必须从文件开头完整重读重算，不拼接摘要中间态。正确性检查摘要不一致是错误，不当作性能不佳静默接受。极小降级缓冲可能只覆盖后端主机叶块路径，不能仅凭检查通过声称 GPU 核函数已执行。
 
-预测过期但设备仍忙时，空闲对端可以回收任务；仅在有合格排队任务时使用预测期限唤醒。
-关闭线程池必须排空已接受任务，GPU 故障不能导致 CPU 提前退出。
-Overdue predictions permit idle-peer reclamation, with deadline wakeups only for eligible queued work.
-Shutdown drains admitted tasks even if the GPU retires.
+Unavailable CUDA or recoverable compute errors fall back on that worker only. Other initialization exceptions propagate unchanged and fail the scan. Compute failure rereads/recomputes the whole file on CPU. A correctness mismatch is an error, not a slow-device observation. Tiny fallback buffers may exercise host leaves only and do not prove a GPU kernel ran.
 
-## 关闭分析器 / Disable the analyzer
+## 本地模型与选择 / Local model and selection
 
-配置 `pgo=true` 默认开启运行时剖析引导优化（profile-guided optimization, PGO）。
-命令行 `--no-pgo` 覆盖为 false，仅适用于扫描。它关闭任务采样、统计学习和
-模型决策，但保留最小设备正确性检查、CUDA 错误回退以及既有汇总计时。
-Runtime PGO defaults on. Scan-only `--no-pgo` overrides configuration and disables
-sampling, learning and model decisions, not minimal device checks, error fallback or existing summary clocks.
+每线程有 CPU/GPU 各 32 个四倍大小区间，保存每字节服务时间和绝对残差的指数加权移动平均（exponentially weighted moving average, EWMA），alpha=1/8。只学习真实成功且无回退的哈希任务；不把比较和失败样本混入。预测仅使用同线程、同后端、同大小区间证据。
 
-禁用后使用静态策略：不合格文件仅 CPU；合格文件小于 64 MiB 时 CPU 优先，达到 64 MiB
-时 GPU 优先；CPU 全忙时 GPU 可接手，GPU 忙时 CPU 可接手。它不等于 `--cpu`，也不改变
-编译器 PGO。`--summary` 仅控制是否显示统计，不改变分析器是否运行。
-Disabled mode uses static eligibility and a 64 MiB preference boundary with bidirectional busy-device
-assistance. It is neither forced CPU nor compiler PGO. Summary visibility does not enable or disable learning.
+Each worker owns 32 factor-four bands per backend with per-byte cost/error EWMA, alpha=1/8. Only successful unretried hashes train normal cost. Evidence remains local to worker/backend/band.
 
-## 持续剖析与汇总 / Continuous profiling and summary
+两个后端均已知时选 GPU 当且仅当：
 
-持续剖析（continuous profiling）是任务级、有界、进程内聚合，不是操作系统调用栈采样器。
-复用已有哈希任务墙钟计时与完成锁，不逐块计时、不逐文件记录路径、不写入摘要数据库。
-正常成功任务才训练后端模型，失败重试与比较不混入正常样本。
-合格文件逐任务采样，较小文件每工作线程每 64 项采样一次；禁用时不产生模型样本。
-Task-level profiling reuses job wall clocks and completion synchronization. It is not an OS stack sampler,
-per-block timer, per-file path log or database trace. Failures/retries and comparisons do not train normal
-hash costs. Eligible files are sampled per job; smaller files are sampled once per 64 jobs per worker.
-Disabled profiling produces no model observations. Aggregation remains bounded in memory.
+```text
+GPU_service + GPU_error < 0.95 * CPU_service - CPU_error
+```
 
-`--summary` 展示开关状态、后端样本数、已知区间、预测残差与延迟分布。分布采用有界
-直方图（histogram），桶值不是精确分位数；所有任务墙钟时间包含 I/O 等待，不是 CPU 时间
-或 GPU 核函数时间。没有真实观测不等于零耗时，没有模型样本不等于没有执行哈希。
-Summary exposes enabled state, backend observations, known bands, residuals and bounded latency histograms.
-Bucket percentiles are approximate; job durations include I/O rather than measuring CPU or kernel time.
-No observations are not zero cost, and zero model samples do not imply zero hashing.
+这是服务成本比较，不含虚构的独立 GPU 队列等待；5% 滞回（hysteresis）和残差是工程保护，不是置信区间或全局最优保证。任务已经由该线程领取，不会迁移进行中的摘要。
 
-| 汇总字段 / Summary field | 解释 / Meaning |
+This compares service costs after the task is claimed, not global finish times. Residuals and a 5% margin are safeguards, not confidence bounds or optimality guarantees. In-progress hashes are never migrated.
+
+未知区间先用静态偏好：合格文件达到 64 MiB 选 GPU，否则 CPU。启用 PGO 时，每线程每区间对两个后端各最多两次初始探索；已有一端证据时尝试未知端。每 64 次合格到达提供一次周期探索，CPU/GPU 交替；GPU 不可用仍退 CPU。探索计数不是成功样本数。不同线程的机会不合并，样本碎片化与并发探索可能增加成本。
+
+Unknown bands use a 64 MiB static preference boundary. PGO allows up to two initial explorations per backend per worker-band and alternating periodic exploration every 64 eligible arrivals. Unavailable GPU falls back. Opportunities are local and are not successful observations; fragmentation/concurrent exploration have costs.
+
+## 开关、剖析和遥测 / Switches, profiling and telemetry
+
+`--no-pgo` 关闭运行时剖析引导优化（profile-guided optimization, PGO）的采样、学习和模型选择；静态资格/64 MiB 偏好、设备正确性检查与 CPU 回退仍有效。它不是 `--cpu`，不改变编译器 PGO。`--no-telemetry` 只关闭独立遥测库入库，`--summary` 只控制本轮展示；三者独立。
+
+No-pgo disables runtime sampling/learning/model selection, not static routing or correctness/fallback. It is not forced CPU or compiler PGO. No-telemetry controls persistence and summary controls current-run presentation independently.
+
+持续剖析（continuous profiling）复用任务墙钟时间，不是系统调用栈采样。合格哈希逐任务采样，较小文件每线程每 64 项一次；不逐块增加时钟或遥测写入。耗时包含 I/O 与设备争用，不是 CPU 时间或 GPU 核函数时间。不同采样率与后端选择使观测分布存在选择偏差。
+
+Task-level profiling reuses wall clocks, not OS stack sampling. Eligible hashes are sampled; smaller files are sampled every 64 jobs per worker. No per-block instrumentation is added. Times include I/O/contention and sampling/placement introduce selection bias.
+
+## Summary 口径 / Summary semantics
+
+| 字段 / Field | 含义 / Meaning |
 |---|---|
-| `calibration_stop` | 设备检查后为 `not-run-device-checked`；未运行合成性能校准 / Device validated, synthetic performance calibration not run |
-| `pgo_enabled` | 运行时分析器开关 / Runtime analyzer enabled |
-| `pgo_exploration_jobs` | 实际探索选择数，不等于成功样本 / Actual exploration selections, not successful samples |
-| `pgo_samples`, `pgo_cpu_samples`, `pgo_gpu_samples` | 成功任务观测，不含校准 / Successful task observations, excluding calibration |
-| `pgo_cpu_known_bands`, `pgo_gpu_known_bands` | 真实文件观测覆盖区间 / Bands covered by real file observations |
-| `pgo_predicted_samples`, `pgo_mae_ms` | 可检验预测数、绝对误差 EWMA；未知显示 unknown / Checked predictions and absolute-error EWMA; unknown is explicit |
-| `pgo_rejected_samples` | 模型拒绝的不合法观测 / Invalid observations rejected by the model |
-| `pgo_latency_p50_bucket_us`, `pgo_latency_p95_bucket_us` | 已采样服务时间的近似分位桶范围 / Approximate sampled-service percentile bucket ranges |
-| `pgo_residual_p95_bucket_us` | 预测绝对残差的近似分位桶范围 / Approximate absolute-residual percentile bucket range |
+| `scheduler=worker-local`, `single_queue=1`, `worker_count` | 固定线程私有决策与单队列 / Fixed local decision ownership |
+| `pgo_samples`, `pgo_cpu_samples`, `pgo_gpu_samples` | 全线程成功样本累计 / Summed local successful observations |
+| `pgo_cpu_known_bands`, `pgo_gpu_known_bands` | 已知线程×区间单元，每后端上限 N×32 / Worker-band coverage, not one global model |
+| `pgo_predicted_samples` | 可验证预测累计 / Predictions checked across workers |
+| `worker.<id>.local_error_ewma_ms` | 本地误差 EWMA，不是全局误差 / Local error only |
+| `worker.<id>.cpu_hashes`, `.gpu_hashes` | 后端尝试，包含回退尝试 / Attempts including retries |
+| `worker.<id>.cold_start_cpu` | 首次设备初始化期间暂走 CPU 的选择数，不是永久不可用 / Temporary CPU selections during cold startup |
+| `worker.<id>.setup_ms`, `.gpu_init_failures`, `.fallbacks` | 逐线程初始化与失败 / Local startup/failure |
+| `pgo_latency_p50_bucket_us`, `pgo_latency_p95_bucket_us`, `pgo_residual_p95_bucket_us` | 合并计数的近似分位桶 / Approximate pooled histogram percentiles |
 
-直方图共 32 桶，按 `floor(log2(microseconds))` 聚合，两端饱和。样本分布不是全部文件的
-无偏分布：不同大小采样率不同，且后端选择会影响可见样本。
-Histograms have 32 logarithmic microsecond buckets with saturated ends. Different sampling rates and
-backend selection mean the sample distribution is not an unbiased distribution over every file.
+直方图共 32 个 `floor(log2(us))` 桶，两端饱和。空闲后只聚合计数与桶，不把各线程 EWMA 当作一个全局训练模型。逐线程决策原因、后端字节和并发观测也显示/保存。并发计数覆盖“选择 GPU 的任务”生命周期，包含文件 I/O，不是内核忙碌数；`contended_samples` 仅标记选择时已观察到其他 GPU 任务的样本，不是整个服务区间重叠的完整检测。遥测导出 `worker.<id>.model.cpu/gpu.<band>` 的全部 64 个区间，见 [遥测文档](telemetry.md)。不自动从旧库加载模型。
 
-**不承诺字面零开销或整盘加速。** 必须对照启用/禁用和 CPU 模式，报告决策成本、流水线
-与整轮时间、输出一致性及缓存条件。完整实验方案见链接，尚未实测的结果不在此宣称通过。
-No literal zero-overhead or whole-drive speedup is promised. Controlled ablations must report decision
-cost, pipeline/end-to-end time, output equality and cache conditions; unmeasured gates are not passes.
+Thirty-two saturated log2-microsecond buckets are pooled after idle; local EWMAs remain distinct. Concurrency counts GPU-selected task lifetimes including I/O, not active kernels. contended_samples checks overlap only at selection, not across the full interval. Worker decisions/bytes/concurrency and all model bands are retained in telemetry, never auto-loaded into future runs.
 
-## 兼容与失败 / Compatibility and failure
+未知或已移除配置字段静默忽略；支持字段仍校验类型和预算，TOML 仍须合法。**不承诺零开销或普遍加速。** 应分别验证摘要一致性、资源上限、线程隔离和真实负载性能；历史中央模型报告不是当前架构的通过证明。
 
-配置只解析当前受支持字段，不保留旧字段的专用兼容解析逻辑。
-未知或已移除字段（包括 `gpu_probe_bytes`）静默忽略，不检查其值的类型或范围；
-整个文件仍须满足 TOML 语法与大小限制，受支持字段仍严格校验类型与预算。
-CUDA 不可用则 CPU；GPU 计算错误完整重读并 CPU 重试，不拼接后端部分状态。
-失败服务退休，由已预算的 CPU 工作者排空任务。摘要不匹配必须失败，不能接受为有效结果。
-Configuration parses only currently supported fields, with no dedicated legacy-field compatibility parsing.
-Unknown or removed fields (including `gpu_probe_bytes`) are silently ignored without checking their value types
-or ranges. The file must still satisfy TOML syntax and size limits; supported fields retain strict type and budget validation.
-Unavailable CUDA uses CPU; GPU failures retry fully
-from the beginning on CPU. A failed service retires rather than becoming an extra unbudgeted CPU lane.
-Digest mismatches fail, never silently becoming valid results.
-
-两种 PGO 模式的正确性检查均使用至多 64 KiB 输入；默认 GPU 缓冲足以覆盖真实内核路径。极小的预算降级缓冲可能仅执行该后端的主机叶块路径，不据此声称 GPU 内核已执行。
-In both PGO modes, correctness checks use up to 64 KiB; default buffers exercise the device kernel. Tiny budget-fallback buffers can use only the backend host-leaf path, so validation alone does not universally prove a kernel launch.
-
-### 实际选择不等式 / Implemented comparison
-
-两端都有有效预测时，选择 GPU 的条件为：
-
-`GPU_wait + GPU_service + GPU_error < 0.95 * (CPU_wait + CPU_service) - CPU_error`
-
-这是带 5% 滞回的保守优势判定，不是对称的置信区间，也不保证全局最优。等待时间来自
-正在运行任务的剩余预测，未构建所有排队任务的完整离线排程；过期预测由可用对端接手。
-With both predictions known, this conservative comparison requires a five-percent margin. It is not
- a symmetric confidence interval or global optimality guarantee. Wait estimates concern in-flight
- residuals, not a complete offline schedule of all queued work; overdue predictions yield to the peer.
+Unknown/removed settings are ignored; supported types/budgets and TOML validity remain checked. No zero-overhead/universal-speedup claim. Historical centralized-model reports do not validate this architecture.

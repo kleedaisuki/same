@@ -101,7 +101,7 @@ WHERE run_id = (SELECT run_id FROM latest_run) ORDER BY category, name;
 -- 已学习的每个大小区间；保留字符串精度 / Learned bands with preserved text precision.
 SELECT category, name, value FROM parameters
 WHERE run_id = (SELECT run_id FROM latest_run)
-  AND (category LIKE 'model.cpu.%' OR category LIKE 'model.gpu.%')
+  AND (category LIKE 'worker.%.model.cpu.%' OR category LIKE 'worker.%.model.gpu.%')
 ORDER BY category, name;
 
 -- 原始直方图桶计数 / Raw histogram bucket counts.
@@ -116,17 +116,25 @@ SELECT config_json FROM latest_run;
 
 ## 参数、采样和解释边界 / Parameters, sampling and interpretation
 
-`metrics.unit` 显式区分 `ms`、`count`、`bool`、`bytes` 和 `MiB/s`；例如 `dispatch.setup_ms` 与 `pgo.mean_absolute_error_ms` 为 `ms`，`pgo.samples` 为 `count`。整数汇总转为 SQLite REAL，超过 2^53 的整数可能不再精确；模型样本参数以文本存储以保留原值。
+`metrics.unit` 显式区分 `ms`、`count`、`bool`、`bytes` 和 `MiB/s`；例如 `worker.0.setup_ms` 与 `worker.0.pgo.mean_absolute_error_ms` 为 `ms`，`pgo.samples` 为 `count`。整数汇总转为 SQLite REAL，超过 2^53 的整数可能不再精确；模型样本参数以文本存储以保留原值。
 
 Metric units distinguish ms/count/bool/bytes/MiB/s. Numeric summaries use SQLite REAL, so integers above 2^53 may lose precision; model sample parameters remain text to preserve their exact value.
 
-最终快照保留 CPU/GPU 各 32 个大小区间，共 64 个区间的学习参数，包括未知区间；记录成本、误差、样本数和 known 状态，以及算法设置和原始延迟/残差直方图（histogram）。未知区间的零值不表示零耗时。参数是运行末态，不会跨运行自动加载为训练先验。`parameters.category` 使用 `routing`、`model`、`dispatch`、`telemetry` 和 `model.cpu.0`…`model.gpu.31`；每个区间记录 `known`、`samples`、`cost_ms_per_byte`、`error_ms_per_byte`，浮点参数以 17 位精度文本保存。直方图桶键是 `pgo.latency_bucket_us.0`…`.31` 和 `pgo.residual_bucket_us.0`…`.31`，桶索引为 `floor(log2(us))`、两端饱和，数值是次数而非微秒。
+最终快照为每个工作线程保留 CPU/GPU 各 32 个大小区间，共 `workers × 64` 个区间，包括未知区间。类别是 `worker.<id>.model.cpu.<band>` 与 `worker.<id>.model.gpu.<band>`，band 为 0–31；字段为 `known`、`samples`、`cost_ms_per_byte`、`error_ms_per_byte`。浮点参数以 17 位精度文本保存，未知零值不表示零成本，历史参数不自动加载。
+
+Each worker exports 64 CPU/GPU bands, including unknown cells. Categories use worker.<id>.model.cpu/gpu.<band>, with known/samples/cost/error fields. Seventeen-digit text preserves floating-point parameters. Unknown zero values are not zero cost; historical parameters are not loaded into new runs.
+
+`worker.<id>` 参数类别保存该线程的 `cpu_block_bytes`、`gpu_block_bytes` 与 `device_budget_bytes`。`worker.<id>.pgo.mean_absolute_error_ms` 是线程本地误差 EWMA，不再输出伪全局 EWMA。`pgo.cpu_known_bands` 与 `pgo.gpu_known_bands` 汇总的是已知“线程×区间”单元，每个后端最多 `workers × 32`。
+
+Worker parameters retain actual buffers/budget. Error EWMAs are worker-local, not global. Aggregate known-band counters count worker-band cells, up to workers × 32 per backend.
+
+原始直方图（histogram）保留汇总 `pgo.latency_bucket_us.0`…`.31` / `pgo.residual_bucket_us.0`…`.31` 和逐线程 `worker.<id>.pgo.*`；桶索引为 `floor(log2(us))`、两端饱和，数值是次数而非微秒。每线程另存 CPU/GPU 次数和逻辑字节、初始化与回退、探索和各决策原因（包括 `worker.<id>.cold_start_cpu`：自动模式一次性首设备初始化期间暂走 CPU，不等于永久停用 GPU）、选择时 GPU 在途数、峰值并发与竞争样本数。GPU 在途与峰值统计覆盖选中 GPU 的任务生命周期（含 I/O），不是实际内核忙碌数；`contended_samples` 仅在选择时观察 active>1，不能完整捕捉随后出现的区间重叠。它们用于分析样本碎片化与可能竞争，不构成全局调度模型。
+
+Histograms retain aggregate and worker-prefixed raw buckets. Bucket indices are saturated floor(log2(us)); values are counts. Per-worker work, initialization/fallback, exploration/decision reasons and concurrency metrics expose fragmentation/contention without creating a global model.
 
 写入器自身在 `parameters.category='telemetry'` 保存 8 个实际生效值：`queue_capacity`、`batch_size`、`event_cap`、`retain_runs`、`busy_timeout_ms`、`flush_interval_ms`、`schema_version`、`application_id`。它们来自写入器最终配置，例如容量 1 对应 `batch_size=1`，而非未经裁剪的配置请求值。
 
 The writer persists eight effective settings in category telemetry: queue_capacity, batch_size, event_cap, retain_runs, busy_timeout_ms, flush_interval_ms, schema_version and application_id. These reflect the actual clamped configuration, including batch_size=1 for capacity 1.
-
-The final snapshot retains all 32 size bands per CPU/GPU backend (64 total), including unknown bands: costs, errors, counts and known state, algorithm settings and raw latency/residual histograms. Unknown zero-valued bands are not zero-cost predictions. Snapshots are terminal diagnostics, not automatically reloaded training priors.
 
 哈希跨度复用已有分析器采样：合格任务采样，小任务每个工作线程每 64 次采样；它们不是所有文件的完整追踪。未采样的文件任务失败也记录 `hash.error`，不受 `--no-pgo` 抑制；开启采样时失败记录在 `hash` 错误跨度中。GPU 回退记录 `hash.fallback`。这些诊断仍受事件队列容量与上限约束，不应从缺少跨度推断“没有执行”。普通事件还可能因容量、争用和每轮上限丢弃；应先看损失计数再分析分布。模型直方图与事件数据库采样不等同，事件队列丢弃不撤销已经更新的模型。
 
