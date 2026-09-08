@@ -84,10 +84,7 @@ std::string default_config() {
         << "device_memory_bytes = " << c.device_memory_bytes
         << "\n# 任务数量上限，不是文件内容预读量 / Task-count bound, not payload prefetch\n"
         << "queue_capacity = " << c.queue_capacity << "\ngpu_min_bytes = " << c.gpu_min_bytes
-        << "\n# 旧配置兼容字段；不再阻止忙时 GPU 分流 / Retired compatibility field, not an "
-           "offload gate\n"
-        << "gpu_probe_bytes = " << c.gpu_probe_bytes << "\nbackend = \"" << c.backend
-        << "\"\nrehash = " << (c.rehash ? "true" : "false")
+        << "\nbackend = \"" << c.backend << "\"\nrehash = " << (c.rehash ? "true" : "false")
         << "\n# 运行时剖析引导路由，非编译器 PGO；不控制汇总输出 / Runtime profile-guided routing, "
            "not compiler PGO or summary output\n"
         << "pgo = " << (c.pgo ? "true" : "false") << '\n';

@@ -55,10 +55,10 @@ int main() {
     if (!rejected)
         throw std::runtime_error("invalid config accepted");
     for (const auto* invalid :
-         {"workers = 2.0\n", "workers = true\n", "rehash = 1\n", "backend = 1\n", "unknown = 1\n",
+         {"workers = 2.0\n", "workers = true\n", "rehash = 1\n", "backend = 1\n",
           "metadata_workers = 0\n", "metadata_workers = 257\n", "metadata_workers = 2.0\n",
-          "gpu_min_bytes = -1\n", "gpu_min_bytes = 1.5\n", "gpu_probe_bytes = -1\n",
-          "gpu_probe_bytes = true\n", "pgo = 1\n", "pgo = 'false'\n", "pgo = []\n"}) {
+          "gpu_min_bytes = -1\n", "gpu_min_bytes = 1.5\n", "pgo = 1\n", "pgo = 'false'\n",
+          "pgo = []\n", "workers = {}\n", "unknown = [\n"}) {
         {
             std::ofstream file(root / ".same/config.toml");
             file << invalid;
@@ -71,6 +71,20 @@ int main() {
         }
         if (!rejected)
             throw std::runtime_error("wrong config type accepted");
+    }
+    // 未知字段的值不受应用类型限制；已知字段仍须生效。
+    // Unknown values have no application type contract; supported overrides still apply.
+    for (const auto* unknown :
+         {"future = 1\n", "future = [true, 'x']\n", "gpu_probe_bytes = -1\n",
+          "gpu_probe_bytes = 'retired'\n", "[future]\nworkers = 0\npgo = 'ignored'\n"}) {
+        {
+            std::ofstream file(root / ".same/config.toml");
+            file << "workers = 2\npgo = false\n" << unknown;
+        }
+        const auto loaded = same::Config::load(root);
+        if (loaded.workers != 2 || loaded.pgo ||
+            loaded.gpu_min_bytes != same::Config{}.gpu_min_bytes)
+            throw std::runtime_error("unknown configuration changed supported defaults");
     }
     {
         std::ofstream file(root / ".same/config.toml");

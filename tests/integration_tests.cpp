@@ -472,8 +472,8 @@ void symlinks(const fs::path& exe) {
 /// creation or mutation.
 void invalid_config(const fs::path& exe) {
     Fixture f(exe);
-    for (auto text : {"workers = 0", "backend = \"typo\"", "unknown = 1", "rehash = \"yes\"",
-                      "block_bytes = 1", "workers = 256\nmemory_bytes = 1"}) {
+    for (auto text : {"workers = 0", "backend = \"typo\"", "rehash = \"yes\"", "block_bytes = 1",
+                      "workers = 256\nmemory_bytes = 1"}) {
         f.file(".same/config.toml", text);
         f.run(2);
         check(!fs::exists(f.root / ".same/state.db"), "invalid config created database");
@@ -632,8 +632,8 @@ void lifecycle_commands(const fs::path& exe) {
           "new command failed");
     const auto config = read(f.root / ".same/config.toml");
     for (const auto* key :
-         {"workers", "metadata_workers", "gpu_min_bytes", "gpu_probe_bytes", "block_bytes",
-          "memory_bytes", "device_memory_bytes", "queue_capacity", "backend", "rehash"})
+         {"workers", "metadata_workers", "gpu_min_bytes", "block_bytes", "memory_bytes",
+          "device_memory_bytes", "queue_capacity", "backend", "rehash"})
         check(config.find(std::string(key) + " =") != std::string::npos,
               "new omitted default " + std::string(key));
     check(!read(f.root / ".same/ignore").empty(), "new omitted recommended ignore");
@@ -690,10 +690,11 @@ void command_validation(const fs::path& exe) {
 /// insufficient device budget; an environment opt-in exercises a real GPU.
 void backends(const fs::path& exe) {
     Fixture f(exe);
-    f.config({{"backend", "\"auto\""},
-              {"device_memory_bytes", "1"},
-              {"gpu_min_bytes", "0"},
-              {"gpu_probe_bytes", "0"}});
+    f.config({
+        {"backend", "\"auto\""},
+        {"device_memory_bytes", "1"},
+        {"gpu_min_bytes", "0"},
+    });
     f.file("a", std::string(8192, 'f'));
     f.file("b", std::string(8192, 'f'));
     f.expect({group({"a", "b"})});
@@ -730,7 +731,7 @@ void backends(const fs::path& exe) {
     // 自动选择结果依赖硬件；无论选择如何，摘要/输出必须保持不变。
     // Auto decisions depend on hardware; digest/output correctness must not depend on the decision.
     gpu.config({{"backend", "\"auto\""},
-                {"gpu_probe_bytes", "0"},
+
                 {"gpu_min_bytes", "0"},
                 {"workers", "3"},
                 {"block_bytes", "65536"},
@@ -757,28 +758,22 @@ void size_routing(const fs::path& exe) {
     f.config({{"gpu_min_bytes", "0"}, {"rehash", "true"}});
     f.expect(expected);
     check(f.stats["cpu_routed_hashes"] == 0 && f.stats["hashed"] == 4, "size route disabled");
-    // 小载荷资格下界，而不是退役的批次字节门槛，阻止设备初始化。
-    // The payload floor, not the retired volume gate, prevents GPU setup for small files.
-    f.config({{"backend", "\"auto\""},
-              {"gpu_min_bytes", "4097"},
-              {"gpu_probe_bytes", "0"},
-              {"rehash", "true"}});
+    // 小载荷资格下界阻止不必要的设备初始化。
+    // The payload floor prevents unnecessary GPU setup for small files.
+    f.config({{"backend", "\"auto\""}, {"gpu_min_bytes", "4097"}, {"rehash", "true"}});
     f.expect(expected);
     check(f.stats["gpu_workers"] == 0 && f.stats["calibration_ms"] == 0 &&
               f.stats["gpu_setup_ms"] == 0 && f.stats["cpu_hashes"] == 4,
           "below-floor payloads must not pay CUDA setup or calibration");
     check(read(f.base / "stderr").find("using CPU fallback") == std::string::npos,
           "intentional auto CPU policy must not report unavailable CUDA");
-    f.config({{"backend", "\"auto\""},
-              {"gpu_min_bytes", "0"},
-              {"gpu_probe_bytes", "4294967296"},
-              {"rehash", "true"}});
+    f.config({{"backend", "\"auto\""}, {"gpu_min_bytes", "0"}, {"rehash", "true"}});
     f.expect(expected);
     check(f.stats["cpu_hashes"] + f.stats["gpu_hashes"] == 4 && f.stats["cpu_fallbacks"] == 0,
           "adaptive attempts or retry accounting changed");
     if (std::getenv("SAME_REQUIRE_CUDA"))
         check(f.stats["gpu_workers"] == 1 && f.stats["gpu_setup_ms"] > 0,
-              "retired volume gate still blocks eligible work");
+              "eligible work did not initialize the available device");
     f.config({{"backend", "\"auto\""}, {"gpu_min_bytes", "0"}});
     f.expect(expected);
     check(f.stats["cached"] == 4 && f.stats["gpu_workers"] == 0 && f.stats["gpu_setup_ms"] == 0,

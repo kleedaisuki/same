@@ -107,7 +107,6 @@ same::Config config() {
     result.queue_capacity = 8;
     result.block_bytes = 1024;
     result.gpu_min_bytes = 1024;
-    result.gpu_probe_bytes = 0;
     result.memory_bytes = 32768;
     return result;
 }

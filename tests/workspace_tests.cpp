@@ -55,9 +55,10 @@ int main() {
                   loaded.device_memory_bytes == defaults.device_memory_bytes &&
                   loaded.queue_capacity == defaults.queue_capacity &&
                   loaded.gpu_min_bytes == defaults.gpu_min_bytes &&
-                  loaded.gpu_probe_bytes == defaults.gpu_probe_bytes &&
                   loaded.backend == defaults.backend && loaded.rehash == defaults.rehash,
               "all defaults round trip");
+        check(config.find("gpu_probe_bytes") == std::string::npos, "retired field generated");
+        check(loaded.pgo == defaults.pgo, "PGO default round trip");
         std::ofstream(root / ".same/ignore", std::ios::binary) << "custom\n";
         same::initialize_workspace(root);
         check(read(root / ".same/config.toml") == config &&

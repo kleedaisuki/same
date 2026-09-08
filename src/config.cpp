@@ -42,14 +42,8 @@ Config Config::load(const std::filesystem::path& root) {
     if (!contents)
         return result;
     const auto table = toml::parse(*contents);
-    for (const auto& [key, node] : table) {
-        const auto name = key.str();
-        if (name != "workers" && name != "metadata_workers" && name != "block_bytes" &&
-            name != "memory_bytes" && name != "device_memory_bytes" && name != "queue_capacity" &&
-            name != "backend" && name != "rehash" && name != "gpu_min_bytes" &&
-            name != "gpu_probe_bytes" && name != "pgo")
-            throw std::runtime_error("unknown configuration key: " + std::string(name));
-    }
+    // 仅读取明确支持的字段；未知字段（含旧版本字段）不参与校验。
+    // Read supported fields only; unknown fields, including retired settings, are ignored.
     auto number = [&](const char* name, std::size_t& target) {
         if (!table.contains(name))
             return;
@@ -62,12 +56,6 @@ Config Config::load(const std::filesystem::path& root) {
     number("workers", result.workers);
     result.metadata_workers = std::min<std::size_t>(result.workers, 4);
     number("metadata_workers", result.metadata_workers);
-    if (table.contains("gpu_probe_bytes")) {
-        const auto value = table["gpu_probe_bytes"].value_exact<std::int64_t>();
-        if (!value || *value < 0)
-            throw std::runtime_error("gpu_probe_bytes must be a nonnegative integer");
-        result.gpu_probe_bytes = static_cast<std::uint64_t>(*value);
-    }
     if (table.contains("gpu_min_bytes")) {
         const auto value = table["gpu_min_bytes"].value_exact<std::int64_t>();
         if (!value || *value < 0 ||

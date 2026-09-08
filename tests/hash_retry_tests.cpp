@@ -244,7 +244,6 @@ void routed_file_hash(bool inject_failure, bool profiling = true) {
     cfg.block_bytes = 4096;
     cfg.gpu_min_bytes = 0;
     cfg.pgo = profiling;
-    cfg.gpu_probe_bytes = 0;
     cfg.memory_bytes = 64 * 1024 * 1024;
     auto fail = std::make_shared<std::atomic<bool>>(false);
     same::Resources pool(

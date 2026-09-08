@@ -144,10 +144,15 @@ cost, pipeline/end-to-end time, output equality and cache conditions; unmeasured
 
 ## 兼容与失败 / Compatibility and failure
 
-`gpu_probe_bytes` 继续接受为退役兼容键，不再以累计 4 GiB 决定初始化。
+配置只解析当前受支持字段，不保留旧字段的专用兼容解析逻辑。
+未知或已移除字段（包括 `gpu_probe_bytes`）静默忽略，不检查其值的类型或范围；
+整个文件仍须满足 TOML 语法与大小限制，受支持字段仍严格校验类型与预算。
 CUDA 不可用则 CPU；GPU 计算错误完整重读并 CPU 重试，不拼接后端部分状态。
 失败服务退休，由已预算的 CPU 工作者排空任务。摘要不匹配必须失败，不能接受为有效结果。
-The retired aggregate probe key remains accepted. Unavailable CUDA uses CPU; GPU failures retry fully
+Configuration parses only currently supported fields, with no dedicated legacy-field compatibility parsing.
+Unknown or removed fields (including `gpu_probe_bytes`) are silently ignored without checking their value types
+or ranges. The file must still satisfy TOML syntax and size limits; supported fields retain strict type and budget validation.
+Unavailable CUDA uses CPU; GPU failures retry fully
 from the beginning on CPU. A failed service retires rather than becoming an extra unbudgeted CPU lane.
 Digest mismatches fail, never silently becoming valid results.
 

@@ -187,20 +187,18 @@ Timings use a monotonic clock, with three decimal places in milliseconds for mac
 
 The program creates a real `.same` directory, persists `.same/state.db`, and reads optional **`.same/config.toml`** and **`.same/ignore`**. `.same/run.lock` prevents concurrent runs against the same state; do not remove it while running.
 
-优先级：默认值 → TOML → 命令行。未知键、错误类型和非法预算直接报错，不会静默忽略。所有容量单位是字节。
+优先级：默认值 → TOML → 命令行。仅处理下表列出的配置字段；未知或已移除的字段静默忽略，不校验其值的类型或范围。受支持字段的错误类型和非法预算仍直接报错。所有容量单位是字节。
 
-Precedence: defaults → TOML → CLI. Unknown keys, wrong types, and invalid budgets fail explicitly. Capacity values are bytes.
+Precedence: defaults → TOML → CLI. Only the fields listed below are processed; unknown or removed fields are silently ignored without type or range validation of their values. Wrong types and invalid budgets for supported fields still fail explicitly. Capacity values are bytes.
 
-配置文件最多 64 KiB，整数配置不接受 `2.0` 或布尔值等隐式转换。
+配置文件仍须是有效 TOML，且最多 64 KiB；语法错误或超限直接报错。受支持的整数配置不接受 `2.0` 或布尔值等隐式转换。
 
-The configuration file is capped at 64 KiB; integer settings reject implicit conversions such as `2.0` or booleans.
+The configuration file must still be valid TOML and is capped at 64 KiB; syntax errors or exceeding this limit fail explicitly. Supported integer settings reject implicit conversions such as `2.0` or booleans.
 
 ```toml
 # 示例为 4 个内容线程；same new 写入本机实际默认值。 / Four-worker example; new resolves host defaults.
 workers = 4
 metadata_workers = 4
-# 旧配置兼容输入，不再充当全局门槛 / Retired compatibility input, not a global gate
-gpu_probe_bytes = 4294967296
 gpu_min_bytes = 16777216
 block_bytes = 1048576
 memory_bytes = 67108864
@@ -214,7 +212,6 @@ rehash = false
 |---|---|---|
 | `workers` | 硬件并发数限制在 1–8 / hardware concurrency clamped to 1–8 | 1–256 |
 | `metadata_workers` | `min(workers, 4)` | 1–256；独立的目录与元数据线程 / separate directory and metadata workers |
-| `gpu_probe_bytes` | 4294967296 (legacy) | 非负兼容保留值；不再控制自动分流 / Nonnegative retired input; no longer gates routing |
 | `gpu_min_bytes` | 16777216 (16 MiB) | 非负整数；小于阈值走 CPU SIMD，0 禁用大小路由 / smaller files use CPU SIMD; 0 disables size routing |
 | `block_bytes` | 1048576 (1 MiB) | 1024 的正整数倍，最大 64 MiB / positive multiple of 1024, ≤64 MiB |
 | `memory_bytes` | 67108864 (64 MiB) | ≥ `workers * (2*block_bytes + block_bytes/32 + 4096)` |

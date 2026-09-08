@@ -18,9 +18,6 @@ struct Config {
     /// 小于阈值的文件使用 CPU SIMD；0 禁用大小路由以便对照实验。
     /// Files below this threshold use CPU SIMD; zero disables size routing for ablations.
     std::size_t gpu_min_bytes{16 * 1024 * 1024};
-    /// 兼容读取旧配置的退役字段；自适应分流不再由全局字节门槛禁止 GPU。
-    /// Retired compatibility input; adaptive routing is no longer gated by aggregate bytes.
-    std::uint64_t gpu_probe_bytes{4ULL * 1024 * 1024 * 1024};
     /// I/O block size, a multiple of one BLAKE3 chunk (1024 bytes).
     /// I/O 块大小，必须是 BLAKE3 分块大小（1024 字节）的整数倍。
     std::size_t block_bytes{1024 * 1024};
@@ -40,8 +37,8 @@ struct Config {
     bool pgo{true};
     /// Choose bounded defaults from hardware concurrency. 根据硬件并发数选择有界默认值。
     Config();
-    /// Load optional .same/config.toml; reject unknown keys, types and invalid limits.
-    /// 加载可选配置文件；拒绝未知键、错误类型及不合法限制。
+    /// Load optional .same/config.toml; ignore unknown keys, reject invalid supported values.
+    /// 加载可选配置文件；忽略未知键；仍拒绝已支持字段的错误类型及不合法限制。
     static Config load(const std::filesystem::path& root);
     /// Throw on inconsistent budgets before allocating worker buffers.
     /// 在分配工作缓冲区前拒绝不一致的资源预算。
