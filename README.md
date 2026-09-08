@@ -57,6 +57,7 @@ same                            # 等同 same scan，仅当前目录 / same scan
 same scan -r                    # 递归子目录 / include subdirectories
 same scan --cpu --rehash         # CPU 强制重新哈希 / CPU, bypass digest cache
 same scan -r --no-pgo            # 关闭运行时路由分析器 / disable runtime routing analyzer
+same scan -r --no-telemetry      # 本轮不写遥测库 / disable telemetry persistence for this run
 same scan -r --summary           # 显示汇总、数据库与性能统计 / show all statistics
 same new                        # 生成标准配置与推荐忽略规则 / deploy defaults and ignore
 same clean                      # 删除当前 .same / remove this directory's .same
@@ -181,6 +182,22 @@ Timings use a monotonic clock, with three decimal places in milliseconds for mac
 
 设计依据 / Design references: [NO_COLOR convention](https://no-color.org/), [Microsoft VT console processing](https://learn.microsoft.com/en-us/windows/console/console-virtual-terminal-sequences), [USENIX: Auto-pilot benchmarking methodology](https://www.usenix.org/legacy/event/usenix05/tech/freenix/full_papers/wright/wright_html/)（基准测试链接仅作为方法背景，不代表本工具已通过性能认证 / methodological context, not a performance certification）。
 
+### 跨运行遥测 / Cross-run telemetry
+
+扫描默认在工作区的 **`.same/telemetry.db`** 保存跨运行日志、阶段追踪（tracing）、采样哈希跨度（span）、性能指标和动态分析器参数；它与摘要缓存 `.same/state.db` 独立。使用外部 SQLite 客户端查询，**same 不内置历史查询、报表或服务**；`--summary` 始终只展示本次运行。
+
+Scans persist local cross-run logs, stage traces, sampled hash spans, metrics and analyzer parameters in **`.same/telemetry.db`**, separate from the digest cache. Query it with an external SQLite client; same has no integrated history query, report or service. Summary always describes the current run.
+
+固定容量队列与独立写入线程将 SQL、批量提交和检查点（checkpoint）移出工作线程；队列争用或超限时丢弃遥测并统计损失，不阻塞文件任务。写入器错误即使未启用 `--summary` 也会警告。结束时仍需等待最终写入，单独报告此开销；异步不意味着零 CPU、零磁盘 I/O 或绝不丢失。
+
+A bounded queue and dedicated writer keep SQL, batched commits and checkpoints off workers. Contention or limits drop telemetry with visible counters instead of blocking file work. Writer errors warn even without Summary. Final draining still waits and is reported separately; asynchronous does not mean zero CPU/I/O cost or losslessness.
+
+`--no-telemetry` 本轮不打开遥测库，但不关闭在线路由；`--no-pgo` 关闭哈希性能采样与学习，但保留基础运行历史、阶段和错误。两个开关互相独立。默认保留最近 64 次运行，每轮队列事件最多 16384 条；完整结束快照独立保存。库中可能含扫描根路径、采样文件相对路径和错误消息，不含文件内容、不上传网络。`same clean` 也会删除这份历史。
+
+`--no-telemetry` avoids telemetry DB access without disabling online routing. `--no-pgo` disables hash profiling and learning while retaining basic run history, stages and errors. Defaults retain 64 runs and cap queued events at 16384 per run; final snapshots are separate. Data may contain the root, sampled relative paths and errors, never file contents or network uploads. Clean also deletes this history.
+
+配置、表结构、时间口径和只读 SQL 示例见 [遥测设计与检索](docs/telemetry.md)。 / See [telemetry design and queries](docs/telemetry.md) for configuration, schema, timing semantics and read-only SQL examples.
+
 ## 状态与配置 / State and configuration
 
 程序自动创建真实目录 `.same`，持久化状态位于 `.same/state.db`。配置是 **`.same/config.toml`**，忽略规则是 **`.same/ignore`**；两者均可省略。`.same/run.lock` 防止同一状态目录的并发扫描；不要在运行期间删除锁文件。
@@ -220,6 +237,10 @@ rehash = false
 | `backend` | `"auto"` | `"auto"`, `"cpu"`, `"cuda"` |
 | `rehash` | `false` | 布尔值 / boolean |
 | `pgo` | `true` | 运行时剖析引导路由；`--no-pgo` 可覆盖关闭 / Runtime profile-guided routing; CLI can disable |
+| `telemetry` | `true` | 持久化本地遥测；`--no-telemetry` 可覆盖关闭 / Persist local telemetry; CLI can disable |
+| `telemetry_queue_capacity` | `4096` | 1–65536；事件槽数，不是字节 / Event slots, not bytes |
+| `telemetry_retention_runs` | `64` | 1–4096；包含本轮 / Retained runs including current |
+| `telemetry_max_events` | `16384` | 1–1000000；每轮队列事件上限，不含最终快照 / Per-run queued-event cap, excluding final snapshot |
 
 `auto` 保留全部 `workers` 路 CPU SIMD，首个未缓存的合格文件后台初始化独立 GPU 服务。
 默认小于 16 MiB 直接 CPU；资格仅由 `gpu_min_bytes` 控制，不再随 CPU 的 `block_bytes` 改变。

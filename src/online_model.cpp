@@ -12,7 +12,7 @@ void increment(std::uint64_t& value) noexcept {
 }
 /// 调用方保证 bytes 非零。 / Caller guarantees nonzero bytes.
 unsigned band_index(std::uint64_t bytes) noexcept {
-    return (std::bit_width(bytes) - 1) / 2;
+    return (std::bit_width(bytes) - 1) / OnlineModel::band_shift;
 }
 /// 避免无限值乘法及浮点到整数的越界转换。
 /// Avoid overflowing multiplication and out-of-range floating-to-integer conversion.
@@ -31,7 +31,7 @@ bool valid(std::uint64_t bytes, double ms) noexcept {
 /// 凸组合形式避免两个大数相减造成不必要的溢出。
 /// Convex-combination form avoids unnecessary overflow from subtraction.
 double smooth(double old, double value) noexcept {
-    return old * 0.875 + value * 0.125;
+    return old * (1.0 - OnlineModel::smoothing_alpha) + value * OnlineModel::smoothing_alpha;
 }
 } // namespace
 OnlineModel::Prediction OnlineModel::predict(bool gpu, std::uint64_t bytes) const noexcept {
@@ -84,6 +84,17 @@ OnlineModel::Snapshot OnlineModel::snapshot() const noexcept {
         result.cpu_known_bands += band.known;
     for (const auto& band : bands_[1])
         result.gpu_known_bands += band.known;
+    return result;
+}
+OnlineModel::Parameters OnlineModel::parameters() const noexcept {
+    Parameters result{};
+    for (unsigned backend = 0; backend < backend_count; ++backend) {
+        for (unsigned index = 0; index < band_count; ++index) {
+            const auto& band = bands_[backend][index];
+            result[backend * band_count + index] = {band.cost,  band.error, band.samples,
+                                                    band.known, index,      backend != 0};
+        }
+    }
     return result;
 }
 } // namespace same::detail

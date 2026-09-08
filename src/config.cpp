@@ -70,6 +70,9 @@ Config Config::load(const std::filesystem::path& root) {
     number("memory_bytes", result.memory_bytes);
     number("device_memory_bytes", result.device_memory_bytes);
     number("queue_capacity", result.queue_capacity);
+    number("telemetry_queue_capacity", result.telemetry_queue_capacity);
+    number("telemetry_retention_runs", result.telemetry_retention_runs);
+    number("telemetry_max_events", result.telemetry_max_events);
     if (table.contains("backend")) {
         auto value = table["backend"].value_exact<std::string>();
         if (!value)
@@ -88,6 +91,12 @@ Config Config::load(const std::filesystem::path& root) {
             throw std::runtime_error("pgo must be boolean");
         result.pgo = *value;
     }
+    if (table.contains("telemetry")) {
+        auto value = table["telemetry"].value_exact<bool>();
+        if (!value)
+            throw std::runtime_error("telemetry must be boolean");
+        result.telemetry = *value;
+    }
     result.validate();
     return result;
 }
@@ -100,6 +109,12 @@ void Config::validate() const {
         throw std::runtime_error("block_bytes must be a positive multiple of 1024, at most 64 MiB");
     if (!queue_capacity || queue_capacity > 65536)
         throw std::runtime_error("queue_capacity must be in [1, 65536]");
+    if (!telemetry_queue_capacity || telemetry_queue_capacity > 65536)
+        throw std::runtime_error("telemetry_queue_capacity must be in [1, 65536]");
+    if (!telemetry_retention_runs || telemetry_retention_runs > 4096)
+        throw std::runtime_error("telemetry_retention_runs must be in [1, 4096]");
+    if (!telemetry_max_events || telemetry_max_events > 1000000)
+        throw std::runtime_error("telemetry_max_events must be in [1, 1000000]");
     if (2 * block_bytes + block_bytes / 32 + 4096 > memory_bytes / workers)
         throw std::runtime_error(
             "memory_bytes must cover two blocks plus compute staging per worker");

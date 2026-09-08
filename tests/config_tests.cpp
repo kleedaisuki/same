@@ -27,6 +27,10 @@ int main() {
     same::Config::load(root).validate();
     if (!same::Config::load(root).pgo)
         throw std::runtime_error("runtime PGO must default to enabled");
+    const auto defaults = same::Config::load(root);
+    if (!defaults.telemetry || defaults.telemetry_queue_capacity != 4096 ||
+        defaults.telemetry_retention_runs != 64 || defaults.telemetry_max_events != 16384)
+        throw std::runtime_error("telemetry defaults");
     {
         std::ofstream file(root / ".same/config.toml");
         file << "workers = 2\nblock_bytes = 1024\nmemory_bytes = 16384\nbackend = 'cpu'\nrehash = "
@@ -42,6 +46,24 @@ int main() {
     }
     if (!same::Config::load(root).pgo)
         throw std::runtime_error("explicit runtime PGO enable ignored");
+    // 遥测开关不影响 PGO；数值上下界均可显式配置。
+    // Telemetry is independent of PGO; both endpoints of numeric limits are supported.
+    for (const auto* settings :
+         {"telemetry = false\ntelemetry_queue_capacity = 1\ntelemetry_retention_runs = 1\n"
+          "telemetry_max_events = 1\n",
+          "telemetry = true\ntelemetry_queue_capacity = 65536\ntelemetry_retention_runs = 4096\n"
+          "telemetry_max_events = 1000000\n"}) {
+        {
+            std::ofstream file(root / ".same/config.toml");
+            file << settings;
+        }
+        const auto loaded = same::Config::load(root);
+        const bool maximum = loaded.telemetry;
+        if (!loaded.pgo || loaded.telemetry_queue_capacity != (maximum ? 65536 : 1) ||
+            loaded.telemetry_retention_runs != (maximum ? 4096 : 1) ||
+            loaded.telemetry_max_events != (maximum ? 1000000 : 1))
+            throw std::runtime_error("telemetry override or PGO independence");
+    }
     {
         std::ofstream file(root / ".same/config.toml");
         file << "workers = 0\n";
@@ -54,11 +76,32 @@ int main() {
     }
     if (!rejected)
         throw std::runtime_error("invalid config accepted");
-    for (const auto* invalid :
-         {"workers = 2.0\n", "workers = true\n", "rehash = 1\n", "backend = 1\n",
-          "metadata_workers = 0\n", "metadata_workers = 257\n", "metadata_workers = 2.0\n",
-          "gpu_min_bytes = -1\n", "gpu_min_bytes = 1.5\n", "pgo = 1\n", "pgo = 'false'\n",
-          "pgo = []\n", "workers = {}\n", "unknown = [\n"}) {
+    for (const auto* invalid : {"workers = 2.0\n",
+                                "workers = true\n",
+                                "rehash = 1\n",
+                                "backend = 1\n",
+                                "metadata_workers = 0\n",
+                                "metadata_workers = 257\n",
+                                "metadata_workers = 2.0\n",
+                                "gpu_min_bytes = -1\n",
+                                "gpu_min_bytes = 1.5\n",
+                                "pgo = 1\n",
+                                "pgo = 'false'\n",
+                                "pgo = []\n",
+                                "workers = {}\n",
+                                "unknown = [\n",
+                                "telemetry = 1\n",
+                                "telemetry = 'false'\n",
+                                "telemetry = []\n",
+                                "telemetry_queue_capacity = 0\n",
+                                "telemetry_queue_capacity = 65537\n",
+                                "telemetry_queue_capacity = 1.0\n",
+                                "telemetry_retention_runs = 0\n",
+                                "telemetry_retention_runs = 4097\n",
+                                "telemetry_retention_runs = true\n",
+                                "telemetry_max_events = 0\n",
+                                "telemetry_max_events = 1000001\n",
+                                "telemetry_max_events = '10'\n"}) {
         {
             std::ofstream file(root / ".same/config.toml");
             file << invalid;

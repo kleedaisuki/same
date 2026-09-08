@@ -22,6 +22,7 @@ Resources::Resources(const Config& config, detail::CudaFactory factory)
         dispatch_.decision = detail::DispatchEvidence::Decision::deferred;
     for (std::size_t i = 0; i < config.workers; ++i) {
         auto worker = std::make_unique<Worker>();
+        worker->index = i;
         worker->cpu_compute = make_cpu_compute();
         worker->first.resize(config.block_bytes);
         worker->second.resize(config.block_bytes);
@@ -108,8 +109,8 @@ void Resources::enqueue(std::function<void(Worker&)> task, bool pinned, detail::
     unsigned char explore = 0;
     if (pgo_ && bytes && route != detail::HashRoute::cpu_only) {
         const auto arrival = ++arrivals_[(std::bit_width(bytes) - 1) / 2];
-        if (arrival % 64 == 0)
-            explore = (arrival / 64) % 2 ? 2 : 1;
+        if (arrival % detail::RoutingParameters::exploration_period == 0)
+            explore = (arrival / detail::RoutingParameters::exploration_period) % 2 ? 2 : 1;
     }
     queue->push_back({std::move(task), bytes, route, explore});
     ready_.notify_all();
@@ -135,7 +136,7 @@ bool Resources::prefer_gpu(const QueuedTask& task) const {
         if (gpu_active_)
             return false;
         const auto band = (std::bit_width(task.bytes) - 1) / 2;
-        return exploration_[band] < 2 &&
+        return exploration_[band] < detail::RoutingParameters::initial_gpu_explorations &&
                (cpu_active_ == workers_.size() || task.route == detail::HashRoute::gpu_preferred);
     }
     const double now = scheduler_now_ms();
@@ -224,7 +225,7 @@ Resources::QueuedTask Resources::take_task(Worker& worker, bool gpu,
              !model_.predict(true, task.bytes).known)) {
             ++exploration_jobs_;
             auto& count = exploration_[(std::bit_width(task.bytes) - 1) / 2];
-            if (count < 2)
+            if (count < detail::RoutingParameters::initial_gpu_explorations)
                 ++count;
         }
         gpu_active_ = true;
@@ -332,7 +333,7 @@ void Resources::prepare_auto(const Config& config, std::uint64_t pending_bytes,
     const auto per_worker = 2 * config.block_bytes + config.block_bytes / 32 + 4096;
     const auto remaining_memory = config.memory_bytes - per_worker * workers_.size();
     const auto service_cost = [](std::size_t block) { return 2 * block + block / 32 + 4096; };
-    auto block = std::size_t{16 * 1024 * 1024};
+    auto block = detail::RoutingParameters::gpu_block_bytes;
     if (service_cost(block) > remaining_memory)
         block = std::min(config.block_bytes, block);
     if (service_cost(block) > remaining_memory)
@@ -345,6 +346,7 @@ void Resources::prepare_auto(const Config& config, std::uint64_t pending_bytes,
         return;
     }
     auto worker = std::make_unique<Worker>();
+    worker->index = workers_.size();
     worker->first.resize(block);
     worker->second.resize(block);
     worker->cpu_compute = make_cpu_compute();

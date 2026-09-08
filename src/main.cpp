@@ -9,7 +9,7 @@ namespace {
 /// 输出命令契约，不访问或修改工作区状态。
 void help() {
     std::cout
-        << "same 0.3.0 - exact duplicate files in the working directory\n"
+        << "same " SAME_VERSION " - exact duplicate files in the working directory\n"
            "Usage: same [scan] [-r] [--summary] [scan options]\n"
            "       same new\n"
            "       same clean [-r]\n"
@@ -22,6 +22,7 @@ void help() {
            "  --rehash       ignore cached hashes for this scan\n"
            "  --cpu          force the CPU backend\n"
            "  --no-pgo       disable runtime profile-guided routing (not compiler PGO)\n"
+           "  --no-telemetry disable persistent local diagnostics (not PGO or summary)\n"
            "  --unique-files show unmatched paths (TSV: group 0)\n"
            "  --color=auto|always|never  auto honors NO_COLOR and redirection\n"
            "  --format=auto|pretty|tsv  auto uses pretty on terminals, TSV otherwise\n"
@@ -49,6 +50,7 @@ int main(int argc, char** argv) {
         }
         bool rehash = false, cpu = false, unique_files = false;
         bool recursive = false, summary = false, no_pgo = false;
+        bool no_telemetry = false;
         auto color_mode = same::ColorMode::automatic;
         std::string_view format = "auto";
         for (int i = first; i < argc; ++i) {
@@ -58,7 +60,7 @@ int main(int argc, char** argv) {
                 return 0;
             }
             if (arg == "--version") {
-                std::cout << "same 0.3.0\n";
+                std::cout << "same " SAME_VERSION "\n";
                 return 0;
             }
             if ((arg == "-r" || arg == "--recursive") && command != "new") {
@@ -74,6 +76,8 @@ int main(int argc, char** argv) {
                 cpu = true;
             else if (arg == "--no-pgo")
                 no_pgo = true;
+            else if (arg == "--no-telemetry")
+                no_telemetry = true;
             else if (arg == "--unique-files")
                 unique_files = true;
             else if (arg == "--summary")
@@ -106,6 +110,8 @@ int main(int argc, char** argv) {
             config.backend = "cpu";
         if (no_pgo)
             config.pgo = false;
+        if (no_telemetry)
+            config.telemetry = false;
         same::TerminalColor color(color_mode);
         const bool pretty = format == "pretty" || (format == "auto" && same::stdout_terminal());
         same::TerminalColor diagnostic_color(color_mode, same::TerminalStream::diagnostics);

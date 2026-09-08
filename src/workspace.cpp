@@ -87,7 +87,18 @@ std::string default_config() {
         << "\nbackend = \"" << c.backend << "\"\nrehash = " << (c.rehash ? "true" : "false")
         << "\n# 运行时剖析引导路由，非编译器 PGO；不控制汇总输出 / Runtime profile-guided routing, "
            "not compiler PGO or summary output\n"
-        << "pgo = " << (c.pgo ? "true" : "false") << '\n';
+        << "pgo = " << (c.pgo ? "true" : "false")
+        << "\n# 本地跨运行诊断，可能包含敏感路径和配置；不上传，与 PGO/summary 独立。\n"
+        << "# Local cross-run diagnostics may contain sensitive paths/configuration; no upload, "
+           "independent of PGO/summary.\n"
+        << "telemetry = " << (c.telemetry ? "true" : "false")
+        << "\n# 异步事件队列上限；满时丢弃遥测而不阻塞任务 / Async event queue bound; drop "
+           "telemetry on overflow, never block work\n"
+        << "telemetry_queue_capacity = " << c.telemetry_queue_capacity
+        << "\n# 跨运行保留数量上限 / Maximum retained runs\n"
+        << "telemetry_retention_runs = " << c.telemetry_retention_runs
+        << "\n# 每次运行事件记录上限 / Maximum event records per run\n"
+        << "telemetry_max_events = " << c.telemetry_max_events << '\n';
     return out.str();
 }
 /// 保守忽略元数据，不默认隐藏用户文档或构建产物。 / Ignore metadata, not user docs or builds.

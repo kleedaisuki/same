@@ -35,6 +35,16 @@ struct Config {
     /// Enable runtime profile-guided routing; unrelated to compiler PGO or summary output.
     /// 启用运行时剖析引导路由；与编译器 PGO 和汇总输出开关无关。
     bool pgo{true};
+    /// Persist local diagnostics independently of runtime PGO and summary output.
+    /// 本地持久化诊断信息，与运行时 PGO 及汇总输出独立；可能包含敏感元数据。
+    bool telemetry{true};
+    /// Bounded asynchronous event queue, [1, 65536]; overflow drops telemetry, not work.
+    /// 异步事件队列上限 [1, 65536]；溢出丢弃遥测，而非阻塞工作任务。
+    std::size_t telemetry_queue_capacity{4096};
+    /// Retained run count, [1, 4096]. 跨运行保留数量，范围 [1, 4096]。
+    std::size_t telemetry_retention_runs{64};
+    /// Per-run event limit, [1, 1000000]. 每轮事件记录上限，范围 [1, 1000000]。
+    std::size_t telemetry_max_events{16384};
     /// Choose bounded defaults from hardware concurrency. 根据硬件并发数选择有界默认值。
     Config();
     /// Load optional .same/config.toml; ignore unknown keys, reject invalid supported values.

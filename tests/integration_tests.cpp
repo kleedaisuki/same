@@ -268,7 +268,8 @@ struct Fixture {
         const std::regex counters("(\\w+)=(\\d+)");
         for (auto it = std::sregex_iterator(errors.begin(), errors.end(), counters);
              it != std::sregex_iterator(); ++it)
-            stats[(*it)[1]] = std::stoi((*it)[2]);
+            if ((*it)[1] != "telemetry_run_id")
+                stats[(*it)[1]] = std::stoi((*it)[2]);
         for (const auto* key :
              {"scanned", "hashed", "cached", "groups", "matches", "gpu_workers", "cpu_fallbacks"})
             check(stats.contains(key), "missing counter " + std::string(key));
@@ -669,7 +670,9 @@ void command_validation(const fs::path& exe) {
                                                                        {"scan", "--sumary"},
                                                                        {"clean", "--cpu"},
                                                                        {"clean", "--no-pgo"},
-                                                                       {"new", "--no-pgo"}}) {
+                                                                       {"new", "--no-pgo"},
+                                                                       {"clean", "--no-telemetry"},
+                                                                       {"new", "--no-telemetry"}}) {
         check(execute(exe, f.root, f.base / "stdout", f.base / "stderr", arguments) == 2,
               "invalid command accepted");
         check(!fs::exists(f.root / ".same"), "invalid command created state");
@@ -814,6 +817,150 @@ void pgo_control(const fs::path& exe) {
           "configuration did not disable analyzer");
 }
 
+/// Read exactly one scalar from the closed journal without mutating fixture state.
+/// 只读已关闭遥测数据库的单个标量，不创建或修改测试状态。
+std::string telemetry_scalar(const Fixture& fixture, const char* query) {
+    sqlite3* raw{};
+    const auto opened = sqlite3_open_v2(utf8(fixture.root / ".same/telemetry.db").c_str(), &raw,
+                                        SQLITE_OPEN_READONLY, nullptr);
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db(raw, sqlite3_close);
+    check(opened == SQLITE_OK, "open telemetry fixture read-only");
+    sqlite3_stmt* prepared{};
+    check(sqlite3_prepare_v2(db.get(), query, -1, &prepared, nullptr) == SQLITE_OK,
+          "prepare telemetry query: " + std::string(sqlite3_errmsg(db.get())));
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> statement(prepared,
+                                                                         sqlite3_finalize);
+    check(sqlite3_step(statement.get()) == SQLITE_ROW, "telemetry scalar omitted row");
+    const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(statement.get(), 0));
+    const auto bytes = sqlite3_column_bytes(statement.get(), 0);
+    const std::string result = text ? std::string(text, static_cast<std::size_t>(bytes)) : "";
+    check(sqlite3_step(statement.get()) == SQLITE_DONE, "telemetry scalar returned extra rows");
+    return result;
+}
+
+/// Verify durable identities, complete parameters and independent CLI observation controls.
+/// 验证跨运行身份、完整模型参数，以及命令行独立观测开关。
+void telemetry_controls(const fs::path& exe) {
+    Fixture f(exe);
+    f.config({{"gpu_min_bytes", "0"}, {"telemetry_queue_capacity", "128"}});
+    f.file("a", std::string(4096, 't'));
+    f.file("b", std::string(4096, 't'));
+    check(execute(exe, f.root, f.base / "stdout", f.base / "stderr", {"scan"}) == 0,
+          "quiet telemetry scan failed");
+    const auto expected_output = read(f.base / "stdout");
+    check(read(f.base / "stderr").empty(), "telemetry forced an unsolicited summary");
+    const auto first_id = telemetry_scalar(f, "SELECT run_id FROM latest_run");
+    check(!first_id.empty() && telemetry_scalar(f, "SELECT count(*) FROM runs") == "1" &&
+              telemetry_scalar(f, "SELECT status FROM latest_run") == "completed",
+          "quiet run not durably finalized");
+    check(telemetry_scalar(f, "SELECT count(DISTINCT category) FROM parameters "
+                              "WHERE category GLOB 'model.cpu.*' OR category GLOB 'model.gpu.*'") ==
+              "64",
+          "journal omitted model size bands");
+    check(telemetry_scalar(f, "SELECT count(*) FROM parameters "
+                              "WHERE category GLOB 'model.cpu.*' OR category GLOB 'model.gpu.*'") ==
+              "256",
+          "journal omitted raw band fields");
+    check(telemetry_scalar(f, "SELECT value FROM parameters WHERE category='model' "
+                              "AND name='smoothing_alpha'") == "0.125",
+          "journal omitted model algorithm parameter");
+    const auto config = telemetry_scalar(f, "SELECT config_json FROM latest_run");
+    check(config.find("\"gpu_min_bytes\":0") != std::string::npos &&
+              config.find("\"workers\":2") != std::string::npos &&
+              config.find("\"pgo\":1") != std::string::npos,
+          "effective configuration snapshot incorrect");
+    check(telemetry_scalar(f, "SELECT value FROM metrics WHERE name='pgo.samples'") == "2.0",
+          "final profiler metrics omitted");
+    check(telemetry_scalar(f, "SELECT count(*) FROM logs WHERE name='run.completed'") == "1",
+          "completion log missing");
+    check(execute(exe, f.root, f.base / "stdout", f.base / "stderr",
+                  {"scan", "--rehash", "--no-pgo", "--summary"}) == 0,
+          "no-pgo telemetry scan failed");
+    check(read(f.base / "stdout") == expected_output, "no-pgo changed business output");
+    check(telemetry_scalar(f, "SELECT count(*) FROM runs") == "2" &&
+              telemetry_scalar(f, "SELECT count(DISTINCT run_id) FROM runs") == "2" &&
+              telemetry_scalar(f, "SELECT run_id FROM latest_run") != first_id,
+          "cross-run identity overwritten or reused");
+    check(telemetry_scalar(f, "SELECT count(*) FROM spans WHERE name='hash' "
+                              "AND run_id=(SELECT run_id FROM latest_run)") == "0",
+          "no-pgo emitted sampled hash spans");
+    check(telemetry_scalar(f, "SELECT count(*) FROM logs WHERE name='run.completed' "
+                              "AND run_id=(SELECT run_id FROM latest_run)") == "1",
+          "no-pgo disabled base lifecycle journal");
+    const auto summary = read(f.base / "stderr");
+    check(summary.find("telemetry_run_id=" +
+                       telemetry_scalar(f, "SELECT run_id FROM latest_run")) != std::string::npos &&
+              summary.find("telemetry_drain_ms=") != std::string::npos,
+          "current-run summary omitted journal identity/drain");
+    const auto database = read(f.root / ".same/telemetry.db");
+    check(execute(exe, f.root, f.base / "stdout", f.base / "stderr", {"scan", "--no-telemetry"}) ==
+              0,
+          "existing-journal opt-out failed");
+    check(read(f.root / ".same/telemetry.db") == database &&
+              read(f.base / "stdout") == expected_output,
+          "no-telemetry mutated journal or results");
+    Fixture disabled(exe);
+    disabled.file("a", "data");
+    check(execute(exe, disabled.root, disabled.base / "stdout", disabled.base / "stderr",
+                  {"scan", "--no-telemetry"}) == 0,
+          "fresh-journal opt-out failed");
+    check(!fs::exists(disabled.root / ".same/telemetry.db"), "no-telemetry created journal");
+}
+
+/// Journal failures cannot fail a scan; business failures retain their original cause.
+/// 遥测故障不能使扫描失败；业务故障必须保存原始错误并持久化失败状态。
+void telemetry_failures(const fs::path& exe) {
+    Fixture broken(exe);
+    broken.file("a", "same");
+    broken.file("b", "same");
+    const std::string corrupt = "not a SQLite telemetry database";
+    broken.file(".same/telemetry.db", corrupt);
+    broken.expect({group({"a", "b"})});
+    check(read(broken.root / ".same/telemetry.db") == corrupt,
+          "bad journal overwritten during fail-open scan");
+    check(read(broken.base / "stderr").find("telemetry_write_errors=1") != std::string::npos,
+          "bad journal failure hidden from summary");
+    check(execute(exe, broken.root, broken.base / "stdout", broken.base / "stderr", {"scan"}) == 0,
+          "bad journal failed a scan without summary");
+    check(read(broken.base / "stderr").find("Telemetry warning:") != std::string::npos,
+          "writer failure hidden without summary");
+    Fixture failed(exe);
+    failed.file("a", "unmodified");
+    failed.sql("PRAGMA user_version=999");
+    failed.run(2);
+    const auto error = telemetry_scalar(failed, "SELECT error FROM latest_run");
+    check(telemetry_scalar(failed, "SELECT status FROM latest_run") == "failed" &&
+              error == "Unsupported state database schema version" &&
+              read(failed.base / "stderr").find(error) != std::string::npos,
+          "business error swallowed or failed lifecycle omitted");
+    check(telemetry_scalar(failed, "SELECT count(*) FROM logs WHERE name='run.failed' "
+                                   "AND severity='error'") == "1",
+          "failed run omitted error log");
+    check(read(failed.root / "a") == "unmodified", "failure modified scan input");
+}
+
+/// Deferred startup must assign a unique span to each submitted file, including the held one.
+/// 延迟启动保留的文件同样需要独立跨度编号，不能复用协调线程扫描计数。
+void telemetry_span_identity(const fs::path& exe) {
+    Fixture f(exe);
+    f.config({{"backend", "\"auto\""},
+              {"gpu_min_bytes", "0"},
+              {"device_memory_bytes", "1"},
+              {"telemetry_queue_capacity", "128"}});
+    f.file("a", std::string(4096, 's'));
+    f.file("b", std::string(4096, 's'));
+    f.expect({group({"a", "b"})});
+    check(telemetry_scalar(f, "SELECT count(*)-count(DISTINCT span_id) FROM spans "
+                              "WHERE name='hash'") == "0",
+          "deferred startup reused a hash span id");
+    check(telemetry_scalar(f, "SELECT count(*) FROM spans WHERE name='hash' "
+                              "AND (parent_span_id<>3 OR worker<0 OR backend<>'cpu' "
+                              "OR bytes<>4096 OR duration_ns<=0)") == "0",
+          "hash span has incorrect parent, lane, backend or timing");
+    check(telemetry_scalar(f, "SELECT (SELECT count(*) FROM spans WHERE name='hash') + dropped "
+                              "FROM latest_run") == "2",
+          "sampled hash spans lost without explicit accounting");
+}
 /// 跨进程锁必须拒绝第二个扫描器，Windows 状态目录大小写不敏感。 / Reject a competing scanner;
 /// Windows state-directory exclusion is case insensitive.
 void locking_and_state(const fs::path& exe) {
@@ -864,6 +1011,9 @@ int main(int argc, char** argv) {
         {"presentation", presentation},
         {"scan commands", scan_commands},
         {"pgo control", pgo_control},
+        {"telemetry controls", telemetry_controls},
+        {"telemetry failures", telemetry_failures},
+        {"telemetry span identity", telemetry_span_identity},
         {"command validation", command_validation},
         {"lifecycle commands", lifecycle_commands},
         {"locking and state", locking_and_state}};

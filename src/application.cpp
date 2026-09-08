@@ -4,6 +4,7 @@
 #include "same/resources.hpp"
 #include "same/run_lock.hpp"
 #include "same/store.hpp"
+#include "same/telemetry.hpp"
 #include "same/terminal.hpp"
 #include "same/walk.hpp"
 #include <algorithm>
@@ -268,7 +269,7 @@ private:
             const bool initial =
                 !config_.pgo || (!evidence.block_complete && !evidence.stream_complete);
             if (initial && input.record.stamp.size >= floor_ &&
-                input.record.stamp.size >= 64ULL * 1024 * 1024)
+                input.record.stamp.size >= detail::RoutingParameters::static_gpu_floor_bytes)
                 route = detail::HashRoute::gpu_preferred;
         }
         submit(std::move(input), route);
@@ -289,7 +290,8 @@ private:
 /// Stream the tree into bounded worker jobs; keep every SQLite mutation on this thread.
 /// 流式遍历目录并提交有界任务；所有 SQLite 修改留在当前线程。
 void scan(const fs::path& root, const Config& config, Store& store, Resources& resources,
-          Counters& counters, bool recursive) {
+          Counters& counters, bool recursive, telemetry::Telemetry* trace = nullptr,
+          Clock::time_point trace_start = {}) {
     detail::CompletionJobs<HashResult> pending(resources, config.queue_capacity);
     auto save = [&](const FileRecord& record) {
         const auto start = Clock::now();
@@ -303,26 +305,74 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
         counters.hash_work_ms += result.work_ms;
         save(result.record);
     };
+    // 提交顺序独立于发现计数，延迟启动也不会复用跨度 ID。 / Submission order remains unique
+    // even when startup releases multiple deferred files.
+    std::uint64_t next_hash_span = 16;
     auto submit = [&](HashInput input, detail::HashRoute route) {
         const auto submitted = Clock::now();
         const auto bytes = input.record.stamp.size;
-        auto operation = [root, gpu_min_bytes = config.gpu_min_bytes,
+        const auto span_id = next_hash_span++;
+        auto operation = [root, trace, trace_start, span_id, gpu_min_bytes = config.gpu_min_bytes,
                           record = std::move(input.record),
                           opened = std::move(input.reader)](Worker& worker) mutable {
             // 每64个小任务抽样；合格任务全采样，关闭时不修改采样状态。
             // Sample every 64th small task and every eligible task; disabled leaves no sample
             // state.
-            const bool sample = worker.profile_enabled && (record.stamp.size >= gpu_min_bytes ||
-                                                           (++worker.profile_sequence & 63) == 0);
-            const auto cpu_before = sample ? worker.cpu_hashes : 0;
-            const auto gpu_before = sample ? worker.gpu_hashes : 0;
+            const bool sample = worker.profile_enabled &&
+                                (record.stamp.size >= gpu_min_bytes ||
+                                 (++worker.profile_sequence &
+                                  (detail::RoutingParameters::small_sample_period - 1)) == 0);
+            const auto cpu_before = worker.cpu_hashes;
+            const auto gpu_before = worker.gpu_hashes;
             const auto start = Clock::now();
-            auto hashed = worker.execute(
-                [&] { return hash_file(root, record, worker, gpu_min_bytes, std::move(opened)); });
-            const auto elapsed = milliseconds(start, Clock::now());
+            // 固定事件只复用已有采样和时钟；不进入调度器锁，不读取文件内容。
+            // Fixed events reuse sampling and clocks; no scheduler lock or file contents.
+            auto report = [&](Clock::time_point end, bool success) noexcept {
+                if (!trace)
+                    return;
+                const auto gpu_attempts = worker.gpu_hashes - gpu_before;
+                const auto cpu_attempts = worker.cpu_hashes - cpu_before;
+                const bool retry = gpu_attempts + cpu_attempts > 1;
+                if (!sample && !retry && success)
+                    return;
+                telemetry::Event event;
+                event.type = sample ? "span" : "log";
+                event.name = sample ? "hash" : (success ? "hash.fallback" : "hash.error");
+                event.severity = success ? (retry ? "warn" : "info") : "error";
+                event.backend = retry ? "gpu+cpu" : (gpu_attempts ? "gpu" : "cpu");
+                event.message = record.path;
+                event.span_id = span_id;
+                event.parent_span_id = 3;
+                event.worker = static_cast<std::int64_t>(worker.index);
+                event.bytes = record.stamp.size;
+                event.time_ns = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(start - trace_start)
+                        .count());
+                event.duration_ns = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                event.value = success ? 1 : 0;
+                trace->emit(event);
+                if (sample && retry) {
+                    event.type = "log";
+                    event.name = "hash.fallback";
+                    trace->emit(event);
+                }
+            };
+            FileRecord hashed;
+            Clock::time_point ended;
+            try {
+                hashed = worker.execute([&] {
+                    return hash_file(root, record, worker, gpu_min_bytes, std::move(opened));
+                });
+                ended = Clock::now();
+            } catch (...) {
+                report(Clock::now(), false);
+                throw;
+            }
+            const auto elapsed = milliseconds(start, ended);
+            report(ended, true);
             // 复用已有计时；仅完整成功且没有重试的实际后端样本进入模型。
-            // Reuse existing timing; publish only successful, single-attempt actual-backend
-            // samples.
+            // Reuse existing timing; only successful single-attempt samples train the model.
             if (sample && worker.cpu_hashes - cpu_before + worker.gpu_hashes - gpu_before == 1)
                 worker.sample = {hashed.stamp.size, elapsed, worker.gpu_hashes != gpu_before, true};
             return HashResult{std::move(hashed), elapsed};
@@ -754,6 +804,187 @@ void render_profile(const Counters& counters, const Resources& resources,
     render_online_profile(resources, profile, false);
     diagnostics << profile.str();
 }
+
+/// Serialize effective settings once, never on a worker or when telemetry is disabled.
+/// 有效配置仅序列化一次，工作线程和禁用遥测路径均不执行。
+std::string telemetry_config(const Config& config, OutputOptions options) {
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << "{";
+#define CONFIG_NUMBER(field) out << "\"" #field "\":" << config.field << ','
+    CONFIG_NUMBER(workers);
+    CONFIG_NUMBER(metadata_workers);
+    CONFIG_NUMBER(gpu_min_bytes);
+    CONFIG_NUMBER(block_bytes);
+    CONFIG_NUMBER(memory_bytes);
+    CONFIG_NUMBER(device_memory_bytes);
+    CONFIG_NUMBER(queue_capacity);
+    CONFIG_NUMBER(rehash);
+    CONFIG_NUMBER(pgo);
+    CONFIG_NUMBER(telemetry);
+    CONFIG_NUMBER(telemetry_queue_capacity);
+    CONFIG_NUMBER(telemetry_retention_runs);
+    CONFIG_NUMBER(telemetry_max_events);
+#undef CONFIG_NUMBER
+    out << "\"recursive\":" << options.recursive << ",\"unique_files\":" << options.unique_files
+        << ",\"summary\":" << options.summary << ",\"backend\":";
+    quoted_path(out, config.backend);
+    out << '}';
+    return out.str();
+}
+/// Preserve raw counter/model state, rather than reparsing a human report.
+/// 保存原始计数和模型状态，不反向解析展示文本；调用者必须已经等待工作线程空闲。
+void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
+                       const Resources* resources, const std::array<double, 5>& phases) {
+    auto metric = [&](std::string name, double value, std::string unit = "count") {
+        final.metrics.push_back({std::move(name), value, std::move(unit)});
+    };
+#define COUNTER(field, unit) metric(#field, static_cast<double>(counters.field), unit)
+    COUNTER(scanned, "count");
+    COUNTER(database_bytes, "bytes");
+    COUNTER(scanned_bytes, "bytes");
+    COUNTER(cached_bytes, "bytes");
+    COUNTER(hashed, "count");
+    COUNTER(hash_wait_ms, "ms");
+    COUNTER(hash_work_ms, "ms");
+    COUNTER(walk_wait_ms, "ms");
+    COUNTER(enumerate_work_ms, "ms");
+    COUNTER(metadata_work_ms, "ms");
+    COUNTER(database_work_ms, "ms");
+    COUNTER(walk_task_peak, "count");
+    COUNTER(walk_result_peak, "count");
+    COUNTER(cached, "count");
+    COUNTER(groups, "count");
+    COUNTER(matches, "count");
+#undef COUNTER
+    constexpr std::array<const char*, 5> names{"initialize_ms", "pipeline_ms", "compare_ms",
+                                               "validate_ms", "output_ms"};
+    for (std::size_t i = 0; i < phases.size(); ++i)
+        metric(names[i], phases[i], "ms");
+    const auto elapsed = std::accumulate(phases.begin(), phases.end(), 0.0);
+    metric("elapsed_ms", elapsed, "ms");
+    metric("scan_work_ms", std::max(0.0, phases[1] - counters.hash_wait_ms), "ms");
+    metric("unique", static_cast<double>(counters.scanned - counters.matches));
+    auto parameter = [&](std::string category, std::string name, auto value) {
+        std::ostringstream text;
+        text.imbue(std::locale::classic());
+        text << std::setprecision(17) << value;
+        final.parameters.push_back({std::move(category), std::move(name), text.str()});
+    };
+#define ROUTING(field) parameter("routing", #field, detail::RoutingParameters::field)
+    ROUTING(cpu_advantage_factor);
+    ROUTING(exploration_period);
+    ROUTING(initial_gpu_explorations);
+    ROUTING(small_sample_period);
+    ROUTING(static_gpu_floor_bytes);
+    ROUTING(gpu_block_bytes);
+#undef ROUTING
+    parameter("model", "smoothing_alpha", detail::OnlineModel::smoothing_alpha);
+    parameter("model", "band_shift", detail::OnlineModel::band_shift);
+    parameter("model", "band_count", detail::OnlineModel::band_count);
+    parameter("model", "backend_count", detail::OnlineModel::backend_count);
+    parameter("model", "training_scope", "current-run-only");
+    if (!resources)
+        return;
+    metric("gpu_workers", static_cast<double>(resources->gpu_workers()));
+    metric("cpu_fallbacks", static_cast<double>(resources->fallbacks()));
+    metric("cpu_routed_hashes", static_cast<double>(resources->cpu_routed_hashes()));
+    metric("gpu_block_bytes", static_cast<double>(resources->gpu_block_bytes()), "bytes");
+    metric("gpu_service_enabled", resources->gpu_service_enabled());
+    metric("pgo_enabled", resources->profiling_enabled());
+    metric("pgo_exploration_jobs", static_cast<double>(resources->exploration_jobs()));
+    const auto [hashed, compared] = resources->read_bytes();
+    metric("hash_read_bytes", static_cast<double>(hashed), "bytes");
+    metric("compare_read_bytes", static_cast<double>(compared), "bytes");
+    metric("read_bytes", static_cast<double>(hashed) + static_cast<double>(compared), "bytes");
+    metric("read_mib_s",
+           elapsed > 0 ? (static_cast<double>(hashed) + static_cast<double>(compared)) / 1048576.0 /
+                             (elapsed / 1000.0)
+                       : 0,
+           "MiB/s");
+    const auto [cpu, gpu] = resources->hash_attempts();
+    metric("cpu_hashes", static_cast<double>(cpu));
+    metric("gpu_hashes", static_cast<double>(gpu));
+    const auto [overflow, spill] = resources->route_counts();
+    metric("gpu_overflow_jobs", static_cast<double>(overflow));
+    metric("cpu_spill_jobs", static_cast<double>(spill));
+    const auto& dispatch = resources->dispatch_evidence();
+#define DISPATCH(field, unit) metric("dispatch." #field, static_cast<double>(dispatch.field), unit)
+    DISPATCH(block_complete, "bool");
+    DISPATCH(stream_complete, "bool");
+    DISPATCH(block_gpu_preferred, "bool");
+    DISPATCH(stream_gpu_preferred, "bool");
+    DISPATCH(calibration_complete, "bool");
+    DISPATCH(device_validated, "bool");
+    DISPATCH(setup_ms, "ms");
+    DISPATCH(elapsed_ms, "ms");
+    DISPATCH(cpu_block_ms, "ms");
+    DISPATCH(gpu_block_ms, "ms");
+    DISPATCH(cpu_stream_fastest_ms, "ms");
+    DISPATCH(gpu_stream_slowest_ms, "ms");
+    DISPATCH(cpu_stream_ms, "ms");
+    DISPATCH(gpu_stream_ms, "ms");
+    DISPATCH(mixed_cpu_ms, "ms");
+    DISPATCH(mixed_gpu_ms, "ms");
+    DISPATCH(expected_saving_ms, "ms");
+#undef DISPATCH
+    parameter("dispatch", "decision", dispatch_name(dispatch.decision));
+    parameter("dispatch", "calibration_stop", calibration_stop(dispatch));
+    const auto profile = resources->profile_snapshot();
+#define PROFILE(field, unit) metric("pgo." #field, static_cast<double>(profile.field), unit)
+    PROFILE(samples, "count");
+    PROFILE(cpu_samples, "count");
+    PROFILE(gpu_samples, "count");
+    PROFILE(rejected_samples, "count");
+    PROFILE(predicted_samples, "count");
+    PROFILE(cpu_known_bands, "count");
+    PROFILE(gpu_known_bands, "count");
+    PROFILE(mean_absolute_error_ms, "ms");
+#undef PROFILE
+    for (std::size_t i = 0; i < profile.latency_histogram.size(); ++i) {
+        metric("pgo.latency_bucket_us." + std::to_string(i),
+               static_cast<double>(profile.latency_histogram[i]));
+        metric("pgo.residual_bucket_us." + std::to_string(i),
+               static_cast<double>(profile.residual_histogram[i]));
+    }
+    for (const auto& band : resources->model_parameters()) {
+        const auto category =
+            std::string("model.") + (band.gpu ? "gpu." : "cpu.") + std::to_string(band.band_index);
+        parameter(category, "known", band.known);
+        parameter(category, "samples", band.samples);
+        parameter(category, "cost_ms_per_byte", band.cost_ms_per_byte);
+        parameter(category, "error_ms_per_byte", band.error_ms_per_byte);
+    }
+}
+/// Append final writer health; legacy elapsed excludes this explicit exit drain.
+/// 附加写入器终态；旧 elapsed 不含明确展示的退出排空耗时。
+void render_telemetry(const telemetry::Telemetry* trace, const telemetry::Stats& stats,
+                      double total_ms, std::ostream& out, bool pretty) {
+    if (!trace) {
+        out << (pretty ? "  Telemetry       disabled\n" : "telemetry_enabled=0\n");
+        return;
+    }
+    if (pretty) {
+        out << "  Telemetry       .same/telemetry.db | " << stats.status.c_str() << '\n'
+            << "  Run ID          " << trace->run_id() << '\n'
+            << "  Trace records   " << stats.accepted << " accepted | " << stats.persisted
+            << " persisted | " << stats.dropped << " dropped | " << stats.errors << " errors\n"
+            << "  Trace pressure  " << stats.queue_high_water << " queued peak | "
+            << stats.truncated << " truncated\n"
+            << "  Telemetry drain " << human_duration(stats.drain_ms) << " (exit wait)\n"
+            << "  Total incl. I/O " << human_duration(total_ms) << " (includes telemetry drain)\n";
+    } else {
+        out << "telemetry_enabled=1 telemetry_db=.same/telemetry.db telemetry_run_id="
+            << trace->run_id() << " telemetry_status=" << stats.status.c_str()
+            << " telemetry_accepted=" << stats.accepted
+            << " telemetry_persisted=" << stats.persisted << " telemetry_dropped=" << stats.dropped
+            << " telemetry_write_errors=" << stats.errors
+            << " telemetry_truncated=" << stats.truncated
+            << " telemetry_queue_high_water=" << stats.queue_high_water
+            << " telemetry_drain_ms=" << stats.drain_ms
+            << " total_including_telemetry_ms=" << total_ms << '\n';
+    }
+}
 } // namespace
 int run(const fs::path& root, const Config& config, std::ostream& output,
         std::ostream& diagnostics) {
@@ -762,36 +993,171 @@ int run(const fs::path& root, const Config& config, std::ostream& output,
 int run(const fs::path& root, const Config& config, std::ostream& output, std::ostream& diagnostics,
         OutputOptions options) {
     const auto start = Clock::now();
+    const auto wall_start = config.telemetry ? std::chrono::system_clock::now()
+                                             : std::chrono::system_clock::time_point{};
     WorkspaceLock workspace_lock(root);
     prepare_state(root);
     RunLock lock(root / ".same" / "run.lock");
-    Store store(root / ".same" / "state.db");
-    Resources resources(config);
+    // 生命周期日志先于业务存储；所有工作线程先停止，写入器最后在锁内收尾。
+    // Journal precedes business storage; workers stop before writer finalization under the lock.
+    std::unique_ptr<telemetry::Telemetry> trace;
+    if (config.telemetry) {
+        try {
+            telemetry::RunInfo info;
+            info.version = SAME_VERSION;
+            info.started_unix_ns = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(wall_start.time_since_epoch())
+                    .count());
+            info.command = "scan";
+            info.root = path_key(root);
+            info.config_json = telemetry_config(config, options);
+            telemetry::Options settings;
+            settings.queue_capacity = config.telemetry_queue_capacity;
+            settings.event_cap = config.telemetry_max_events;
+            settings.retain_runs = config.telemetry_retention_runs;
+            trace = std::make_unique<telemetry::Telemetry>(root / ".same" / "telemetry.db",
+                                                           std::move(info), settings);
+        } catch (...) {
+            diagnostics << "Telemetry warning: cannot allocate run metadata; scan continues.\n";
+        }
+    }
+    telemetry::FinalRecord final;
     Counters counters;
-    const auto initialized = Clock::now();
-    scan(root, config, store, resources, counters, options.recursive);
-    const auto scanned = Clock::now();
-    partition(root, store, resources, config.queue_capacity);
-    resources.wait_idle();
-    const auto compared = Clock::now();
-    validate_results(root, store, options.unique_files);
-    // end_scan committed exactly the visited records; measure before emitting any output.
-    // end_scan 已提交全部已访问记录；在任何输出前读取文件长度。
-    counters.database_bytes = fs::file_size(root / ".same" / "state.db");
-    const auto validated = Clock::now();
-    render_results(store, counters, output, options);
-    const auto finished = Clock::now();
-    if (options.summary)
-        render_profile(counters, resources,
-                       {milliseconds(start, initialized), milliseconds(initialized, scanned),
-                        milliseconds(scanned, compared), milliseconds(compared, validated),
-                        milliseconds(validated, finished)},
-                       diagnostics, options);
-    if (config.backend == "cuda" && resources.gpu_workers() < config.workers)
-        diagnostics << "CUDA initialization or input registration failed for some workers; using "
-                       "CPU fallback.\n";
-    if (resources.dispatch_evidence().decision == detail::DispatchEvidence::Decision::failed)
-        diagnostics << "CUDA probe failed; auto selected CPU.\n";
+    std::array<double, 5> phases{};
+    std::ostringstream summary;
+    std::exception_ptr failure;
+    std::unique_ptr<Store> store;
+    std::unique_ptr<Resources> resources;
+    constexpr std::array<const char*, 5> stage_names{"initialize", "scan", "compare", "validate",
+                                                     "output"};
+    std::size_t stage = 0;
+    auto stage_start = start;
+    bool incomplete_telemetry = false;
+    auto event = [&](std::string_view type, std::string_view name, Clock::time_point begin,
+                     Clock::time_point end, std::uint64_t id, std::uint64_t parent,
+                     bool success = true) noexcept {
+        if (!trace)
+            return;
+        telemetry::Event record;
+        record.type = type;
+        record.name = name;
+        record.severity = success ? "info" : "error";
+        record.span_id = id;
+        record.parent_span_id = parent;
+        record.time_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(begin - start).count());
+        record.duration_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+        record.value = success ? 1 : 0;
+        // 阶段事件数量固定且走结束槽，不与抽样文件争用事件预算。
+        // Fixed-count phase events use the final slot, never compete with sampled files.
+        try {
+            final.events.push_back(record);
+        } catch (...) {
+            incomplete_telemetry = true;
+        }
+    };
+    auto end_stage = [&](Clock::time_point end, bool success = true) {
+        phases[stage] = milliseconds(stage_start, end);
+        event("span", stage_names[stage], stage_start, end, stage + 2, 1, success);
+        stage_start = end;
+    };
+    event("log", "run.start", start, start, 1, 0);
+    try {
+        store = std::make_unique<Store>(root / ".same" / "state.db");
+        resources = std::make_unique<Resources>(config);
+        end_stage(Clock::now());
+        stage = 1;
+        event("log", "scan.start", stage_start, stage_start, 3, 1);
+        scan(root, config, *store, *resources, counters, options.recursive, trace.get(), start);
+        end_stage(Clock::now());
+        stage = 2;
+        event("log", "compare.start", stage_start, stage_start, 4, 1);
+        partition(root, *store, *resources, config.queue_capacity);
+        resources->wait_idle();
+        end_stage(Clock::now());
+        stage = 3;
+        event("log", "validate.start", stage_start, stage_start, 5, 1);
+        validate_results(root, *store, options.unique_files);
+        counters.database_bytes = fs::file_size(root / ".same" / "state.db");
+        end_stage(Clock::now());
+        stage = 4;
+        event("log", "output.start", stage_start, stage_start, 6, 1);
+        render_results(*store, counters, output, options);
+        end_stage(Clock::now());
+    } catch (...) {
+        failure = std::current_exception();
+        if (resources)
+            resources->wait_idle();
+        end_stage(Clock::now(), false);
+        final.status = "failed";
+        try {
+            std::rethrow_exception(failure);
+        } catch (const std::exception& error) {
+            try {
+                final.error = error.what();
+            } catch (...) {
+                incomplete_telemetry = true;
+            }
+        } catch (...) {
+            try {
+                final.error = "non-standard exception";
+            } catch (...) {
+                incomplete_telemetry = true;
+            }
+        }
+    }
+    if (trace) {
+        try {
+            capture_telemetry(final, counters, resources.get(), phases);
+        } catch (...) {
+            incomplete_telemetry = true;
+        }
+    }
+    if (resources && !failure) {
+        if (options.summary)
+            render_profile(counters, *resources, phases, summary, options);
+        if (config.backend == "cuda" && resources->gpu_workers() < config.workers)
+            diagnostics
+                << "CUDA initialization or input registration failed for some workers; using "
+                   "CPU fallback.\n";
+        if (resources->dispatch_evidence().decision == detail::DispatchEvidence::Decision::failed)
+            diagnostics << "CUDA probe failed; auto selected CPU.\n";
+        if (trace && (resources->fallbacks() ||
+                      (config.backend == "cuda" && resources->gpu_workers() < config.workers) ||
+                      resources->dispatch_evidence().decision ==
+                          detail::DispatchEvidence::Decision::failed)) {
+            event("log", "backend.fallback", stage_start, stage_start, 1, 0);
+            if (!final.events.empty())
+                final.events.back().severity = "warn";
+        }
+    }
+    resources.reset();
+    store.reset();
+    const auto completed = Clock::now();
+    event("span", "run", start, completed, 1, 0, !failure);
+    event("log", failure ? "run.failed" : "run.completed", completed, completed, 1, 0, !failure);
+    if (trace && failure && !final.events.empty())
+        final.events.back().message = final.error;
+    if (incomplete_telemetry)
+        diagnostics << "Telemetry warning: final metadata is incomplete (allocation failure).\n";
+    telemetry::Stats stats;
+    if (trace)
+        stats = trace->finish(std::move(final));
+    const auto total_ms = milliseconds(start, Clock::now());
+    if (options.summary) {
+        diagnostics << summary.str();
+        render_telemetry(trace.get(), stats, total_ms, diagnostics, options.diagnostics_pretty);
+    }
+    // 写入失败不依赖 --summary，避免静默失去整个运行历史。 / Surface writer failure even
+    // without --summary so a missing run history is never silently reported as healthy.
+    if (stats.errors) {
+        diagnostics << "Telemetry warning: ";
+        quoted_path(diagnostics, std::string_view(stats.error));
+        diagnostics << '\n';
+    }
+    if (failure)
+        std::rethrow_exception(failure);
     return 0;
 }
 } // namespace same

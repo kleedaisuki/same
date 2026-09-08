@@ -79,12 +79,55 @@ void drift() {
     require(prediction.ms > 3.8 && prediction.ms < 4, "drift response too slow or unstable");
     require(prediction.samples == 56 && prediction.error_ms > 0, "uncertainty missing");
 }
+/// 导出保留未知状态、原始系数和后端隔离，且复制不会改变预测。
+/// Export preserves unknown state, raw coefficients and backend isolation without mutation.
+void parameter_export() {
+    using Model = same::detail::OnlineModel;
+    static_assert(Model::band_count == 32 && Model::backend_count == 2);
+    static_assert(Model::band_shift == 2 && Model::smoothing_alpha == 0.125);
+    Model model;
+    const auto empty = model.parameters();
+    require(empty.size() == 64, "parameter export is not bounded to 64 bands");
+    for (unsigned i = 0; i < empty.size(); ++i) {
+        const auto& band = empty[i];
+        require(!band.known && !band.samples && band.cost_ms_per_byte == 0 &&
+                    band.error_ms_per_byte == 0,
+                "unknown export fabricated evidence");
+        require(band.band_index == i % Model::band_count && band.gpu == (i >= Model::band_count),
+                "export band identity wrong");
+    }
+    require(model.observe(false, 1024, 8), "first sample rejected");
+    require(model.observe(false, 2048, 32), "second sample rejected");
+    require(model.seed(true, std::numeric_limits<std::uint64_t>::max(), 64), "max seed rejected");
+    const auto before = model.predict(false, 3072);
+    auto exported = model.parameters();
+    const auto& cpu = exported[5];
+    require(cpu.known && cpu.samples == 2 && cpu.cost_ms_per_byte == 0.0087890625 &&
+                cpu.error_ms_per_byte == 0.0009765625,
+            "trained coefficients changed during export");
+    require(!exported[4].known && !exported[6].known && !exported[Model::band_count + 5].known,
+            "export leaked evidence across bands or backends");
+    const auto& maximum = exported.back();
+    require(maximum.gpu && maximum.band_index == 31 && maximum.known && maximum.samples == 0,
+            "maximum band or seed identity lost");
+    require(before.ms == cpu.cost_ms_per_byte * 3072 &&
+                before.error_ms == cpu.error_ms_per_byte * 3072,
+            "export does not reproduce prediction");
+    exported[5].cost_ms_per_byte = 999;
+    const auto after = model.predict(false, 3072);
+    require(before.ms == after.ms && before.error_ms == after.error_ms &&
+                before.samples == after.samples && before.known == after.known,
+            "export mutated model or retained references");
+    require(empty[5].known == false && model.snapshot().samples == 2,
+            "old snapshot mutated or export added samples");
+}
 } // namespace
 int main() {
     try {
         boundaries();
         invalid_and_histograms();
         drift();
+        parameter_export();
         std::cout << "online model tests passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -19,17 +19,34 @@ namespace same {
 namespace detail {
 /// 可注入设备创建器；返回空表示不可用。 / Injectable device factory; null means unavailable.
 using CudaFactory = std::function<std::unique_ptr<Compute>(std::size_t, std::size_t)>;
+/// 路由参数的唯一来源，运行记录直接引用。 / Single source for routing policy and run snapshots.
+struct RoutingParameters {
+    /// 保守完成时间比较的 CPU 系数。 / CPU coefficient in conservative finish comparison.
+    static constexpr double cpu_advantage_factor = 0.95;
+    /// 每区间的探索机会间隔，CPU/GPU 交替。 / Per-band opportunities alternate CPU/GPU.
+    static constexpr std::uint64_t exploration_period = 64;
+    /// 未知区间初始 GPU 探索上限。 / Initial GPU explorations per unknown band.
+    static constexpr unsigned initial_gpu_explorations = 2;
+    /// 小任务采样间隔。 / Small-task sampling period.
+    static constexpr std::uint64_t small_sample_period = 64;
+    /// 未知模型的初始 GPU 偏好和独立更新块。 / Initial preference floor and separate GPU block.
+    static constexpr std::uint64_t static_gpu_floor_bytes = 64ULL * 1024 * 1024;
+    static constexpr std::size_t gpu_block_bytes = 16 * 1024 * 1024;
+};
 /// 比较完成成本；等待与服务时间必须非负且有限，误差不是置信区间。
 /// Compare completion costs; waits/service must be nonnegative finite, errors are not confidence
 /// bounds.
 inline bool gpu_finishes_first(OnlineModel::Prediction cpu, OnlineModel::Prediction gpu,
                                double cpu_wait, double gpu_wait) noexcept {
-    return gpu_wait + gpu.ms + gpu.error_ms < 0.95 * (cpu_wait + cpu.ms) - cpu.error_ms;
+    return gpu_wait + gpu.ms + gpu.error_ms <
+           RoutingParameters::cpu_advantage_factor * (cpu_wait + cpu.ms) - cpu.error_ms;
 }
 } // namespace detail
 /// 单线程独占的复用缓冲及可降级后端。 / Reusable buffers and fallback-capable backend exclusively
 /// owned by one worker thread.
 struct Worker {
+    /// 稳定运行内通道编号；只在启动前写入。 / Stable per-run lane ID, assigned before startup.
+    std::size_t index{};
     /// 两个等容量输入缓冲，任务结束后复用。 / Equal-capacity input buffers reused between tasks.
     std::vector<std::byte> first, second;
     /// 运行期间可能永久替换为 CPU 的当前后端。 / Active backend, possibly permanently replaced with
@@ -217,7 +234,11 @@ public:
         return {cpu, gpu};
     }
 
-    /// 空闲后读取连续剖析快照；不得与任务并发。 / Read profiling snapshot after idle only.
+    /// 仅空闲后导出模型系数，不改变在线状态。 / Export coefficients after idle without mutation.
+    auto model_parameters() const {
+        return model_.parameters();
+    }
+    /// 空闲后取得有界剖析统计。 / Read bounded profiling totals after idle.
     auto profile_snapshot() const {
         return model_.snapshot();
     }
