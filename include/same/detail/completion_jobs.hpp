@@ -76,8 +76,8 @@ public:
                     gpu_eligible ? HashRoute::gpu_preferred : HashRoute::cpu_only);
     }
     /// 显式区分不可卸载与可忙时互补的载荷。 / Distinguish CPU-only work from saturation spill.
-    template <class F> void submit_hash(F&& operation, HashRoute route) {
-        submit_impl(std::forward<F>(operation), false, route);
+    template <class F> void submit_hash(F&& operation, HashRoute route, std::uint64_t bytes = 0) {
+        submit_impl(std::forward<F>(operation), false, route, bytes);
     }
 
 private:
@@ -85,7 +85,8 @@ private:
     /// Both admission routes share publication and capacity contracts, differing only in
     /// scheduling.
     template <class F>
-    void submit_impl(F&& operation, bool pinned, std::optional<HashRoute> route) {
+    void submit_impl(F&& operation, bool pinned, std::optional<HashRoute> route,
+                     std::uint64_t bytes = 0) {
         if (pending_ == state_->ring.size())
             throw std::logic_error("completion admission capacity exceeded");
         auto publish = [state = state_,
@@ -105,7 +106,7 @@ private:
             state->ready.notify_one();
         };
         if (route)
-            resources_.submit_hash(std::move(publish), *route);
+            resources_.submit_hash(std::move(publish), *route, bytes);
         else
             resources_.submit(std::move(publish), pinned);
         ++pending_;

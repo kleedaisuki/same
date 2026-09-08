@@ -25,6 +25,14 @@ struct DispatchEvidence {
     /// 两类摘要均完整验证并计时；设备可用性不等同于任何一类性能胜出。
     /// Both shapes were fully validated/timed; availability is distinct from winning either shape.
     bool calibration_complete{};
+    /// GPU 预热摘要已验证；不能将超时当作设备故障。 / GPU warmup digest validated;
+    /// timeout is not a device failure.
+    bool device_validated{};
+    /// 每种形状均需三组成对样本；完整形状不受另一形状超时否决。
+    /// Each shape requires three paired samples; another shape's timeout cannot veto it.
+    bool block_complete{}, stream_complete{};
+    /// 正常完成、软期限和设备异常分开报告。 / Distinguish completion, deadline and device error.
+    enum class StopReason { none, deadline, device_error } stop_reason{StopReason::none};
     /// 独立的短块/长流偏好，单块不胜不得否决长流胜出。
     /// Independent block/stream preferences; losing one block must not veto a winning stream.
     bool block_gpu_preferred{}, stream_gpu_preferred{};

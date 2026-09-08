@@ -87,7 +87,10 @@ std::string default_config() {
         << "\n# 旧配置兼容字段；不再阻止忙时 GPU 分流 / Retired compatibility field, not an "
            "offload gate\n"
         << "gpu_probe_bytes = " << c.gpu_probe_bytes << "\nbackend = \"" << c.backend
-        << "\"\nrehash = " << (c.rehash ? "true" : "false") << '\n';
+        << "\"\nrehash = " << (c.rehash ? "true" : "false")
+        << "\n# 运行时剖析引导路由，非编译器 PGO；不控制汇总输出 / Runtime profile-guided routing, "
+           "not compiler PGO or summary output\n"
+        << "pgo = " << (c.pgo ? "true" : "false") << '\n';
     return out.str();
 }
 /// 保守忽略元数据，不默认隐藏用户文档或构建产物。 / Ignore metadata, not user docs or builds.

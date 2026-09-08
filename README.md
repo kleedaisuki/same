@@ -56,6 +56,7 @@ Run the installed executable **from the directory to scan**:
 same                            # 等同 same scan，仅当前目录 / same scan, root files only
 same scan -r                    # 递归子目录 / include subdirectories
 same scan --cpu --rehash         # CPU 强制重新哈希 / CPU, bypass digest cache
+same scan -r --no-pgo            # 关闭运行时路由分析器 / disable runtime routing analyzer
 same scan -r --summary           # 显示汇总、数据库与性能统计 / show all statistics
 same new                        # 生成标准配置与推荐忽略规则 / deploy defaults and ignore
 same clean                      # 删除当前 .same / remove this directory's .same
@@ -221,18 +222,36 @@ rehash = false
 | `queue_capacity` | `2 * workers` | 1–65536 |
 | `backend` | `"auto"` | `"auto"`, `"cpu"`, `"cuda"` |
 | `rehash` | `false` | 布尔值 / boolean |
+| `pgo` | `true` | 运行时剖析引导路由；`--no-pgo` 可覆盖关闭 / Runtime profile-guided routing; CLI can disable |
 
-`auto` 保留全部 `workers` 路CPU，首个未缓存的合格载荷后台初始化独立GPU服务，不阻塞CPU流水线。
-默认小于16MiB直接CPU SIMD；CPU仍用1MiB块，GPU在主机预算允许时独立使用16MiB块。
-64MiB起的长类与较短载荷分别校准，明显GPU优势形成偏好；CPU全忙时GPU也可接手其他合格载荷，
-GPU忙时CPU接手GPU优先任务。小文件和比较任务不进入GPU。设置费用不保证在短批次摊销。
-`cuda` 保留显式选择和大小下界；失败仍完整CPU重试，不混用半个摘要。
+`auto` 保留全部 `workers` 路 CPU SIMD，首个未缓存的合格文件后台初始化独立 GPU 服务。
+默认小于 16 MiB 直接 CPU；资格仅由 `gpu_min_bytes` 控制，不再随 CPU 的 `block_bytes` 改变。
+GPU 默认独立采用 16 MiB 更新块，预算不足时降级或停用 GPU，不使合法 CPU 配置失效。
+启动仅执行最小设备正确性检查，不运行合成性能校准；在线模型仅从真实成功任务学习。
+未知区间先用静态偏好：合格文件达到 64 MiB 时 GPU 优先，其余 CPU 优先。
+在线模型结合真实任务统计、设备预计等待时间与预测误差选择后端；在任务边界双向互助，
+不迁移正在计算的摘要。初始化有成本，不保证短批次获益。
 
-Auto keeps all CPU workers and lazily adds one budgeted GPU service. CPU uses its configured block;
-GPU prefers a separate 16MiB block. Small and long eligible shapes have independent measured preferences.
-Saturated CPUs spill eligible work to an idle GPU; a busy GPU spills preferred work to idle CPUs.
-Small-only and cache-only scans skip setup. Short eligible batches may not amortize initialization.
-Explicit modes and full failure retries are preserved. See [the routing design](docs/adaptive-routing-design.md).
+Auto keeps all CPU workers and lazily initializes a separate budgeted GPU service. Eligibility depends
+on `gpu_min_bytes`, not CPU block size. GPU prefers an independent 16 MiB update block. Online routing
+combines observed task costs, estimated waits and prediction error; assistance occurs at job boundaries.
+Startup checks correctness without synthetic performance calibration. Only real successful tasks train
+the model; unknown bands start with GPU preference at 64 MiB and CPU preference below, subject to eligibility.
+Setup is not free and short batches need not benefit.
+
+`pgo=true` 默认启用运行时剖析引导优化（profile-guided optimization, PGO）。
+`--no-pgo` 覆盖配置，关闭采样、学习和模型决策，保留设备正确性检查与静态分流：
+合格文件达到 64 MiB 时 GPU 优先，其余 CPU 优先，忙时仍可互助。它不是 `--cpu`，
+也不改变编译器 PGO。`--summary` 仅控制统计是否显示，不启停模型。
+
+Runtime PGO defaults on. `--no-pgo` disables sampling, learning and model
+placement, not device correctness checks or GPU support. Static eligible files at least 64 MiB prefer
+GPU, smaller eligible files prefer CPU, with busy-device assistance. This is neither forced CPU nor a
+compiler PGO switch. Summary visibility is independent of analyzer operation.
+
+详见[自动分流契约](docs/auto-dispatch.md)、[在线模型研究](docs/online-routing-design.md)与
+[实验计划](docs/online-routing-experiment-plan.md)。 / See the routing contract, research design and
+experiment plan; historical benchmarks do not establish the new model's speedup.
 
 ### 有界扫描流水线 / Bounded scanning pipeline
 
@@ -244,32 +263,26 @@ Directory and file-metadata work form a dynamic task graph. Metadata workers sha
 
 Metadata handles transfer directly to hashing or close on cache hits, avoiding a duplicate open while retaining fresh pre/post-read object and path-binding checks. Each result carries at most one open file; active workers and depth-first directory cursors add resources outside queue lengths. Budgets are not hard handle/process-memory limits.
 
-小文件默认走 CPU SIMD，`cpu_routed_hashes` 不算错误回退。自动资格下界为
-`max(gpu_min_bytes,block_bytes)`；0不取消CPU块下界，也不凭空建立GPU偏好。
-显式 `backend="cuda"` 保留独立选择契约。精确字节比较始终使用主机缓冲区。
+`cpu_routed_hashes` 是大小策略路由次数，不是失败回退。`cpu_hashes` / `gpu_hashes`
+统计真实文件哈希尝试，不包括设备检查。`gpu_setup_ms` 展示初始化成本；运行时不再执行
+合成性能校准，设备检查成功后 `calibration_stop=not-run-device-checked`，旧校准耗时字段
+保留为零，不表示 GPU 没优势。`gpu_block_bytes` 是实际 GPU 更新块，不代表已经执行文件任务。
+精确比较始终在主机完成。
 
-Auto eligibility uses the larger of the user floor and CPU block size; zero removes neither the
-CPU-block lower bound nor the need for measured preference. Exact comparisons remain host-side.
+Size routing is not failure fallback. Hash-attempt counters exclude device checks. Setup metrics expose
+initialization costs. Runtime synthetic calibration is not run: after device validation,
+`calibration_stop=not-run-device-checked` and legacy calibration timings remain zero, not evidence of
+GPU inferiority. GPU block size alone does not prove file execution; comparison remains host-side.
 
-分界取决于文件大小、单次块大小、显存预算和并发。新的 ncu 驱动优化后，同样 64 MiB 输入，16 MiB 更新块可让 GPU 胜过 CPU，而 1 MiB 更新块不具相同优势。旧的固定 16 MiB 文件阈值不能表达这个差异。探测使用2秒软预算，完整操作后检查，不强行中断驱动；费用计入Scan/Elapsed，摘要不一致直接失败。
+持续剖析（continuous profiling）仅在进程内聚合任务级样本，不采集操作系统调用栈，
+不逐文件记录路径、不逐块计时，也不写入摘要数据库。固定大小统计包括 CPU/GPU 样本数、
+已知大小区间、预测误差和有界延迟分布；它们通过 `--summary` 展示。
+该机制追求低开销，而不是声称数学意义上的零成本；性能结论须由对照实验支持。
 
-The decision depends on file size, update block size, device budget and concurrency. After ncu-driven optimization, 64 MiB input with 16 MiB updates can favor GPU while 1 MiB updates do not show the same benefit. Auto uses a two-second soft probe budget, charged to Scan/Elapsed; it checks after complete operations and never suppresses digest mismatches.
-
-`cpu_hashes` / `gpu_hashes` 报告实际文件哈希尝试数，不含校准；`auto_backend`、`gpu_setup_ms`、`calibration_ms` 和 `probe_*_ms` 字段展示决策证据。单实例校准不是整盘加速证明；短扫描或全缓存扫描可显式选择 CPU 避免探测费用。详见[自动分派契约](docs/auto-dispatch.md)、[ncu 证据](docs/gpu-profiling.md)与[实测分派基准](docs/dispatch-benchmark.md)。
-
-Actual CPU/GPU hash attempts exclude calibration; `auto_backend`, `calibration_ms`, and four `probe_*_ms` fields expose the decision evidence. A single-instance probe does not prove whole-drive speedup. Explicit CPU avoids probing for short or fully cached scans.
-
-`auto_backend=adaptive` 表示独立GPU服务可用，不代表每项任务均走GPU。
-`gpu_overflow_jobs` 记录CPU全忙时的GPU接手次数，`cpu_spill_jobs`记录CPU接手GPU偏好任务
-（GPU忙或优先队列有积压）；`gpu_block_bytes`及两个
-`gpu_*_preferred`字段报告实际输入块和短/长偏好。旧混合/摊销统计字段保留为0。
-Adaptive service availability is not per-job GPU execution. New routing counters expose assistance;
-block size and shape preferences expose policy. Retired mixed/amortization fields remain zero.
-
-合格哈希在GPU优先、CPU可窃取的有界队列中持续分流；缓存验证与已见更新合并为一次数据库操作。
-实现边界、CPU/CUDA回归与分阶段实测见[哈希分流及数据库验证](docs/hash-store-validation.md)。
-Eligible hashes use bounded GPU-preferred, CPU-stealable scheduling; cache validation and marking
-are fused. See the linked validation report for contracts, regressions and measured limitations.
+Continuous profiling aggregates bounded task-level statistics in process; it is not an OS stack sampler.
+It adds no per-file path log, per-block timers or digest-database writes. Summary reports backend sample
+counts, known bands, prediction errors and bounded latency distributions. Low overhead must be measured,
+not asserted as literally zero.
 
 新增统计：`walk_wait_ms` 是协调线程等待遍历结果的时间；`enumerate_work_ms`、`metadata_work_ms` 是各工作线程累计时间，不应与总耗时相加；`database_work_ms` 为扫描协调器数据库操作时间。旧 `scan_work_ms` 字段仍为 `scan_ms - hash_wait_ms`，现在包含等待元数据的时间，不是 CPU 工作时间。`walk_task_peak`、`walk_result_peak` 显示队列峰值。
 

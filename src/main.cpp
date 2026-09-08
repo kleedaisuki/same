@@ -21,6 +21,7 @@ void help() {
            "  --summary  show Summary, Database and profiling (off by default)\n"
            "  --rehash       ignore cached hashes for this scan\n"
            "  --cpu          force the CPU backend\n"
+           "  --no-pgo       disable runtime profile-guided routing (not compiler PGO)\n"
            "  --unique-files show unmatched paths (TSV: group 0)\n"
            "  --color=auto|always|never  auto honors NO_COLOR and redirection\n"
            "  --format=auto|pretty|tsv  auto uses pretty on terminals, TSV otherwise\n"
@@ -47,7 +48,7 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("unknown command: " + std::string(command));
         }
         bool rehash = false, cpu = false, unique_files = false;
-        bool recursive = false, summary = false;
+        bool recursive = false, summary = false, no_pgo = false;
         auto color_mode = same::ColorMode::automatic;
         std::string_view format = "auto";
         for (int i = first; i < argc; ++i) {
@@ -71,6 +72,8 @@ int main(int argc, char** argv) {
                 rehash = true;
             else if (arg == "--cpu")
                 cpu = true;
+            else if (arg == "--no-pgo")
+                no_pgo = true;
             else if (arg == "--unique-files")
                 unique_files = true;
             else if (arg == "--summary")
@@ -101,6 +104,8 @@ int main(int argc, char** argv) {
             config.rehash = true;
         if (cpu)
             config.backend = "cpu";
+        if (no_pgo)
+            config.pgo = false;
         same::TerminalColor color(color_mode);
         const bool pretty = format == "pretty" || (format == "auto" && same::stdout_terminal());
         same::TerminalColor diagnostic_color(color_mode, same::TerminalStream::diagnostics);

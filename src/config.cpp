@@ -47,7 +47,7 @@ Config Config::load(const std::filesystem::path& root) {
         if (name != "workers" && name != "metadata_workers" && name != "block_bytes" &&
             name != "memory_bytes" && name != "device_memory_bytes" && name != "queue_capacity" &&
             name != "backend" && name != "rehash" && name != "gpu_min_bytes" &&
-            name != "gpu_probe_bytes")
+            name != "gpu_probe_bytes" && name != "pgo")
             throw std::runtime_error("unknown configuration key: " + std::string(name));
     }
     auto number = [&](const char* name, std::size_t& target) {
@@ -93,6 +93,12 @@ Config Config::load(const std::filesystem::path& root) {
         if (!value)
             throw std::runtime_error("rehash must be boolean");
         result.rehash = *value;
+    }
+    if (table.contains("pgo")) {
+        auto value = table["pgo"].value_exact<bool>();
+        if (!value)
+            throw std::runtime_error("pgo must be boolean");
+        result.pgo = *value;
     }
     result.validate();
     return result;

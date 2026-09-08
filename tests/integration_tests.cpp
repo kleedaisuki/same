@@ -667,7 +667,9 @@ void command_validation(const fs::path& exe) {
                                                                        {"clean", "--summary"},
                                                                        {"scan", "--unknown"},
                                                                        {"scan", "--sumary"},
-                                                                       {"clean", "--cpu"}}) {
+                                                                       {"clean", "--cpu"},
+                                                                       {"clean", "--no-pgo"},
+                                                                       {"new", "--no-pgo"}}) {
         check(execute(exe, f.root, f.base / "stdout", f.base / "stderr", arguments) == 2,
               "invalid command accepted");
         check(!fs::exists(f.root / ".same"), "invalid command created state");
@@ -783,6 +785,40 @@ void size_routing(const fs::path& exe) {
           "cached eligible files initialized CUDA");
 }
 
+/// 分析器开关不改变摘要与缓存；禁用后不得产生在线样本。
+/// Analyzer control preserves digests/cache and suppresses online samples when disabled.
+void pgo_control(const fs::path& exe) {
+    Fixture f(exe);
+    f.config({{"pgo", "true"}, {"gpu_min_bytes", "0"}});
+    f.file("a", std::string(4096, 'p'));
+    f.file("b", std::string(4096, 'p'));
+    const Groups expected{group({"a", "b"})};
+    f.expect(expected);
+    check(f.stats["pgo_enabled"] == 1 && f.stats["pgo_samples"] == 2,
+          "enabled analyzer did not observe successful eligible CPU hashes");
+    check(execute(exe, f.root, f.base / "stdout", f.base / "stderr",
+                  {"scan", "--summary", "--rehash", "--format=pretty"}) == 0,
+          "pretty online summary failed");
+    const auto pretty = read(f.base / "stderr");
+    check(pretty.find("Online PGO") != std::string::npos &&
+              pretty.find("2 samples (2 CPU | 0 GPU)") != std::string::npos &&
+              pretty.find("Model error") != std::string::npos &&
+              pretty.find("Sample latency") != std::string::npos,
+          "pretty summary omitted online profiling evidence");
+    check(f.run(0, {"scan", "-r", "--summary", "--rehash", "--no-pgo"}) == expected,
+          "no-pgo changed duplicate groups");
+    check(f.stats["pgo_enabled"] == 0 && f.stats["pgo_samples"] == 0 &&
+              f.stats["pgo_predicted_samples"] == 0 && f.stats["calibration_ms"] == 0,
+          "no-pgo left performance analysis enabled");
+    f.expect(expected);
+    check(f.stats["cached"] == 2 && f.stats["pgo_samples"] == 0,
+          "cache-only scan produced model samples");
+    f.config({{"pgo", "false"}, {"rehash", "true"}});
+    f.expect(expected);
+    check(f.stats["pgo_enabled"] == 0 && f.stats["pgo_samples"] == 0,
+          "configuration did not disable analyzer");
+}
+
 /// 跨进程锁必须拒绝第二个扫描器，Windows 状态目录大小写不敏感。 / Reject a competing scanner;
 /// Windows state-directory exclusion is case insensitive.
 void locking_and_state(const fs::path& exe) {
@@ -832,6 +868,7 @@ int main(int argc, char** argv) {
         {"size routing", size_routing},
         {"presentation", presentation},
         {"scan commands", scan_commands},
+        {"pgo control", pgo_control},
         {"command validation", command_validation},
         {"lifecycle commands", lifecycle_commands},
         {"locking and state", locking_and_state}};

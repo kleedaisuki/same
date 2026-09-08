@@ -2,6 +2,7 @@
 #include "same/compute.hpp"
 #include "same/config.hpp"
 #include "same/detail/dispatch.hpp"
+#include "same/detail/online_model.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -18,6 +19,13 @@ namespace same {
 namespace detail {
 /// 可注入设备创建器；返回空表示不可用。 / Injectable device factory; null means unavailable.
 using CudaFactory = std::function<std::unique_ptr<Compute>(std::size_t, std::size_t)>;
+/// 比较完成成本；等待与服务时间必须非负且有限，误差不是置信区间。
+/// Compare completion costs; waits/service must be nonnegative finite, errors are not confidence
+/// bounds.
+inline bool gpu_finishes_first(OnlineModel::Prediction cpu, OnlineModel::Prediction gpu,
+                               double cpu_wait, double gpu_wait) noexcept {
+    return gpu_wait + gpu.ms + gpu.error_ms < 0.95 * (cpu_wait + cpu.ms) - cpu.error_ms;
+}
 } // namespace detail
 /// 单线程独占的复用缓冲及可降级后端。 / Reusable buffers and fallback-capable backend exclusively
 /// owned by one worker thread.
@@ -33,8 +41,8 @@ struct Worker {
     /// 按大小路由到 CPU 的哈希次数，仅工作线程写入。
     /// Hash attempts routed to CPU by size; worker-thread-only writes.
     std::uint64_t cpu_routed_hashes{};
-    /// 自动模式要求至少一个完整配置块；显式 CUDA 模式保持用户下界。
-    /// Auto requires at least one full configured block; explicit CUDA keeps the user floor.
+    /// 文件资格仅取显式大小下界，与缓冲容量无关。 / Eligibility is the explicit size floor,
+    /// independent of buffers.
     std::size_t gpu_floor{};
     /// 实际后端哈希尝试数（错误重试也计入）。 / Actual backend hash attempts, including retries.
     std::uint64_t cpu_hashes{}, gpu_hashes{};
@@ -44,6 +52,22 @@ struct Worker {
     /// Actual successful read bytes, including backend retries; worker-thread-only writes.
     /// 实际成功读取字节，包含后端重试；仅所属工作线程写入。
     std::uint64_t hash_bytes{0}, compare_bytes{0};
+
+    /// 成功任务的固定大小观测槽；仅所属线程写，完成锁内消费。
+    /// Fixed-size successful-task sample; worker writes, completion lock consumes.
+    struct Sample {
+        /// 实际输入字节和已有计时（毫秒）。 / Input bytes and existing duration in ms.
+        std::uint64_t bytes{};
+        double service_ms{};
+        /// 实际后端与完整成功标记。 / Actual backend and complete-success marker.
+        bool gpu{}, valid{};
+    } sample;
+    /// 关闭 PGO 时不采样；小任务的有界采样序号由所属线程维护。
+    /// No sampling with PGO disabled; worker-owned bounded small-task sampling sequence.
+    bool profile_enabled{};
+    std::uint64_t profile_sequence{};
+    /// 锁内预测的完成时刻，零表示没有可靠估计。 / Locked predicted finish, zero if unknown.
+    double predicted_finish_ms{};
 
     /**
      * @brief 后端失败时换为 CPU，并完整重试一次。 / Replace a failed backend with CPU and retry
@@ -125,12 +149,12 @@ public:
     /// 按载荷偏好提交；CPU-only 永不进入自动 GPU 服务。 / Submit by payload preference;
     /// CPU-only work never enters the automatic GPU service.
     template <class F>
-    auto submit_hash(F&& operation, detail::HashRoute route)
+    auto submit_hash(F&& operation, detail::HashRoute route, std::uint64_t bytes = 0)
         -> std::future<std::invoke_result_t<F, Worker&>> {
-        return submit_impl(std::forward<F>(operation), false, route);
+        return submit_impl(std::forward<F>(operation), false, route, bytes);
     }
-    /** 使用独立缓冲同步探测一次，可与已有 CPU 工作重叠。 / Probe synchronously once using
-     * independent buffers, overlapping existing CPU work. 不得并发调用本函数或读取统计。
+    /** 使用独立缓冲同步验证一次，不运行性能校准。 / Validate synchronously once using
+     * independent buffers without performance calibration. 不得并发调用本函数或读取统计。
      * Do not call this method concurrently with itself or statistics access.
      */
     void prepare_auto(const Config& config, std::uint64_t pending_bytes, std::size_t pending_files);
@@ -193,31 +217,77 @@ public:
         return {cpu, gpu};
     }
 
+    /// 空闲后读取连续剖析快照；不得与任务并发。 / Read profiling snapshot after idle only.
+    auto profile_snapshot() const {
+        return model_.snapshot();
+    }
+    /// 空闲后读取实际探索任务数。 / Actual exploration jobs after idle.
+    std::uint64_t exploration_jobs() const {
+        return exploration_jobs_;
+    }
+    /// 固定剖析开关。 / Frozen profiling switch.
+    bool profiling_enabled() const {
+        return pgo_;
+    }
+    /// 空闲后读取服务存活状态。 / Read service liveness after idle.
+    bool gpu_service_enabled() const {
+        return preferred_enabled_;
+    }
+
 private:
     /// 统一打包与异常传递，仅排队类别不同。 / Shared packaging/exception contract for all routes.
     template <class F>
-    auto submit_impl(F&& operation, bool pinned, detail::HashRoute route)
+    auto submit_impl(F&& operation, bool pinned, detail::HashRoute route, std::uint64_t bytes = 0)
         -> std::future<std::invoke_result_t<F, Worker&>> {
         using Task = std::packaged_task<std::invoke_result_t<F, Worker&>(Worker&)>;
         auto task = std::make_shared<Task>(std::forward<F>(operation));
         auto future = task->get_future();
-        enqueue([task](Worker& worker) { (*task)(worker); }, pinned, route);
+        enqueue([task](Worker& worker) { (*task)(worker); }, pinned, route, bytes);
         return future;
     }
     /// 单次运行的性能选择，不跨机器/驱动/配置持久化。
     /// Per-run performance selection; never persisted across hardware/driver/config changes.
     detail::DispatchEvidence dispatch_;
+    /// 仅在现有队列锁内更新的固定空间模型。 / Fixed-space model under the existing queue lock.
+    detail::OnlineModel model_;
+    /// 构造时冻结，禁用后不预测或学习。 / Frozen at construction; disabled means no
+    /// prediction/learning.
+    bool pgo_{};
+    /// 未知区间最多两次初始探索，要求 CPU 饱和或已有 GPU 形状偏好。
+    /// At most two initial unknown-band explorations, requiring saturation or a GPU shape
+    /// preference.
+    std::array<unsigned char, 32> exploration_{};
+    /// 每区间每64个合格任务一次再探索；总次数可观测。
+    /// One re-exploration per 64 eligible tasks per band; observable total.
+    std::array<std::uint64_t, 32> arrivals_{};
+    std::uint64_t exploration_jobs_{};
+    /// 任务元数据与原有函数一起入队，无独立分配。 / Metadata inline with the existing callable.
+    struct QueuedTask {
+        std::function<void(Worker&)> operation;
+        std::uint64_t bytes{};
+        detail::HashRoute route{detail::HashRoute::cpu_only};
+        /// 0=无，1=CPU，2=GPU；仅目标空闲时探索。 / 0=none, 1=CPU, 2=GPU; idle targets only.
+        unsigned char explore{};
+    };
+    /// 锁内比较含等待时间的完成成本；未知模型保持静态偏好。
+    /// Compare completion costs including waiting under lock; unknown models use static preference.
+    bool prefer_gpu(const QueuedTask& task) const;
+    /// 返回可领取队列，空表示等待真实在途任务而非预测计时器。
+    /// Return runnable queue; null waits for real in-flight work, never a prediction timer.
+    std::deque<QueuedTask>* runnable_queue(bool gpu);
+
     /// 自动探测状态；服务可用状态由队列锁保护。 / Auto probe state; service availability is locked.
     bool auto_mode_{}, auto_attempted_{}, preferred_enabled_{};
     /// 创建后端，不持有队列锁。 / Backend factory, invoked without the queue lock.
     detail::CudaFactory cuda_factory_;
     /// 等待共享容量后按类别排队。 / Wait for shared capacity and enqueue by class.
-    void enqueue(std::function<void(Worker&)> task, bool pinned, detail::HashRoute route);
+    void enqueue(std::function<void(Worker&)> task, bool pinned, detail::HashRoute route,
+                 std::uint64_t bytes);
     /// 队列锁下决定当前线程能否领取。 / Decide eligibility under the queue lock.
-    bool can_run(bool gpu) const;
+    bool can_run(bool gpu);
     /// 锁内领取并更新活动/路由计数；必须持有 mutex_ 且 can_run(gpu) 为真。
     /// Dequeue and update activity/routing; requires mutex_ held and can_run(gpu) true.
-    std::function<void(Worker&)> take_task(bool gpu);
+    QueuedTask take_task(Worker& worker, bool gpu, std::deque<QueuedTask>& source);
     /// 执行任务并发布活动状态，服务错误后退出。 / Execute and publish activity; failed service
     /// exits.
     void run(Worker& worker, bool gpu = false);
@@ -241,7 +311,7 @@ private:
     std::vector<std::thread> threads_;
     /// 普通、固定 GPU、GPU 优先及 CPU 优先队列，均由 mutex_ 保护。
     /// Ordinary, pinned GPU, GPU-preferred and CPU-preferred queues, protected by mutex_.
-    std::deque<std::function<void(Worker&)>> queue_, gpu_queue_, hash_queue_, cpu_hash_queue_;
+    std::deque<QueuedTask> queue_, gpu_queue_, hash_queue_, cpu_hash_queue_;
     /// 锁内活动数量；future 就绪不等于执行器已归还。 / Locked activity; ready futures may precede
     /// return.
     std::size_t cpu_active_{};

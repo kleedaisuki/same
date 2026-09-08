@@ -9,10 +9,13 @@ HashRoute classify_hash(std::uint64_t bytes, std::size_t floor, std::size_t gpu_
                         const DispatchEvidence& evidence) {
     if (bytes < floor || !bytes)
         return HashRoute::cpu_only;
-    if (!evidence.calibration_complete || !gpu_block)
+    if (evidence.decision == DispatchEvidence::Decision::failed || !gpu_block)
         return HashRoute::cpu_preferred;
     const bool stream = bytes >= 64ULL * 1024 * 1024 && bytes / gpu_block >= 4;
-    const bool wins = stream ? evidence.stream_gpu_preferred : evidence.block_gpu_preferred;
+    const bool complete = evidence.calibration_complete ||
+                          (stream ? evidence.stream_complete : evidence.block_complete);
+    const bool wins =
+        complete && (stream ? evidence.stream_gpu_preferred : evidence.block_gpu_preferred);
     // 小于校准输入的未测形状不外推单块胜利。 / Do not extrapolate a block win below its input size.
     return wins && bytes >= gpu_block ? HashRoute::gpu_preferred : HashRoute::cpu_preferred;
 }
@@ -71,7 +74,10 @@ static DispatchEvidence probe(Compute& cpu, Compute& gpu, std::span<std::byte> s
     const auto start = Clock::now();
     const auto expired = [&] {
         result.elapsed_ms = milliseconds(start);
-        return result.elapsed_ms >= static_cast<double>(budget.count());
+        const bool deadline = result.elapsed_ms >= static_cast<double>(budget.count());
+        if (deadline)
+            result.stop_reason = DispatchEvidence::StopReason::deadline;
+        return deadline;
     };
     if (expired())
         return result;
@@ -85,6 +91,7 @@ static DispatchEvidence probe(Compute& cpu, Compute& gpu, std::span<std::byte> s
         if (expired())
             return result;
         sample(gpu, scratch, blocks, expected, scratch.size());
+        result.device_validated = true;
         if (expired())
             return result;
         const auto timed = [&](Compute& compute, double& value, std::size_t step) {
@@ -104,16 +111,20 @@ static DispatchEvidence probe(Compute& cpu, Compute& gpu, std::span<std::byte> s
             }
         }
         if (blocks == 1) {
+            result.block_complete = true;
             result.cpu_block_ms = median(cpu_ms);
             result.gpu_block_ms = median(gpu_ms);
             result.block_gpu_preferred = stable_gpu_win(cpu_ms, gpu_ms);
         } else {
+            result.stream_complete = true;
             result.cpu_stream_ms = median(cpu_ms);
             result.gpu_stream_ms = median(gpu_ms);
             result.cpu_stream_fastest_ms = *std::min_element(cpu_ms.begin(), cpu_ms.end());
             result.gpu_stream_slowest_ms = *std::max_element(gpu_ms.begin(), gpu_ms.end());
             result.stream_gpu_preferred = stable_gpu_win(cpu_ms, gpu_ms);
         }
+        if (result.block_gpu_preferred || result.stream_gpu_preferred)
+            result.decision = DispatchEvidence::Decision::gpu;
     }
     result.elapsed_ms = milliseconds(start);
     result.calibration_complete = true;
@@ -129,6 +140,7 @@ DispatchEvidence calibrate_dispatch(Compute& cpu, Compute& gpu, std::span<std::b
     } catch (const ComputeError&) {
         DispatchEvidence result;
         result.decision = DispatchEvidence::Decision::failed;
+        result.stop_reason = DispatchEvidence::StopReason::device_error;
         result.elapsed_ms = milliseconds(start);
         return result;
     }

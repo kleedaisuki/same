@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 namespace {
 /// 不依赖 NDEBUG 的断言。 / Assertions independent of NDEBUG.
@@ -74,11 +75,70 @@ public:
         return "fault";
     }
 };
+/// 在指定摘要创建时越过期限，摘要仍由真实 CPU 后端验证。
+/// Cross the deadline on a selected creation while retaining real digest correctness.
+class DelayedCompute final : public same::Compute {
+    /// 委托真实摘要；计数仅用于确定性选择超时阶段。
+    /// Real digest delegate; the counter selects which stage times out.
+    std::unique_ptr<same::Compute> cpu_{same::make_cpu_compute()};
+    unsigned calls_{}, delayed_call_;
+
+public:
+    /// 指定预热或样本阶段。 / Select the warmup or sampling stage.
+    explicit DelayedCompute(unsigned call) : delayed_call_(call) {}
+    /// 一次延迟超过测试预算。 / One delay exceeds the test budget.
+    std::unique_ptr<same::Hasher> hasher() override {
+        if (++calls_ == delayed_call_)
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        return cpu_->hasher();
+    }
+    /// 保持计算接口语义。 / Preserve the compute interface contract.
+    bool equal(std::span<const std::byte> a, std::span<const std::byte> b) override {
+        return cpu_->equal(a, b);
+    }
+    /// 测试后端名称。 / Test backend name.
+    std::string name() const override {
+        return "delayed";
+    }
+};
+/// 已完成的块样本在长流超时后仍有效，部分样本不能建立偏好。
+/// Completed block evidence survives stream timeout; partial samples cannot establish preference.
+void partial_evidence() {
+    using namespace same::detail;
+    auto cpu = same::make_cpu_compute();
+    std::vector<std::byte> bytes(1024);
+    DelayedCompute stream_timeout(5);
+    const auto partial =
+        calibrate_dispatch(*cpu, stream_timeout, bytes, std::chrono::milliseconds(200));
+    require(partial.device_validated && partial.block_complete && !partial.stream_complete &&
+                !partial.calibration_complete && partial.cpu_block_ms > 0 &&
+                partial.gpu_block_ms > 0 && partial.cpu_stream_ms == 0 &&
+                partial.stop_reason == DispatchEvidence::StopReason::deadline,
+            "stream timeout discarded valid block evidence");
+    DelayedCompute sample_timeout(2);
+    const auto incomplete =
+        calibrate_dispatch(*cpu, sample_timeout, bytes, std::chrono::milliseconds(200));
+    require(incomplete.device_validated && !incomplete.block_complete &&
+                !incomplete.block_gpu_preferred && incomplete.cpu_block_ms == 0,
+            "incomplete paired rounds invented a preference");
+    DispatchEvidence evidence;
+    evidence.block_complete = true;
+    evidence.block_gpu_preferred = true;
+    evidence.stop_reason = DispatchEvidence::StopReason::deadline;
+    require(classify_hash(1024, 1024, 1024, evidence) == HashRoute::gpu_preferred,
+            "valid independent shape vetoed by global incompleteness");
+    require(classify_hash(64ULL * 1024 * 1024, 1024, 1024, evidence) == HashRoute::cpu_preferred,
+            "unknown stream borrowed block preference");
+    evidence.decision = DispatchEvidence::Decision::failed;
+    require(classify_hash(1024, 1024, 1024, evidence) == HashRoute::cpu_preferred,
+            "failed device retained preference");
+}
 } // namespace
 /// 验证决策边界与完整摘要检查。 / Verify decision boundaries and full digest checks.
 int main() {
     try {
         payload_bands();
+        partial_evidence();
         using same::detail::stable_gpu_win;
         require(stable_gpu_win({10, 10, 10}, {7, 8, 6}), "stable margin rejected");
         require(!stable_gpu_win({10, 10, 10}, {7, 8.01, 6}), "unstable margin accepted");
@@ -125,7 +185,12 @@ int main() {
                     report.gpu_stream_slowest_ms >= report.gpu_stream_ms,
                 "missing conservative serial extremes");
         require(report.elapsed_ms > 0, "missing calibration cost");
-        require(report.calibration_complete && !expired.calibration_complete &&
+        require(report.device_validated && report.block_complete && report.stream_complete &&
+                    !expired.device_validated &&
+                    expired.stop_reason == same::detail::DispatchEvidence::StopReason::deadline &&
+                    failed.stop_reason ==
+                        same::detail::DispatchEvidence::StopReason::device_error &&
+                    report.calibration_complete && !expired.calibration_complete &&
                     !failed.calibration_complete,
                 "availability confused with partial calibration");
         // 同一字节流按不同CPU/GPU更新粒度仍必须完整校验成功。

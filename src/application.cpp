@@ -213,8 +213,8 @@ public:
     /// Borrow scan-external services; future destruction joins before those services die.
     AutoHashStartup(const Config& config, Resources& resources)
         : config_(config), resources_(resources),
-          floor_(std::max(config.gpu_min_bytes, config.block_bytes)),
-          ready_(config.backend != "auto") {}
+          floor_(std::max<std::size_t>(1, config.gpu_min_bytes)), ready_(config.backend != "auto") {
+    }
 
     /// 不迁移已排队任务；初始化期间以更大候选替换唯一保留项。
     /// Never migrate queued work; replace the sole retained candidate with larger input.
@@ -260,6 +260,17 @@ private:
             route =
                 detail::classify_hash(input.record.stamp.size, floor_, resources_.gpu_block_bytes(),
                                       resources_.dispatch_evidence());
+        // 没有合成校准时以研究阈值冷启动，真实任务模型在出队时修正偏好。
+        // Without synthetic calibration start from the research threshold; real-task models
+        // refine the preference at dequeue. Explicit backends and the eligibility floor remain.
+        if (ready_ && config_.backend == "auto") {
+            const auto& evidence = resources_.dispatch_evidence();
+            const bool initial =
+                !config_.pgo || (!evidence.block_complete && !evidence.stream_complete);
+            if (initial && input.record.stamp.size >= floor_ &&
+                input.record.stamp.size >= 64ULL * 1024 * 1024)
+                route = detail::HashRoute::gpu_preferred;
+        }
         submit(std::move(input), route);
     }
     /// 配置及资源由 run 持有，覆盖后台任务。 / Run owns services beyond background work.
@@ -294,17 +305,31 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
     };
     auto submit = [&](HashInput input, detail::HashRoute route) {
         const auto submitted = Clock::now();
+        const auto bytes = input.record.stamp.size;
         auto operation = [root, gpu_min_bytes = config.gpu_min_bytes,
                           record = std::move(input.record),
                           opened = std::move(input.reader)](Worker& worker) mutable {
+            // 每64个小任务抽样；合格任务全采样，关闭时不修改采样状态。
+            // Sample every 64th small task and every eligible task; disabled leaves no sample
+            // state.
+            const bool sample = worker.profile_enabled && (record.stamp.size >= gpu_min_bytes ||
+                                                           (++worker.profile_sequence & 63) == 0);
+            const auto cpu_before = sample ? worker.cpu_hashes : 0;
+            const auto gpu_before = sample ? worker.gpu_hashes : 0;
             const auto start = Clock::now();
             auto hashed = worker.execute(
                 [&] { return hash_file(root, record, worker, gpu_min_bytes, std::move(opened)); });
-            return HashResult{std::move(hashed), milliseconds(start, Clock::now())};
+            const auto elapsed = milliseconds(start, Clock::now());
+            // 复用已有计时；仅完整成功且没有重试的实际后端样本进入模型。
+            // Reuse existing timing; publish only successful, single-attempt actual-backend
+            // samples.
+            if (sample && worker.cpu_hashes - cpu_before + worker.gpu_hashes - gpu_before == 1)
+                worker.sample = {hashed.stamp.size, elapsed, worker.gpu_hashes != gpu_before, true};
+            return HashResult{std::move(hashed), elapsed};
         };
         // 只提交偏好；领取时在同一锁下决定真实设备忙闲，不固定首个大文件。
         // Submit a preference; resolve live device occupancy under the queue lock at dequeue.
-        pending.submit_hash(std::move(operation), route);
+        pending.submit_hash(std::move(operation), route, bytes);
         counters.hash_wait_ms += milliseconds(submitted, Clock::now());
         if (pending.pending() >= config.queue_capacity)
             drain();
@@ -511,6 +536,69 @@ std::string_view dispatch_name(detail::DispatchEvidence::Decision decision) {
     }
     return "invalid";
 }
+/// 校准终止原因独立于设备与性能偏好。 / Calibration stop is independent of device/preference.
+std::string_view calibration_stop(const detail::DispatchEvidence& evidence) {
+    using Stop = detail::DispatchEvidence::StopReason;
+    if (evidence.stop_reason == Stop::deadline)
+        return "deadline";
+    if (evidence.stop_reason == Stop::device_error)
+        return "device-error";
+    if (evidence.calibration_complete)
+        return "complete";
+    return evidence.device_validated ? "not-run-device-checked" : "not-completed";
+}
+/// 返回微秒直方图的分位桶范围，不伪装成精确延迟；空分布为未知。
+/// Report a quantile bucket's microsecond range, not exact latency; empty means unknown.
+std::string histogram_quantile(const std::array<std::uint64_t, 32>& histogram, unsigned percent) {
+    const auto count = std::accumulate(histogram.begin(), histogram.end(), std::uint64_t{});
+    if (!count)
+        return "unknown";
+    const auto rank = count / 100 * percent + (count % 100 * percent + 99) / 100;
+    std::uint64_t cumulative = 0;
+    for (std::size_t i = 0; i < histogram.size(); ++i) {
+        cumulative += histogram[i];
+        if (cumulative < rank)
+            continue;
+        const auto lower = i ? std::uint64_t{1} << i : 0;
+        return std::to_string(lower) +
+               (i == 31 ? "+" : ".." + std::to_string((std::uint64_t{1} << (i + 1)) - 1));
+    }
+    return "unknown";
+}
+/// 固定空间的单次运行观测；无堆栈采样器或跨运行训练的暗示。
+/// Fixed-space per-run observations; no implication of stack sampling or cross-run training.
+void render_online_profile(const Resources& resources, std::ostream& out, bool pretty) {
+    const auto profile = resources.profile_snapshot();
+    const auto enabled = resources.profiling_enabled();
+    const auto p50 = histogram_quantile(profile.latency_histogram, 50);
+    const auto p95 = histogram_quantile(profile.latency_histogram, 95);
+    const auto residual95 = histogram_quantile(profile.residual_histogram, 95);
+    const auto error =
+        profile.predicted_samples ? std::to_string(profile.mean_absolute_error_ms) : "unknown";
+    if (pretty) {
+        out << "  Online PGO      " << (enabled ? "enabled" : "disabled") << " | "
+            << profile.samples << " samples (" << profile.cpu_samples << " CPU | "
+            << profile.gpu_samples << " GPU) | " << resources.exploration_jobs()
+            << " exploration jobs\n"
+            << "  Model coverage  " << profile.cpu_known_bands << " CPU | "
+            << profile.gpu_known_bands << " GPU observed size bands\n"
+            << "  Model error     " << error << " ms absolute-error EWMA | "
+            << profile.predicted_samples << " predictions checked | p95 residual " << residual95
+            << " us\n"
+            << "  Sample latency  p50 " << p50 << " us | p95 " << p95
+            << " us (bucket ranges; service incl. I/O)\n";
+        return;
+    }
+    out << "pgo_enabled=" << enabled << " pgo_samples=" << profile.samples
+        << " pgo_exploration_jobs=" << resources.exploration_jobs()
+        << " pgo_cpu_samples=" << profile.cpu_samples << " pgo_gpu_samples=" << profile.gpu_samples
+        << " pgo_cpu_known_bands=" << profile.cpu_known_bands
+        << " pgo_gpu_known_bands=" << profile.gpu_known_bands
+        << " pgo_rejected_samples=" << profile.rejected_samples
+        << " pgo_predicted_samples=" << profile.predicted_samples << " pgo_mae_ms=" << error
+        << " pgo_residual_p95_bucket_us=" << residual95 << " pgo_latency_p50_bucket_us=" << p50
+        << " pgo_latency_p95_bucket_us=" << p95 << '\n';
+}
 /// Human-facing profile; machine metrics use a separate unchanged renderer.
 /// 面向人的统计展示；机器统计使用独立且保持不变的渲染器。
 void render_pretty_profile(const Counters& counters, const Resources& resources,
@@ -577,12 +665,21 @@ void render_pretty_profile(const Counters& counters, const Resources& resources,
     row("GPU input", human_bytes(static_cast<double>(resources.gpu_block_bytes())));
     row("Auto dispatch", std::string(dispatch_name(dispatch.decision)) + " | " +
                              human_duration(dispatch.setup_ms) + " setup (included in scan)");
+    row("Calibration", std::string(calibration_stop(dispatch)) + " | device " +
+                           (dispatch.device_validated ? "validated" : "not-validated") +
+                           " | auto service " +
+                           (resources.gpu_service_enabled() ? "active" : "inactive"));
     if (dispatch.elapsed_ms > 0) {
-        row("Probe block", human_duration(dispatch.cpu_block_ms) + " CPU | " +
-                               human_duration(dispatch.gpu_block_ms) + " GPU");
-        row("Probe stream", human_duration(dispatch.cpu_stream_ms) + " CPU | " +
-                                human_duration(dispatch.gpu_stream_ms) + " GPU");
+        row("Probe block", dispatch.block_complete
+                               ? human_duration(dispatch.cpu_block_ms) + " CPU | " +
+                                     human_duration(dispatch.gpu_block_ms) + " GPU"
+                               : "unknown (incomplete)");
+        row("Probe stream", dispatch.stream_complete
+                                ? human_duration(dispatch.cpu_stream_ms) + " CPU | " +
+                                      human_duration(dispatch.gpu_stream_ms) + " GPU"
+                                : "unknown (incomplete)");
     }
+    render_online_profile(resources, out, true);
 }
 /// Print phase wall times and successful read bytes, not CPU time or physical I/O.
 /// 输出各阶段墙钟耗时及成功读取字节，不代表 CPU 时间或物理 I/O。
@@ -649,6 +746,12 @@ void render_profile(const Counters& counters, const Resources& resources,
             << " probe_gpu_block_ms=" << dispatch.gpu_block_ms
             << " probe_cpu_stream_ms=" << dispatch.cpu_stream_ms
             << " probe_gpu_stream_ms=" << dispatch.gpu_stream_ms << '\n';
+    profile << "calibration_stop=" << calibration_stop(dispatch)
+            << " probe_block_complete=" << dispatch.block_complete
+            << " probe_stream_complete=" << dispatch.stream_complete
+            << " gpu_device_validated=" << dispatch.device_validated
+            << " gpu_service_enabled=" << resources.gpu_service_enabled() << '\n';
+    render_online_profile(resources, profile, false);
     diagnostics << profile.str();
 }
 } // namespace

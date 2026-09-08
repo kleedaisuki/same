@@ -25,15 +25,23 @@ int main() {
         }
     } cleanup{root};
     same::Config::load(root).validate();
+    if (!same::Config::load(root).pgo)
+        throw std::runtime_error("runtime PGO must default to enabled");
     {
         std::ofstream file(root / ".same/config.toml");
         file << "workers = 2\nblock_bytes = 1024\nmemory_bytes = 16384\nbackend = 'cpu'\nrehash = "
-                "true\n";
+                "true\npgo = false\n";
     }
     const auto config = same::Config::load(root);
     if (config.workers != 2 || config.metadata_workers != 2 || config.queue_capacity != 4 ||
-        !config.rehash || config.backend != "cpu")
+        !config.rehash || config.backend != "cpu" || config.pgo)
         throw std::runtime_error("config override");
+    {
+        std::ofstream file(root / ".same/config.toml");
+        file << "pgo = true\n";
+    }
+    if (!same::Config::load(root).pgo)
+        throw std::runtime_error("explicit runtime PGO enable ignored");
     {
         std::ofstream file(root / ".same/config.toml");
         file << "workers = 0\n";
@@ -50,7 +58,7 @@ int main() {
          {"workers = 2.0\n", "workers = true\n", "rehash = 1\n", "backend = 1\n", "unknown = 1\n",
           "metadata_workers = 0\n", "metadata_workers = 257\n", "metadata_workers = 2.0\n",
           "gpu_min_bytes = -1\n", "gpu_min_bytes = 1.5\n", "gpu_probe_bytes = -1\n",
-          "gpu_probe_bytes = true\n"}) {
+          "gpu_probe_bytes = true\n", "pgo = 1\n", "pgo = 'false'\n", "pgo = []\n"}) {
         {
             std::ofstream file(root / ".same/config.toml");
             file << invalid;

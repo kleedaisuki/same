@@ -74,7 +74,8 @@ void scan_overlaps_startup() {
     same::Config config;
     config.workers = config.metadata_workers = 1;
     config.queue_capacity = 8;
-    config.block_bytes = config.gpu_min_bytes = 1024;
+    config.block_bytes = 8192;
+    config.gpu_min_bytes = 1024;
     config.memory_bytes = config.device_memory_bytes = 64 * 1024 * 1024;
     std::promise<void> entered, release;
     auto started = entered.get_future();
@@ -142,7 +143,8 @@ void startup_boundary(bool factory_throws) {
     same::Config config;
     config.workers = config.metadata_workers = 1;
     config.queue_capacity = 8;
-    config.block_bytes = config.gpu_min_bytes = 1024;
+    config.block_bytes = 8192;
+    config.gpu_min_bytes = 1024;
     std::promise<void> entered, release;
     auto started = entered.get_future();
     auto gate = release.get_future().share();
@@ -198,12 +200,38 @@ void startup_boundary(bool factory_throws) {
         throw;
     }
 }
+/// 空文件不消耗初始化机会，即使用户将资格下界设为零。
+/// Empty files must not consume startup eligibility even when the configured floor is zero.
+void empty_before_eligible() {
+    same::Config config;
+    config.workers = 1;
+    config.gpu_min_bytes = 0;
+    std::size_t factories = 0, submitted = 0;
+    same::Resources resources(config,
+                              [&](std::size_t, std::size_t) -> std::unique_ptr<same::Compute> {
+                                  ++factories;
+                                  return nullptr;
+                              });
+    same::AutoHashStartup startup(config, resources);
+    auto submit = [&](same::HashInput value, same::detail::HashRoute route) {
+        if (!value.record.stamp.size)
+            require(route == same::detail::HashRoute::cpu_only, "empty input was GPU eligible");
+        ++submitted;
+    };
+    startup.accept(input("empty", 0), submit);
+    startup.finish(submit);
+    require(factories == 0 && submitted == 1, "empty input started the device factory");
+    startup.accept(input("nonempty", 65536), submit);
+    startup.finish(submit);
+    require(factories == 1 && submitted == 2, "empty input prevented later device initialization");
+}
 } // namespace
 
 /// 独立回归入口。 / Standalone regression entry point.
 int main() {
     try {
         scan_overlaps_startup();
+        empty_before_eligible();
         startup_boundary(false);
         startup_boundary(true);
         std::cout << "async scan tests passed\n";

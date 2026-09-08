@@ -35,6 +35,9 @@ struct Config {
     std::string backend{"auto"};
     /// Ignore stored hashes even when file stamps match. 即使文件戳匹配也重新计算哈希。
     bool rehash{false};
+    /// Enable runtime profile-guided routing; unrelated to compiler PGO or summary output.
+    /// 启用运行时剖析引导路由；与编译器 PGO 和汇总输出开关无关。
+    bool pgo{true};
     /// Choose bounded defaults from hardware concurrency. 根据硬件并发数选择有界默认值。
     Config();
     /// Load optional .same/config.toml; reject unknown keys, types and invalid limits.

@@ -117,11 +117,21 @@ same::detail::CudaFactory factory(std::shared_ptr<std::atomic<bool>> fail) {
     return [fail](std::size_t, std::size_t) { return std::make_unique<FakeCuda>(fail); };
 }
 
-/// 校准完成后必须保留服务，无论 GPU 是否赢得基准。 / Retain service regardless of benchmark win.
+/// 正确性验证后保留服务；启动不生成性能样本。 / Validation retains service without performance
+/// samples.
 void prepare(same::Resources& pool, const same::Config& cfg) {
     pool.prepare_auto(cfg, 64ULL * 1024 * 1024 * 1024, 8);
     require(pool.gpu_workers() == 1, "valid fake CUDA must remain available without a speed win");
     pool.wait_idle();
+    const auto& evidence = pool.dispatch_evidence();
+    const auto profile = pool.profile_snapshot();
+    require(evidence.device_validated && !evidence.calibration_complete &&
+                !evidence.block_complete && !evidence.stream_complete && evidence.elapsed_ms == 0 &&
+                evidence.cpu_block_ms == 0 && evidence.gpu_block_ms == 0 &&
+                evidence.cpu_stream_ms == 0 && evidence.gpu_stream_ms == 0,
+            "startup must validate correctness without synthetic performance calibration");
+    require(profile.samples == 0 && profile.cpu_known_bands == 0 && profile.gpu_known_bands == 0,
+            "startup populated real-task statistics or synthetic model priors");
 }
 
 /// 简短路由观察任务。 / Small routing observation job.
@@ -271,17 +281,17 @@ void shared_capacity() {
     require(queued.get() == "cpu", "CPU-only queued job was stolen");
     require(producer.get() == "cuda", "unblocked GPU-preferred producer lost its preferred lane");
 }
-/// 明确证明两类均不胜也保留可溢出服务。 / Losing both calibration shapes still permits overflow.
-void no_win_overflow() {
+/// 慢设备仍可通过正确性验证，不凭初始化延迟否决服务。 / Slow validation must not veto service.
+void slow_validation_overflow() {
     auto cfg = config();
     same::Resources pool(cfg, [](std::size_t, std::size_t) {
         return std::make_unique<FakeCuda>(std::make_shared<std::atomic<bool>>(false), 10ms);
     });
     prepare(pool, cfg);
     const auto& evidence = pool.dispatch_evidence();
-    require(evidence.calibration_complete && !evidence.block_gpu_preferred &&
+    require(evidence.device_validated && !evidence.block_gpu_preferred &&
                 !evidence.stream_gpu_preferred,
-            "deliberately slow fake GPU must complete calibration without either shape winning");
+            "slow validated GPU must remain available without synthetic performance preferences");
     Gate cpu;
     auto held = pool.submit(cpu.job());
     cpu.wait_started();
@@ -290,6 +300,28 @@ void no_win_overflow() {
     cpu.open();
     held.get();
     require(ready && overflow.get() == "cuda", "nonwinning available GPU rejected CPU overflow");
+}
+
+/// 慢于旧两秒校准预算的验证不应被误认为设备失败。
+/// Validation slower than the retired two-second probe budget is not a device failure.
+void slow_validation_service() {
+    const auto cfg = config();
+    same::Resources pool(cfg, [](std::size_t, std::size_t) {
+        return std::make_unique<FakeCuda>(std::make_shared<std::atomic<bool>>(false), 2100ms);
+    });
+    prepare(pool, cfg);
+    const auto& evidence = pool.dispatch_evidence();
+    require(evidence.device_validated && !evidence.calibration_complete &&
+                !evidence.block_complete && !evidence.stream_complete,
+            "successful slow validation must retain service without performance measurements");
+    Gate cpu;
+    auto held = pool.submit(cpu.job());
+    cpu.wait_started();
+    auto overflow = pool.submit_hash(backend, HashRoute::cpu_preferred);
+    const bool ready = overflow.wait_for(5s) == std::future_status::ready;
+    cpu.open();
+    held.get();
+    require(ready && overflow.get() == "cuda", "slow validation stranded usable GPU service");
 }
 
 /// 探测参数不可改变构造时的预算或资格契约。 / Probing cannot change construction contracts.
@@ -324,7 +356,8 @@ void immutable_budgets() {
 void independent_gpu_buffer() {
     auto cfg = config();
     cfg.memory_bytes = 128 * 1024 * 1024;
-    cfg.gpu_min_bytes = 0;
+    cfg.block_bytes = 32 * 1024 * 1024;
+    cfg.gpu_min_bytes = 1024;
     std::size_t requested{};
     same::Resources pool(cfg, [&](std::size_t block, std::size_t) {
         requested = block;
@@ -338,7 +371,7 @@ void independent_gpu_buffer() {
                 },
                 true)
             .get();
-    require(requested == 16 * 1024 * 1024 && buffer == requested && floor == cfg.block_bytes,
+    require(requested == 16 * 1024 * 1024 && buffer == requested && floor == cfg.gpu_min_bytes,
             "GPU service capacity incorrectly changed the configured eligibility floor");
     const auto route = same::detail::classify_hash(floor, floor, buffer, pool.dispatch_evidence());
     require(route != HashRoute::cpu_only &&
@@ -415,7 +448,8 @@ int main() {
         failure_drain();
         tight_budget();
         shared_capacity();
-        no_win_overflow();
+        slow_validation_overflow();
+        slow_validation_service();
         immutable_budgets();
         independent_gpu_buffer();
         full_cpu_saturation();

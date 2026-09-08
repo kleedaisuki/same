@@ -221,7 +221,7 @@ private:
 
 /// 大 GPU 缓冲不能误把已获资格的小文件送回 CPU；故障必须完整重读。
 /// Large GPU buffers must not override file eligibility; a device fault requires a full reread.
-void routed_file_hash(bool inject_failure) {
+void routed_file_hash(bool inject_failure, bool profiling = true) {
     Fixture fixture;
     std::array<std::byte, 2048> content{};
     for (std::size_t i = 0; i < content.size(); ++i)
@@ -241,8 +241,9 @@ void routed_file_hash(bool inject_failure) {
     cfg.backend = "auto";
     cfg.workers = 1;
     cfg.queue_capacity = 8;
-    cfg.block_bytes = 1024;
+    cfg.block_bytes = 4096;
     cfg.gpu_min_bytes = 0;
+    cfg.pgo = profiling;
     cfg.gpu_probe_bytes = 0;
     cfg.memory_bytes = 64 * 1024 * 1024;
     auto fail = std::make_shared<std::atomic<bool>>(false);
@@ -253,9 +254,18 @@ void routed_file_hash(bool inject_failure) {
     require(pool.gpu_workers() == 1 && pool.gpu_block_bytes() == 16 * 1024 * 1024,
             "routed fixture requires an independent 16 MiB GPU buffer");
     const auto route = same::detail::classify_hash(
-        content.size(), cfg.block_bytes, pool.gpu_block_bytes(), pool.dispatch_evidence());
+        content.size(), cfg.gpu_min_bytes, pool.gpu_block_bytes(), pool.dispatch_evidence());
     require(route == same::detail::HashRoute::cpu_preferred,
             "sub-buffer payload must prefer CPU without excluding GPU overflow");
+    if (!profiling) {
+        const auto& evidence = pool.dispatch_evidence();
+        require(evidence.device_validated && !evidence.calibration_complete &&
+                    !evidence.block_complete && !evidence.stream_complete &&
+                    evidence.elapsed_ms == 0 && evidence.cpu_block_ms == 0 &&
+                    evidence.gpu_block_ms == 0 && evidence.cpu_stream_ms == 0 &&
+                    evidence.gpu_stream_ms == 0,
+                "no-PGO must validate the device without performance calibration");
+    }
     fail->store(inject_failure);
     CpuGate cpu;
     auto held = pool.submit(cpu.job());
@@ -289,7 +299,14 @@ void routed_file_hash(bool inject_failure) {
     require(pool.read_bytes().first == content.size() * (inject_failure ? 2U : 1U),
             "routed fault did not reread the entire file");
     require(pool.cpu_routed_hashes() == 0,
-            "GPU buffer capacity incorrectly changed file eligibility");
+            "GPU or CPU buffer capacity incorrectly changed file eligibility");
+    if (!profiling) {
+        const auto snapshot = pool.profile_snapshot();
+        require(!pool.profiling_enabled() && snapshot.samples == 0 &&
+                    snapshot.rejected_samples == 0 && snapshot.cpu_known_bands == 0 &&
+                    snapshot.gpu_known_bands == 0,
+                "no-PGO populated online statistics or calibration priors");
+    }
 }
 } // namespace
 /// 给 CTest 提供明确错误而非无诊断终止。 / Provide actionable CTest errors rather than termination.
@@ -299,6 +316,8 @@ int main() {
         replacement_rejected();
         routed_file_hash(false);
         routed_file_hash(true);
+        routed_file_hash(false, false);
+        routed_file_hash(true, false);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "hash retry regression: " << error.what() << '\n';
