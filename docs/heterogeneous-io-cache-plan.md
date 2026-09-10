@@ -238,6 +238,12 @@ Windows 超时检测与恢复（Timeout Detection and Recovery, TDR）也不是�
 `FindFirstFileExW(...LARGE_FETCH)` 比较；目录记录仍不能无条件代替句柄版本校验。
 [Microsoft 目录信息](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_id_extd_dir_info)
 
+后续本机 [原生异步目录元数据实验](async-metadata-experiment.md) 已验证
+`FILE_FLAG_OVERLAPPED`目录句柄配合`NtQueryDirectoryFile`取得批量元数据；4129条目核验通过。
+但所有调用均内联完成，未观察到PENDING或异步加速。这条Native API候选不受I/O Ring操作码
+集合限制；单文件QueryInformation仍不能仅靠异步句柄变成异步操作。S4应保留同步/异步
+原生目录查询的独立对照，不将本实验视为默认策略性能门槛已通过。
+
 生产工程并非一律追求原生异步：libuv 使用线程池处理文件系统操作；其文件系统文档还
 记录 Linux 默认 io_uring 路线曾被回退。这是保留简单可测 fallback 的理由，不是 Windows
 没有异步 I/O 的证据。[libuv 文件系统](https://docs.libuv.org/en/v1.x/fs.html)、
