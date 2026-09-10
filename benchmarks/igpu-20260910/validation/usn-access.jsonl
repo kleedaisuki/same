@@ -1,0 +1,2 @@
+{"query_ok": true, "bytes": 80}
+{"unprivileged_read_ok": true, "bytes": 65480, "record_count": 1023, "versions": [2], "records_with_name": 0}

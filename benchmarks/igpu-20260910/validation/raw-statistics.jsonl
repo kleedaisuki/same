@@ -1,0 +1,39 @@
+{"file": "cpu8.jsonl", "rows": 5, "groups": 1}
+{"size": 67108864, "backend": "cpu", "count": 5, "median": 19256.07, "minimum": 17292.46, "maximum": 20081.46}
+{"file": "dispatch-bulk.jsonl", "rows": 30, "groups": 6}
+{"size": 1048576, "backend": "cpu", "count": 5, "median": 4286.1, "minimum": 4172.64, "maximum": 4504.63}
+{"size": 1048576, "backend": "cuda", "count": 5, "median": 4765.02, "minimum": 4434.77, "maximum": 4786.84}
+{"size": 16777216, "backend": "cpu", "count": 5, "median": 3934.92, "minimum": 3881.89, "maximum": 4152.41}
+{"size": 16777216, "backend": "cuda", "count": 5, "median": 9505.46, "minimum": 6992.35, "maximum": 9529.46}
+{"size": 67108864, "backend": "cpu", "count": 5, "median": 3938.34, "minimum": 3702.6, "maximum": 4008.6}
+{"size": 67108864, "backend": "cuda", "count": 5, "median": 9943.1, "minimum": 9614.58, "maximum": 10014.26}
+{"file": "dispatch.jsonl", "rows": 50, "groups": 10}
+{"size": 4096, "backend": "cpu", "count": 5, "median": 2293.58, "minimum": 2281.02, "maximum": 2500.0}
+{"size": 4096, "backend": "cuda", "count": 5, "median": 447.39, "minimum": 346.16, "maximum": 452.57}
+{"size": 65536, "backend": "cpu", "count": 5, "median": 3385.24, "minimum": 1780.15, "maximum": 3932.36}
+{"size": 65536, "backend": "cuda", "count": 5, "median": 619.75, "minimum": 600.2, "maximum": 842.64}
+{"size": 1048576, "backend": "cpu", "count": 5, "median": 3014.26, "minimum": 2547.37, "maximum": 3721.75}
+{"size": 1048576, "backend": "cuda", "count": 5, "median": 3457.22, "minimum": 2414.91, "maximum": 3855.24}
+{"size": 16777216, "backend": "cpu", "count": 5, "median": 2961.02, "minimum": 2746.99, "maximum": 3032.68}
+{"size": 16777216, "backend": "cuda", "count": 5, "median": 2726.58, "minimum": 2489.39, "maximum": 2828.65}
+{"size": 67108864, "backend": "cpu", "count": 5, "median": 2057.48, "minimum": 1801.25, "maximum": 2850.89}
+{"size": 67108864, "backend": "cuda", "count": 5, "median": 3048.85, "minimum": 2580.39, "maximum": 3108.46}
+{"file": "opencl.jsonl", "rows": 93, "groups": 18}
+{"size": 2048, "backend": "cpu", "count": 5, "median": 1206.38, "minimum": 1029.04, "maximum": 1285.8}
+{"size": 2048, "backend": "igpu_resident", "count": 5, "median": 8.03, "minimum": 7.36, "maximum": 8.29}
+{"size": 2048, "backend": "igpu_upload", "count": 5, "median": 4.87, "minimum": 4.57, "maximum": 5.06}
+{"size": 4096, "backend": "cpu", "count": 5, "median": 1856.58, "minimum": 1759.57, "maximum": 2114.91}
+{"size": 4096, "backend": "igpu_resident", "count": 5, "median": 13.71, "minimum": 12.47, "maximum": 14.55}
+{"size": 4096, "backend": "igpu_upload", "count": 5, "median": 8.81, "minimum": 7.15, "maximum": 9.31}
+{"size": 65536, "backend": "cpu", "count": 5, "median": 4181.16, "minimum": 4030.96, "maximum": 4446.18}
+{"size": 65536, "backend": "igpu_resident", "count": 5, "median": 133.18, "minimum": 129.25, "maximum": 134.15}
+{"size": 65536, "backend": "igpu_upload", "count": 5, "median": 100.67, "minimum": 99.26, "maximum": 101.49}
+{"size": 1048576, "backend": "cpu", "count": 5, "median": 4615.47, "minimum": 4399.96, "maximum": 4749.32}
+{"size": 1048576, "backend": "igpu_resident", "count": 5, "median": 1425.59, "minimum": 1327.06, "maximum": 1476.03}
+{"size": 1048576, "backend": "igpu_upload", "count": 5, "median": 1105.73, "minimum": 1036.96, "maximum": 1135.77}
+{"size": 16777216, "backend": "cpu", "count": 5, "median": 4087.78, "minimum": 3906.67, "maximum": 4385.12}
+{"size": 16777216, "backend": "igpu_resident", "count": 5, "median": 13215.84, "minimum": 10766.75, "maximum": 14601.7}
+{"size": 16777216, "backend": "igpu_upload", "count": 5, "median": 6975.4, "minimum": 6315.98, "maximum": 7336.5}
+{"size": 67108864, "backend": "cpu", "count": 5, "median": 1984.54, "minimum": 1955.09, "maximum": 3948.92}
+{"size": 67108864, "backend": "igpu_resident", "count": 5, "median": 20264.43, "minimum": 17303.58, "maximum": 27617.68}
+{"size": 67108864, "backend": "igpu_upload", "count": 5, "median": 7916.71, "minimum": 7605.63, "maximum": 8901.84}
