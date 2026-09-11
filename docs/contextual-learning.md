@@ -95,8 +95,8 @@ The fraction is a credit budget, not a probability or overhead guarantee. First 
 模型库采用预写日志（write-ahead logging, WAL）与 `synchronous=NORMAL`。学习状态是建议性数据：断电可能丢失最近提交，允许退回较旧学习状态；摘要与精确比较的正确性契约不因此放宽。主机 CPU 身份为空时禁用跨运行复用，而不是关闭本轮学习。
 WAL/NORMAL trades recent-learning durability for lower advisory-state overhead; it does not weaken content correctness. Missing CPU identity disables cross-run reuse, not in-run learning.
 
-早期初始化策略造成的负收益保留在 [扫描性能记录](contextual-scan-performance.md)，作为历史反例，不删除或改写为成功。冷启动修正后的性能需另行测量，本文不预先宣称已消除回归。
-The earlier negative result remains in the performance record. Post-fix performance is pending measurement, not assumed improved.
+早期初始化策略造成的负收益保留在 [扫描性能记录](contextual-scan-performance.md)，不删除或改写为成功。最终修订另完成 74 次正确扫描及真实预算激活实验：默认短负载不再探测设备，但 PGO 仍有毫秒级开销，不能推导普遍加速。
+The report retains earlier negative results and adds 74 correct final scans plus a physical budget-activation experiment. Default short workloads avoid discovery, but PGO still has millisecond-scale overhead; universal speedup is not established.
 
 显式把某后端启动估计设为零，可用于允许不受启动信用限制的校准实验；已加载的正核显历史估计仍优先于零回退值。默认值不采用这种实验设置。
 An explicit zero bootstrap estimate permits unbudgeted calibration; a loaded positive iGPU setup estimate still overrides the zero fallback. Defaults do not enable this experiment mode.

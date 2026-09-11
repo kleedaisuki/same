@@ -1,7 +1,7 @@
 # 异构在线学习验收 / Heterogeneous online-learning acceptance
 
-状态：进行中，以下是验收条件，不是完成声明。
-Status: in progress; these are acceptance requirements, not completion claims.
+以下为实现证据与验收门；最终跨平台结果以对应提交的 Actions 为准。
+Implementation evidence and acceptance gates; final portability results are those of the matching commit's Actions run.
 
 ## 目标与边界 / Objective and boundaries
 
@@ -36,8 +36,32 @@ and actual device features. Validate scan throughput and completion time, not ke
 
 ## 当前证据 / Current evidence
 
-2026-09-11：原生 iGPU 差分测试通过；完整本机测试首次为 21/22，集成测试的旧两后端
-计数断言失败，正在核查。当前大小分桶 EWMA 尚不满足上述最终建模与持久化要求。
-On 2026-09-11, native iGPU differential tests passed. The initial full local run passed 21/22;
-an integration assertion for two-backend accounting failed and is under investigation.
-The current size-band EWMA does not yet satisfy the final modeling and persistence requirements.
+2026-09-11，本机 Release 在 `SAME_REQUIRE_CUDA=1`、`SAME_REQUIRE_IGPU=1` 下通过 25/25 CTest。
+Local Release passed all 25 CTests with both physical-device requirements enabled.
+
+| 范围 / Scope | 可检查证据 / Inspectable evidence |
+|---|---|
+| 原生核显与退化路径 | `igpu_compute` 验证 5,817 个真实内核批次、任意分块、重复 finish、生命周期与 CPU 差分；`integration` 验证真实 CLI 及缓存 |
+| 模型数学与局部性 | `contextual_model` 验证固定四维回归、共线、拟合范围、数值拒绝和可加增量；`Worker::model` 仅所属线程更新 |
+| 调度与正确性 | `igpu_routing`、`adaptive_routing`、`hash_retry`、`unified_cuda` 验证冻结上下文、三设备探索、准入、重试、双 CUDA 并发与冷启动预算 |
+| 持久化 | `model_store` 验证 v1→v2 迁移、外来库不变、损坏拒绝、事务回滚和有界状态；`learning_integration` 验证第二进程导入、先验不重复、无遥测学习及关闭学习不改库 |
+| 剖析与分析器数据 | `application.cpp` 的逐 worker 导出包含先验/增量矩阵、范围、更新前误差、设备资料及启动历史；summary 独立于遥测开关 |
+| 性能 | [模型微基准](contextual-model-performance.md) 与[扫描消融](contextual-scan-performance.md) 包含命令、原始计时、二进制身份和不利结果；不以核函数吞吐替代扫描耗时 |
+| 跨平台门 | `.github/workflows/ci.yml`：Windows/Linux/macOS × OpenCL ON/OFF、PoCL 强制实际内核、ASan/UBSan；最终提交八个 job 全部成功才通过此门 |
+
+实际预算激活实验：第一进程累计 CPU 工作信用后执行一次 16 MiB iGPU 哈希；第二进程恢复
+354.620 ms 启动历史并因信用不足避免重新激活。该实验使用显式乐观启动配置，不代表默认策略
+的硬性开销上界。原始数据位置与完整配置见扫描报告。
+The physical budget experiment executed a 16 MiB iGPU hash, then reused 354.620 ms setup history
+in a second process to defer activation. Its optimistic configuration does not establish a hard overhead bound.
+
+## 已知限制 / Known limitations
+
+- 设备参数条件化模型身份；同一设备的固定计算单元数不作为可辨识的因果回归系数。
+  Device properties condition model identity; constant hardware properties are not identifiable causal coefficients.
+- 冷启动和发现成本均纳入决策，但首次未知成本可超过估计，短扫描可能不探索。
+  Startup/discovery participate in admission, but unknown first costs may exceed estimates and short scans may not explore.
+- 历史启动最大值不衰减；暂时尖峰会使后续准入更保守。服务成本先验每轮衰减 0.9。
+  Setup maxima do not decay; transient spikes make admission conservative. Service priors decay by 0.9 per run.
+- 最终小文件实验仍观察到 PGO 的毫秒级额外成本，不声称零开销或普遍 GPU 加速。
+  Final small-file trials still show millisecond-scale PGO overhead; no zero-overhead or universal GPU-speedup claim.

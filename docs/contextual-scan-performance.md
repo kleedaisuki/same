@@ -582,3 +582,164 @@ Priority follow-up: defer discovery itself until useful work justifies its cost,
   }
 ]
 ```
+
+## Final preflight-gated revision / 最终发现前预算准入修订
+
+Binary SHA-256: `1e8ecb98d0e051c75058f71c7eb7543ef2cc161f3145a76c2c9da514f24cd714`. Fresh default-floor fixture `build/contextual-scan-2a4d0ef05198`, identical 2-warmup/7-measurement randomized pairs, 74 successful scans. All correctness/hash assertions passed. Earlier results remain above.
+
+全新默认阈值语料，74次扫描全部正确；保留此前证据。
+
+| Workload | Mode | Median wall ms | Discovery ms | iGPU setup ms | Model save ms |
+|---|---|---:|---:|---:|---:|
+| small | cpu_pgo | 106.571 | 0.000 | 0.000 | 3.321 |
+| small | cpu_no_pgo | 94.723 | 0.000 | 0.000 | 0.000 |
+| small | auto_pgo | 104.147 | 0.000 | 0.000 | 3.378 |
+| small | auto_no_pgo | 96.225 | 0.000 | 0.000 | 0.000 |
+| mixed | cpu_pgo | 106.972 | 0.000 | 0.000 | 3.929 |
+| mixed | cpu_no_pgo | 93.168 | 0.000 | 0.000 | 0.000 |
+| mixed | auto_pgo | 101.664 | 0.000 | 0.000 | 3.920 |
+| mixed | auto_no_pgo | 105.399 | 0.000 | 0.000 | 0.000 |
+
+Both automatic modes now avoid iGPU discovery and initialization in every measured short-workload run. This removes the previously observed unnecessary iGPU startup path; the experiment does not demonstrate GPU acceleration because all such requests stay on CPU. Remaining PGO overhead and noisy wall samples are visible, not hidden by subtracting lifecycle costs. A separate activation experiment below tests that admission is not simply permanent GPU disablement.
+
+两种自动模式所有测量均未发现或初始化 iGPU，消除了前次不必要启动路径；这些扫描都留在 CPU，所以不证明 GPU 加速。PGO 剩余开销及噪声保留，不通过减去生命周期成本掩盖。以下独立实验验证准入并非永久禁用 GPU。
+
+```json
+[
+  {
+    "workload": "small",
+    "mode": "cpu_pgo",
+    "wall_ms": [
+      106.571,
+      109.8494,
+      104.8753,
+      100.2161,
+      120.7809,
+      108.9218,
+      105.028
+    ]
+  },
+  {
+    "workload": "small",
+    "mode": "cpu_no_pgo",
+    "wall_ms": [
+      93.147,
+      95.5419,
+      95.8965,
+      93.7813,
+      90.3894,
+      98.6011,
+      94.7226
+    ]
+  },
+  {
+    "workload": "small",
+    "mode": "auto_pgo",
+    "wall_ms": [
+      105.6456,
+      104.1473,
+      104.0992,
+      103.9438,
+      111.5853,
+      103.9307,
+      113.6262
+    ]
+  },
+  {
+    "workload": "small",
+    "mode": "auto_no_pgo",
+    "wall_ms": [
+      105.0728,
+      94.6847,
+      95.7831,
+      96.2246,
+      97.7792,
+      93.7296,
+      103.3876
+    ]
+  },
+  {
+    "workload": "mixed",
+    "mode": "cpu_pgo",
+    "wall_ms": [
+      97.3245,
+      99.2118,
+      119.8524,
+      122.0504,
+      115.7537,
+      106.9716,
+      92.3877
+    ]
+  },
+  {
+    "workload": "mixed",
+    "mode": "cpu_no_pgo",
+    "wall_ms": [
+      89.7037,
+      85.1372,
+      92.2544,
+      93.1678,
+      106.0641,
+      163.3221,
+      93.3625
+    ]
+  },
+  {
+    "workload": "mixed",
+    "mode": "auto_pgo",
+    "wall_ms": [
+      98.5263,
+      100.0185,
+      118.0517,
+      114.0122,
+      119.6771,
+      101.6641,
+      95.8114
+    ]
+  },
+  {
+    "workload": "mixed",
+    "mode": "auto_no_pgo",
+    "wall_ms": [
+      92.1233,
+      86.444,
+      105.5772,
+      105.3991,
+      118.3779,
+      113.0296,
+      93.768
+    ]
+  }
+]
+```
+
+### Real positive-credit activation / 真实设备正预算激活
+
+Separate diagnostic, **not default production policy**, not part of paired timing. Dataset: 32 unique random 16 MiB files (512 MiB), Python `random.Random(432).randbytes(16<<20)` for each file in index order; expected duplicate group set is empty. Each process used the same binary and `--rehash --summary --no-telemetry --format=tsv --color=never`. First forced CPU with `--no-pgo` established ground truth, then two automatic processes shared model state. Every process hashed all 32 files and produced the expected empty group set.
+
+独立诊断而非默认策略，也不混入配对测量。32个唯一随机16MiB文件，固定种子432；CPU基准及随后两次自动扫描均全量哈希、输出一致。
+
+```toml
+workers=1
+metadata_workers=1
+block_bytes=1048576
+memory_bytes=134217728
+device_memory_bytes=33554432
+gpu_min_bytes=16777216
+backend="auto"
+igpu_bootstrap_ms=1
+cuda_bootstrap_ms=1000000
+cold_exploration_fraction=1
+```
+
+Raw diagnostics and exact config: `build/contextual-activation-15d0809f0e1e/activation.json` and `.same/config.toml`.
+
+| Process | Wall ms | Earned credit ms | Discovery ms | Setup ms | iGPU hashes | Setup prior hits | Setup estimate ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| CPU ground | 278.908 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 1.000 |
+| Auto 1 | 790.090 | 227.389 | 125.140 | 354.620 | 1.000 | 0.000 | 1.000 |
+| Auto 2 | 426.108 | 247.545 | 125.120 | 0.000 | 0.000 | 1.000 | 354.620 |
+
+First automatic process activates the physical Iris Xe and hashes one complete 16 MiB payload, persisting one setup-history key. Its optimistic 1 ms bootstrap underestimates actual setup (354.620 ms), so total spent 479.760 ms exceeds earned 227.389 ms; this is a deliberately aggressive exploratory policy, not a hard runtime spending guarantee. The second process restores the measured 354.620 ms setup prior, has 247.545 ms earned minus 125.120 ms discovery, and correctly does not activate iGPU (`igpu_attempted=0`). Model prior hits are 2 and setup prior hits 1. This is direct live-device evidence of credit-funded activation followed by cross-process measured-cost reuse; it is not a speedup result (CPU ground is faster).
+
+首次自动扫描真实激活 Iris Xe 并完成16MiB哈希，保存一条启动历史。故意乐观的1ms先验低估实际354.620ms启动，累计花费479.760ms超过挣得227.389ms，因此这种探索策略不是运行时绝对支出上限。第二进程恢复354.620ms先验，247.545ms预算扣除125.120ms发现后不足，正确不再激活；模型命中2次、启动历史命中1次。这直接证明真实设备预算激活及跨进程成本复用，但不是性能加速结果，CPU基准更快。
