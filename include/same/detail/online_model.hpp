@@ -9,6 +9,25 @@ namespace same::detail {
 /// Example: model.observe(false, 1048576, 0.5); model.predict(false, 1048576);
 class OnlineModel {
 public:
+    /// 固定维度线性成本特征。 / Fixed-dimensional linear cost features.
+    static constexpr unsigned feature_count = 4;
+    /// 持久化特征编码版本。 / Persisted feature encoding version.
+    static constexpr unsigned feature_version = 1;
+    /// payload、有效批量与额外竞争者数。 / Payload, effective batch and extra concurrent peers.
+    struct Context {
+        std::uint64_t bytes{}, effective_batch_bytes{};
+        double contention{};
+    };
+    /// 可加充分统计量；范围仅用于外推诊断。 / Additive sufficient statistics; ranges diagnose
+    /// extrapolation.
+    struct Statistics {
+        std::array<double, 16> xtx{};
+        std::array<double, 4> xty{}, minimum{}, maximum{};
+        double yty{}, weight{};
+        std::uint64_t samples{};
+    };
+    /// 顺序为 CPU/CUDA/iGPU。 / Ordered CPU/CUDA/iGPU.
+    using State = std::array<Statistics, 3>;
     /// 新观测的 EWMA 权重；旧观测权重为 1-alpha。
     /// EWMA weight of a new observation; the previous estimate weighs 1-alpha.
     static constexpr double smoothing_alpha = 0.125;
@@ -43,13 +62,15 @@ public:
     /// 相同四倍大小区间内的估计；未知不是零成本。
     /// Estimate within the same factor-four size band; unknown is not zero cost.
     struct Prediction {
-        /// 预计服务时间与绝对残差 EWMA（毫秒），不是置信区间。
-        /// Predicted service time and absolute-residual EWMA in ms, not a confidence interval.
+        /// 超出训练特征包围盒；不代表统计置信度。 / Outside training feature bounds, not
+        /// confidence. 预计服务时间与绝对残差 EWMA（毫秒），不是置信区间。 Predicted service time
+        /// and absolute-residual EWMA in ms, not a confidence interval.
         double ms{}, error_ms{};
         /// 真实任务样本数，不包含校准先验。 / Task samples, excluding calibration priors.
         std::uint64_t samples{};
         /// 是否有有效先验或观测。 / Whether a valid prior or observation exists.
         bool known{};
+        bool out_of_domain{};
     };
     /// 累计观测概要；直方图单位微秒，桶为 floor(log2(us))，两端饱和。
     /// Observation totals; histogram buckets use floor(log2(us)), saturated at both ends.
@@ -63,6 +84,9 @@ public:
         /// 含校准先验的有效区间数。 / Known bands including calibration priors.
         std::uint64_t cpu_known_bands{}, gpu_known_bands{}, igpu_known_bands{};
         double mean_absolute_error_ms{};
+        /// 更新前残差总量及域外计数。 / Pre-update residual totals and out-of-domain count.
+        double absolute_error_sum_ms{}, squared_error_sum_ms2{};
+        std::uint64_t out_of_domain_samples{}, numerical_rejections{};
         /// 服务时间与预测残差的有界分布。 / Bounded service-time and residual distributions.
         std::array<std::uint64_t, 32> latency_histogram{}, residual_histogram{};
     };
@@ -82,6 +106,34 @@ public:
     /// Example: const auto bands = model.parameters(); // bands[0] is CPU band zero.
     Parameters parameters() const noexcept;
 
+    /// 装入启动先验并衰减；清空本次增量。 / Load decayed startup prior and clear this run's delta.
+    bool initialize(const State& prior, double decay = 1.0) noexcept;
+    /// 延迟装入单设备先验，不重置其他设备或本次增量。 / Lazily load one device prior, preserving
+    /// other devices and run deltas.
+    bool initialize_backend(BackendKind backend, const Statistics& prior,
+                            double decay = 1.0) noexcept;
+    /// 只导出本次观测，合并时先验只能计入一次。 / Export run-only observations; merge the prior
+    /// once.
+    const State& delta() const noexcept {
+        return delta_;
+    }
+    /// 已衰减的启动先验。 / Decayed startup prior.
+    const State& prior() const noexcept {
+        return prior_;
+    }
+    /// 事务性合并；非法或溢出输入不改变目标。 / Transactional merge; invalid/overflow input
+    /// preserves target.
+    static bool merge(State& target, const State& addition) noexcept;
+    /// 验证外部充分统计量的数值域和结构。 / Validate external sufficient-statistic domain and
+    /// structure.
+    static bool valid_state(const State& state) noexcept;
+    /// 固定维度岭回归预测；error_ms 是残差 RMS 而非置信区间。
+    /// Fixed-dimensional ridge prediction; error_ms is residual RMS, not a confidence interval.
+    Prediction predict(BackendKind backend, const Context& context) const noexcept;
+    /// 在更新前记录预测残差，然后累加充分统计量。 / Record pre-update residual then sufficient
+    /// statistics.
+    bool observe(BackendKind backend, const Context& context, double service_ms) noexcept;
+
     /// 兼容 CUDA 布尔调用。 / Compatibility for CUDA boolean callers.
     Prediction predict(bool gpu, std::uint64_t bytes) const noexcept {
         return predict(gpu ? BackendKind::cuda : BackendKind::cpu, bytes);
@@ -98,6 +150,22 @@ public:
     }
 
 private:
+    /// 启动先验与线程局部增量分离，避免多工作线程重复先验。
+    /// Separate startup prior and thread-local delta prevent multiplying prior evidence.
+    State prior_{}, delta_{};
+    /// 缓存的回归系数与残差尺度。 / Cached regression coefficients and residual scale.
+    struct Fit {
+        std::array<double, 4> beta{};
+        /// 域边界必须与缓存系数来自同一次拟合。 / Domain bounds must belong to the cached fit.
+        std::array<double, 4> minimum{}, maximum{};
+        std::uint64_t samples{};
+        double residual{};
+        bool valid{};
+    };
+    std::array<Fit, 3> fits_{};
+    /// 小型 Cholesky 求解；失败不发布新系数。 / Small Cholesky solve; failures do not publish
+    /// coefficients.
+    bool solve(unsigned backend) noexcept;
     /// 每字节成本及残差，alpha=1/8，约五个样本的半衰期。
     /// Per-byte cost/residual, alpha=1/8, approximately five-sample half-life.
     struct Band {
