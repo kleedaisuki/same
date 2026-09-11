@@ -33,9 +33,9 @@ The launcher imports an x64 MSVC environment discovered with vswhere. Isolated C
 
 **The extension is not a separate compiler.** It still requires a matching Toolkit, nvcc and host compiler. Discovery neither installs software nor bypasses NVIDIA compatibility checks or exhaustively searches version combinations.
 
-显式 `CC`、`CXX`、`CMAKE_*_COMPILER`、`CMAKE_TOOLCHAIN_FILE` 优先；`SAME_USE_ENVIRONMENT=ON` 完全保留调用者环境，并禁用跨 VS 生成器回退。显式工具链文件请使用绝对路径。切换生成器/工具链使用新的 `SAME_BUILD_DIR`；同一路径工具升级或工具链文件内容变化后也应清理缓存。Linux/macOS 使用调用者环境；macOS 应选择 CPU。
+显式 `CC`、`CXX`、`CMAKE_*_COMPILER`、`CMAKE_TOOLCHAIN_FILE` 优先；`SAME_USE_ENVIRONMENT=ON` 完全保留调用者环境，并禁用跨 VS 生成器回退。显式工具链文件请使用绝对路径。切换生成器/工具链使用新的 `SAME_BUILD_DIR`；同一路径工具升级或工具链文件内容变化后也应清理缓存。Linux/macOS 使用调用者环境；macOS 应关闭 CUDA；OpenCL 是否可运行取决于设备与系统框架。
 
-Explicit compiler/toolchain choices take precedence. `SAME_USE_ENVIRONMENT=ON` preserves caller tools and disables automatic VS-generator fallback. Use absolute toolchain paths and fresh build directories after generator/toolchain changes, including in-place upgrades. Unix hosts use caller tools; choose CPU on macOS.
+Explicit compiler/toolchain choices take precedence. `SAME_USE_ENVIRONMENT=ON` preserves caller tools and disables automatic VS-generator fallback. Use absolute toolchain paths and fresh build directories after generator/toolchain changes, including in-place upgrades. Unix hosts use caller tools; disable CUDA on macOS; OpenCL runtime availability is device-dependent.
 
 ## CLion 与原生 CMake / CLion and native CMake
 
@@ -86,3 +86,26 @@ This change uses established native CMake mechanisms rather than an experimental
 
 
 Windows CUDA 12.8 的静态运行库在 MSBuild 链接时可能报告 LNK4098（LIBCMT/MSVCRT 默认库警告）。保留现有静态 CUDA 运行库，避免为消除警告而引入 cudart DLL 部署依赖；未使用 /NODEFAULTLIB 掩盖。 / CUDA 12.8 static runtime may produce MSBuild LNK4098 default-library warnings. Static linkage is preserved rather than introducing a cudart DLL deployment requirement or suppressing libraries.
+
+## 可选 OpenCL 核显 / Optional OpenCL iGPU
+
+`SAME_ENABLE_OPENCL=ON` 默认启用，下载固定版本 OpenCL-Headers，不要求安装 OpenCL SDK 或链接系统加载器。运行时动态加载系统 OpenCL；驱动不可用或没有合格设备时回退 CPU。生产选择 GPU 且报告统一主机内存的设备，不把任意 CPU OpenCL 设备当核显。
+OpenCL headers are pinned; the system loader and driver are discovered dynamically. Missing eligible devices safely fall back to CPU.
+
+```sh
+cmake --preset igpu
+cmake --build --preset igpu
+ctest --preset igpu
+# 完全关闭加速器 / Completely disable accelerators:
+cmake -S . -B build/host-only -DSAME_ENABLE_CUDA=OFF -DSAME_ENABLE_OPENCL=OFF
+# 脚本入口关闭 OpenCL / Disable OpenCL through the launcher:
+cmake -DSAME_CUDA_MODE=off -DSAME_CMAKE_ARGS=-DSAME_ENABLE_OPENCL=OFF -P tools/build.cmake
+```
+
+`cpu` 预设关闭 CUDA 和 OpenCL；`igpu` 只启用 OpenCL；`release`/`cuda` 中 OpenCL 与 CUDA 独立配置。CUDA 自动路线回退到主机编译不等于禁用 OpenCL。Linux 需要可用的 OpenCL ICD/驱动；Windows 使用系统 OpenCL.dll；macOS 尝试系统框架，但不能以构建成功推断设备可用。
+CUDA toolchain fallback does not disable OpenCL. Host builds and runtime availability are separate concerns on all platforms.
+
+原生测试环境变量 `SAME_REQUIRE_IGPU=1` 要求真实合格设备；`SAME_REQUIRE_OPENCL_TEST_DEVICE=1` 用于 CI 的 OpenCL 测试工厂，允许 PoCL CPU 设备且不能静默跳过。它们不是生产后端选择开关。GitHub Actions 配置覆盖 Windows/Linux/macOS 的 OpenCL 开/关构建，并单独运行 PoCL 和主机 sanitizer；实际结论须检查对应提交运行结果。
+Test-only requirement switches distinguish physical-device validation from PoCL kernel semantics. Workflow configuration is not proof that a particular run passed.
+
+运行与持久化学习见 [上下文学习](contextual-learning.md)。 / See the contextual-learning contract for runtime behavior.

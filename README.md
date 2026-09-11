@@ -4,7 +4,7 @@
 
 **Find byte-identical files in the working directory; scanning never deletes or rewrites input files.**
 
-C++23 · BLAKE3 · SQLite · optional CUDA。扫描目录 → 只为新增或元数据变化的文件计算 BLAKE3 → 对相同大小和摘要的候选文件逐字节比较。相同摘要不是相同内容的证明。
+C++23 · BLAKE3 · SQLite · optional CUDA / OpenCL iGPU。扫描目录 → 只为新增或元数据变化的文件计算 BLAKE3 → 对相同大小和摘要的候选文件逐字节比较。相同摘要不是相同内容的证明。
 
 Traverse → hash new or metadata-changed files → compare equal-size/equal-digest candidates byte for byte. Digest equality alone is not proof of content equality.
 
@@ -42,9 +42,9 @@ cmake --build --preset release
 ctest --preset release
 ```
 
-`release` 尝试启用 CUDA，不可用时回退 CPU；`cuda` 要求 CUDA 可构建；`cpu` 仅构建 CPU 版本。启用 CUDA 的构建均支持运行时自动分流。完整配置与故障排查见 [构建指南](docs/build.md)。
+`release` 尝试启用 CUDA，并默认包含可选 OpenCL iGPU 后端；`cuda` 要求 CUDA 可构建；`cpu` 关闭两种加速器；`igpu` 关闭 CUDA、启用可选 OpenCL。启用 CUDA 的构建均支持运行时自动分流。完整配置与故障排查见 [构建指南](docs/build.md)。
 
-`release` attempts CUDA with CPU fallback; `cuda` requires a usable CUDA toolchain; `cpu` builds without CUDA. CUDA-enabled builds support runtime auto routing. See the [build guide](docs/build.md) for configuration and troubleshooting.
+`release` attempts CUDA and includes optional OpenCL; `cuda` requires CUDA; `cpu` disables both accelerators; `igpu` enables optional OpenCL without CUDA. CUDA-enabled builds support runtime auto routing. See the [build guide](docs/build.md) for configuration and troubleshooting.
 
 ## 使用与输出 / Usage and output
 
@@ -56,6 +56,7 @@ Run the installed executable **from the directory to scan**:
 same                            # 等同 same scan，仅当前目录 / same scan, root files only
 same scan -r                    # 递归子目录 / include subdirectories
 same scan --cpu --rehash         # CPU 强制重新哈希 / CPU, bypass digest cache
+same scan --igpu --rehash        # 请求核显，仍允许安全回退 / request iGPU with safe fallback
 same scan -r --no-pgo            # 关闭运行时路由分析器 / disable runtime routing analyzer
 same scan -r --no-telemetry      # 本轮不写遥测库 / disable telemetry persistence for this run
 same scan -r --summary           # 显示汇总、数据库与性能统计 / show all statistics
@@ -236,7 +237,7 @@ rehash = false
 | `memory_bytes` | 67108864 (64 MiB) | ≥ `workers * (2*block_bytes + block_bytes/32 + 4096)` |
 | `device_memory_bytes` | 67108864 (64 MiB) | 正整数 / positive integer |
 | `queue_capacity` | `2 * workers` | 1–65536 |
-| `backend` | `"auto"` | `"auto"`, `"cpu"`, `"cuda"` |
+| `backend` | `"auto"` | `"auto"`, `"cpu"`, `"cuda"`, `"igpu"` |
 | `rehash` | `false` | 布尔值 / boolean |
 | `pgo` | `true` | 运行时剖析引导路由；`--no-pgo` 可覆盖关闭 / Runtime profile-guided routing; CLI can disable |
 | `telemetry` | `true` | 持久化本地遥测；`--no-telemetry` 可覆盖关闭 / Persist local telemetry; CLI can disable |
@@ -244,32 +245,18 @@ rehash = false
 | `telemetry_retention_runs` | `64` | 1–4096；包含本轮 / Retained runs including current |
 | `telemetry_max_events` | `16384` | 1–1000000；每轮队列事件上限，不含最终快照 / Per-run queued-event cap, excluding final snapshot |
 
-`auto` 使用固定 `workers` 个统一工作线程，共享一个先入先出任务队列；每个线程根据自己的真实任务统计选择 CPU SIMD 或自己的 CUDA 执行流（stream）。没有额外 GPU 服务线程，也没有中央模型训练锁。
+`auto` 使用固定 `workers` 个统一工作线程，共享一个先入先出任务队列；每个线程根据自己的真实任务统计选择 CPU SIMD、自己的 CUDA 执行流（stream）或池内 OpenCL iGPU。没有额外 GPU 服务线程，也没有中央模型训练锁。
 默认小于 16 MiB 直接 CPU；资格仅由 `gpu_min_bytes` 控制，与 CPU `block_bytes` 无关。
-主机与显存总预算按线程分摊，GPU 按需初始化；预算不足时降级块大小或停用该线程 GPU。
-自动模式首次设备初始化期间，其他线程先用 CPU；就绪后各自 GPU 流可并发，不设置稳态单 GPU 门槛。
-启动只检查设备正确性，不运行合成性能校准；正常成功任务更新本地模型。可恢复设备错误回退 CPU，验证不一致等非设备异常仍使扫描失败。
-多流共享同一 GPU 主上下文（primary context），不等于多块 GPU；本地学习可能受样本分散和设备争用影响，不保证全局最优或短批次收益。
+自动路由使用 CPU、CUDA 和 OpenCL iGPU 三个候选，基于 payload、实际批量与在途竞争的四维服务成本模型。设备特征用于身份隔离；工作线程独占模型和增量。iGPU 单实例忙时不等待，CUDA 使用线程私有流；预算、大小门槛与正确性检查独立于模型。预测不是全局最优或性能提升保证。
 
-Auto uses exactly `workers` unified workers and one FIFO. Each chooses CPU SIMD or its own CUDA stream from worker-local observations, without an extra GPU service or centralized training lock.
-Eligibility remains independent of CPU block size. Total host/device budgets are divided across workers; GPU initialization is lazy with budgeted fallback.
-During auto cold startup, peers run CPU; once ready, private GPU streams remain concurrent without a steady-state single-GPU gate. Startup checks correctness without synthetic performance calibration. Streams share one device primary context; fragmented samples and contention limit prediction quality and no global-optimality/speedup claim is made.
+Auto routing predicts service cost for CPU, CUDA and OpenCL iGPU using payload, effective batches and concurrent peers. Device profiles namespace worker-local learning. Busy iGPU admission never waits; CUDA streams remain worker-private. Eligibility and correctness override predictions.
 
-`pgo=true` 默认启用运行时剖析引导优化（profile-guided optimization, PGO）。
-`--no-pgo` 覆盖配置，关闭采样、学习和模型决策，保留设备正确性检查与静态分流：
-合格文件达到 64 MiB 时选择该线程可用的 GPU，其余 CPU。它不是 `--cpu`，
-也不改变编译器 PGO。`--summary` 仅控制统计是否显示，不启停模型。
+`pgo=true` 默认启用运行时剖析引导优化（profile-guided optimization, PGO）。独立 `.same/model.db` 保存跨运行充分统计量，按设备/驱动/实现与配置匹配，运行边界衰减先验。`--no-telemetry` 不关闭该学习库；`--no-pgo` 不加载、更新或保存模型，并使用静态分流，不等同于 `--cpu` 或编译器 PGO。`--summary` 仅控制展示。
 
-Runtime PGO defaults on. `--no-pgo` disables sampling, learning and model
-placement, not device correctness checks or GPU support. Static eligible files at least 64 MiB prefer
-GPU when available to that worker; smaller eligible files use CPU. This is neither forced CPU nor a
-compiler PGO switch. Summary visibility is independent of analyzer operation.
+PGO persists model statistics independently of telemetry. Disabling telemetry preserves learning; disabling PGO disables model access and uses static routing. Summary visibility is independent.
 
-详见[自动分流契约](docs/auto-dispatch.md)、[统一线程设计](docs/unified-worker-design.md)与
-[实验计划](docs/online-routing-experiment-plan.md)。 / See the routing contract, research design and
-experiment plan; historical benchmarks do not establish the new model's speedup.
-
-先前中央模型的历史实测见 [旧架构验证报告](docs/online-routing-validation.md)，不作为当前线程私有模型的性能证明。 / Earlier centralized-model measurements are historical, not performance evidence for the current worker-private architecture.
+数学定义、统计口径、探索局限与持久化契约见 [上下文学习](docs/contextual-learning.md)。旧架构报告保留为历史证据，不证明当前实现性能。
+See [contextual learning](docs/contextual-learning.md) for mathematics and limitations; historical routing benchmarks do not establish current performance.
 
 ### 有界扫描流水线 / Bounded scanning pipeline
 
@@ -292,12 +279,12 @@ initialization costs. Runtime synthetic calibration is not run: after device val
 `calibration_stop=not-run-device-checked` and legacy calibration timings remain zero, not evidence of
 GPU inferiority. GPU block size alone does not prove file execution; comparison remains host-side.
 
-持续剖析（continuous profiling）仅在进程内聚合任务级样本，不采集操作系统调用栈，
-不逐文件记录路径、不逐块计时，也不写入摘要数据库。固定大小统计包括 CPU/GPU 样本数、
+持续剖析（continuous profiling）在线程局部聚合任务级样本，并在运行边界保存模型统计量，不采集操作系统调用栈，
+不逐文件记录路径、不逐块计时，也不写入摘要数据库。固定大小统计包括 CPU/CUDA/iGPU 样本数、
 已知大小区间、预测误差和有界延迟分布；它们通过 `--summary` 展示。
 该机制追求低开销，而不是声称数学意义上的零成本；性能结论须由对照实验支持。
 
-Continuous profiling aggregates bounded task-level statistics in process; it is not an OS stack sampler.
+Continuous profiling aggregates bounded worker-local task statistics and persists model statistics at run boundaries; it is not an OS stack sampler.
 It adds no per-file path log, per-block timers or digest-database writes. Summary reports backend sample
 counts, known bands, prediction errors and bounded latency distributions. Low overhead must be measured,
 not asserted as literally zero.
