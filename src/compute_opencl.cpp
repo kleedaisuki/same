@@ -138,7 +138,7 @@ struct Program {
         return value;
     }
     /// 生产只接受统一内存 GPU；测试允许 CPU ICD。 / Production accepts unified-memory GPU only.
-    void init(bool testing) {
+    void select(bool testing) {
         static auto shared_api = std::make_shared<Api>();
         api = shared_api;
         cl_uint n = 0;
@@ -176,6 +176,12 @@ struct Program {
         profile.global_memory_bytes = property<cl_ulong>(CL_DEVICE_GLOBAL_MEM_SIZE);
         profile.max_allocation_bytes = property<cl_ulong>(CL_DEVICE_MAX_MEM_ALLOC_SIZE);
         profile.unified_memory = flag(CL_DEVICE_HOST_UNIFIED_MEMORY);
+    }
+    /// 延迟创建上下文并编译；只在工作实际接入时执行。 / Lazily create context/program only
+    /// when compute is admitted. Partial failed initialization is retained for RAII cleanup.
+    void build() {
+        if (program)
+            return;
         cl_int e = 0;
         context = api->clCreateContext(nullptr, 1, &id, nullptr, nullptr, &e);
         check(e);
@@ -195,15 +201,32 @@ struct Program {
     }
 };
 /// 初始化串行化，实际工作线程不持锁。 / Serialize initialization, not worker execution.
-std::shared_ptr<Program> program_for(bool testing) {
+std::shared_ptr<Program> program_for(bool testing, bool materialize = true) {
     static std::mutex mutex;
     static std::shared_ptr<Program> production, test;
     std::lock_guard lock(mutex);
     auto& p = testing ? test : production;
     if (!p) {
         auto next = std::make_shared<Program>();
-        next->init(testing);
+        next->select(testing);
         p = std::move(next);
+    }
+    if (materialize && !p->program) {
+        try {
+            p->build();
+        } catch (...) {
+            // 清理失败的部分编译状态，但保留选择与资料。 / Clear failed build state, retain
+            // selection.
+            if (p->program) {
+                p->api->clReleaseProgram(p->program);
+                p->program = nullptr;
+            }
+            if (p->context) {
+                p->api->clReleaseContext(p->context);
+                p->context = nullptr;
+            }
+            throw;
+        }
     }
     return p;
 }
@@ -427,6 +450,18 @@ std::unique_ptr<Compute> create(std::size_t block, std::size_t budget, bool test
     }
 }
 } // namespace
+std::optional<DeviceProfile> try_igpu_profile(std::size_t block, std::size_t budget) {
+    if (std::endian::native != std::endian::little || block < 1024 || budget < 1056)
+        return std::nullopt;
+    try {
+        auto profile = program_for(false, false)->profile;
+        profile.effective_batch_bytes =
+            std::min({block / 1024, budget / 1056, std::size_t{65536}}) * 1024;
+        return profile;
+    } catch (const ComputeError&) {
+        return std::nullopt;
+    }
+}
 std::unique_ptr<Compute> try_igpu_compute(std::size_t block, std::size_t budget) {
     return create(block, budget, false);
 }

@@ -73,10 +73,20 @@ void exercise(same::Compute& device) {
 int main() {
     try {
         require(!same::try_igpu_compute(65536, 0), "zero budget accepted");
+        require(!same::try_igpu_profile(65536, 0), "zero-budget profile accepted");
         const bool required_test = std::getenv("SAME_REQUIRE_OPENCL_TEST_DEVICE") != nullptr;
         const bool required_igpu = std::getenv("SAME_REQUIRE_IGPU") != nullptr;
+        const auto profile = required_test ? std::optional<same::DeviceProfile>{}
+                                           : same::try_igpu_profile(65536, 262144);
         auto device = required_test ? same::detail::try_opencl_test_compute(65536, 262144)
                                     : same::try_igpu_compute(65536, 262144);
+        if (device && !required_test) {
+            require(profile.has_value(), "materialized device absent from preflight");
+            require(profile->device_name == device->profile().device_name &&
+                        profile->driver_version == device->profile().driver_version &&
+                        profile->effective_batch_bytes == device->profile().effective_batch_bytes,
+                    "preflight and materialized device differ");
+        }
         if (!device) {
             require(!required_test && !required_igpu, "required OpenCL device unavailable");
             std::cout << "OpenCL iGPU unavailable; optional runtime fallback passed\n";

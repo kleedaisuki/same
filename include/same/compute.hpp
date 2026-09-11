@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -155,6 +156,9 @@ std::unique_ptr<Compute> try_cuda_compute(std::size_t block_bytes, std::size_t d
  * 同步输入生命周期与 Compute 相同。 / Retains Compute's synchronous input lifetime
  * contract.
  */
+/// 只查询候选核显身份和有效容量，不创建上下文或编译内核。 / Probe identity and effective capacity
+/// without context creation or kernel compilation; absent runtime/device/budget returns nullopt.
+std::optional<DeviceProfile> try_igpu_profile(std::size_t block_bytes, std::size_t device_budget);
 std::unique_ptr<Compute> try_igpu_compute(std::size_t block_bytes, std::size_t device_budget);
 /// 转换为固定 64 位小写十六进制字符串。 / Encode as exactly 64 lowercase hexadecimal characters.
 std::string hex_digest(const Digest& digest);
