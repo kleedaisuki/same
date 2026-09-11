@@ -8,6 +8,23 @@
 #include <string>
 
 namespace same {
+/// 计算设备类别；独显与核显不能共用布尔身份。 / Device kinds distinguish discrete and integrated
+/// GPUs.
+enum class BackendKind { cpu, cuda, igpu };
+
+/// 固定诊断名称；不分配内存。 / Stable diagnostic name without allocation.
+constexpr const char* backend_name(BackendKind kind) noexcept {
+    switch (kind) {
+    case BackendKind::cpu:
+        return "cpu";
+    case BackendKind::cuda:
+        return "cuda";
+    case BackendKind::igpu:
+        return "igpu";
+    }
+    return "cpu";
+}
+
 /// 可触发整项操作 CPU 重试的后端错误。 / Backend failure eligible for whole-operation CPU retry.
 class ComputeError : public std::runtime_error {
 public:
@@ -76,6 +93,13 @@ public:
     virtual bool equal(std::span<const std::byte> a, std::span<const std::byte> b) = 0;
     /// 返回诊断使用的稳定后端名。 / Return the stable backend name used in diagnostics.
     virtual std::string name() const = 0;
+    /// 强类型路由身份；默认适配现有测试后端，生产后端直接覆盖。
+    /// Typed routing identity; the default adapts named test backends, production overrides it.
+    virtual BackendKind kind() const {
+        const auto id = name();
+        return id == "igpu" ? BackendKind::igpu
+                            : (id == "cuda" ? BackendKind::cuda : BackendKind::cpu);
+    }
 };
 /// 创建无需设备初始化的 CPU 后端。 / Create a CPU backend without device initialization.
 std::unique_ptr<Compute> make_cpu_compute();
@@ -88,6 +112,22 @@ std::unique_ptr<Compute> make_cpu_compute();
  * builds preserve this interface and always return null.
  */
 std::unique_ptr<Compute> try_cuda_compute(std::size_t block_bytes, std::size_t device_budget);
+/**
+ * @brief 创建可选的 OpenCL 集成 GPU 后端。 / Create an optional OpenCL integrated-GPU backend.
+
+ * * @param block_bytes 请求的最大输入块。 / Requested maximum input block.
+ * @param device_budget
+ * 显式 OpenCL 分配配额，须计入共享主存预算。
+ * Explicit OpenCL allocation allowance, charged to
+ * shared host memory.
+ * 未构建、驱动缺失、设备不匹配或配额不足返回空；不选择 OpenCL CPU
+ * 作为核显。
+ * Return null when unbuilt, unavailable, ineligible or under-budget; never label a
+ * CPU as iGPU.
+ * 同步输入生命周期与 Compute 相同。 / Retains Compute's synchronous input lifetime
+ * contract.
+ */
+std::unique_ptr<Compute> try_igpu_compute(std::size_t block_bytes, std::size_t device_budget);
 /// 转换为固定 64 位小写十六进制字符串。 / Encode as exactly 64 lowercase hexadecimal characters.
 std::string hex_digest(const Digest& digest);
 } // namespace same

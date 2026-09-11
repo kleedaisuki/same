@@ -264,6 +264,10 @@ public:
     std::string name() const override {
         return "cuda";
     }
+    /// 返回强类型 CUDA 身份。 / Return the typed CUDA identity.
+    BackendKind kind() const override {
+        return BackendKind::cuda;
+    }
     /// 主机已有两份输入，直接比较以避免两次 H2D 和同步。 / Compare host-resident inputs
     /// directly, avoiding two H2D transfers and synchronization; empty spans need no pointers.
     bool equal(std::span<const std::byte> a, std::span<const std::byte> b) override {

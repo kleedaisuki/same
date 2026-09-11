@@ -43,6 +43,10 @@ public:
     std::string name() const override {
         return "cpu";
     }
+    /// 返回强类型 CPU 身份。 / Return the typed CPU identity.
+    BackendKind kind() const override {
+        return BackendKind::cpu;
+    }
 };
 } // namespace
 /// 构造 CPU 后端，不申请设备资源。 / Construct a CPU backend without device resources.
