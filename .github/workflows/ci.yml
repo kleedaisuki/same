@@ -2,6 +2,7 @@ name: build-and-test
 on:
   push:
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -10,22 +11,60 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, windows-2022, macos-14]
+        opencl: ['ON', 'OFF']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      # Native generators discover VS on Windows; no Python bootstrap is needed.
-      # Windows 原生生成器发现 VS，无需 Python 引导环境。
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSAME_ENABLE_CUDA=OFF
+      # ON also checks optional runtime discovery; OFF has no OpenCL dependency.
+      # ON 验证可选运行时发现；OFF 完全不依赖 OpenCL。
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSAME_ENABLE_CUDA=OFF -DSAME_ENABLE_OPENCL=${{ matrix.opencl }}
       - run: cmake --build build --config Release --parallel 4
-      - run: ctest --test-dir build -C Release --output-on-failure --timeout 120
+      - run: ctest --test-dir build -C Release --output-on-failure --timeout 120 --output-junit results.xml
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: tests-${{ matrix.os }}-opencl-${{ matrix.opencl }}
+          path: |
+            build/results.xml
+            build/Testing/Temporary/LastTest.log
+  opencl-kernel:
+    runs-on: ubuntu-24.04
+    env:
+      # Test-only factory permits PoCL CPU; production still selects only iGPUs.
+      # 仅测试工厂允许 PoCL CPU，生产仍只选择核显。
+      SAME_REQUIRE_OPENCL_TEST_DEVICE: '1'
+      POCL_MAX_PTHREAD_COUNT: '4'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y pocl-opencl-icd ocl-icd-libopencl1 clinfo
+      - run: clinfo -l
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSAME_ENABLE_CUDA=OFF -DSAME_ENABLE_OPENCL=ON
+      - run: cmake --build build --parallel 4
+      - run: ctest --test-dir build --output-on-failure --timeout 180 --output-junit results.xml
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: tests-pocl-native-kernel
+          path: |
+            build/results.xml
+            build/Testing/Temporary/LastTest.log
   sanitizers:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DSAME_ENABLE_CUDA=OFF -DSAME_SANITIZERS=ON
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DSAME_ENABLE_CUDA=OFF -DSAME_ENABLE_OPENCL=OFF -DSAME_SANITIZERS=ON
       - run: cmake --build build --parallel 4
-      - run: ctest --test-dir build --output-on-failure --timeout 120
+      - run: ctest --test-dir build --output-on-failure --timeout 120 --output-junit results.xml
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: tests-sanitizers
+          path: |
+            build/results.xml
+            build/Testing/Temporary/LastTest.log
