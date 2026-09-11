@@ -219,14 +219,29 @@ int main(int argc, char** argv) {
         run();
         const auto expected = read(out);
         check(!expected.empty(), "missing duplicate output");
+        if (same::make_cpu_compute()->profile().device_name.empty()) {
+            check(!fs::exists(database), "unknown CPU identity persisted model");
+            check(metric(read(err), "model_persistence_enabled") == 0,
+                  "unsafe persistence enabled");
+            check(read(err).find("model_persistence_disabled_reason=cpu_identity_unknown") !=
+                      std::string::npos,
+                  "missing unknown identity diagnostic");
+            check(metric(read(err), "pgo_samples") > 0,
+                  "unknown identity disabled in-run learning");
+            run();
+            check(read(out) == expected, "unknown identity changed groups");
+            fs::remove_all(base);
+            std::cout << "Unknown-identity learning isolation passed\n";
+            return 0;
+        }
         check(metric(read(err), "model_saved_keys") == 1, "model not saved");
         const auto key = stored_key(database);
         same::detail::OnlineModel::State first{};
         {
             same::ModelStore store(database);
             const auto loaded = store.load(key);
-            check(loaded.has_value(), std::string("first model load: ") +
-                                          std::string(store.diagnostic()));
+            check(loaded.has_value(),
+                  std::string("first model load: ") + std::string(store.diagnostic()));
             first = *loaded;
         }
         // 队列容量不是设备身份，改变它仍应复用相同先验。
@@ -240,8 +255,8 @@ int main(int argc, char** argv) {
         {
             same::ModelStore store(database);
             const auto loaded = store.load(key);
-            check(loaded.has_value(), std::string("second model load: ") +
-                                          std::string(store.diagnostic()));
+            check(loaded.has_value(),
+                  std::string("second model load: ") + std::string(store.diagnostic()));
             const auto second = *loaded;
             const auto delta = second[0].samples - first[0].samples;
             check(delta == 16, "prior was multiplied by worker count or run samples lost");

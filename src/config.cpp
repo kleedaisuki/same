@@ -1,5 +1,6 @@
 #include "same/config.hpp"
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <limits>
 #include <optional>
@@ -97,10 +98,25 @@ Config Config::load(const std::filesystem::path& root) {
             throw std::runtime_error("telemetry must be boolean");
         result.telemetry = *value;
     }
+    auto real = [&](const char* name, double& target) {
+        if (!table.contains(name))
+            return;
+        const auto value = table[name].value<double>();
+        if (!value)
+            throw std::runtime_error(std::string("invalid number: ") + name);
+        target = *value;
+    };
+    real("igpu_bootstrap_ms", result.igpu_bootstrap_ms);
+    real("cold_exploration_fraction", result.cold_exploration_fraction);
     result.validate();
     return result;
 }
 void Config::validate() const {
+    if (!std::isfinite(igpu_bootstrap_ms) || igpu_bootstrap_ms < 0 || igpu_bootstrap_ms > 3600000)
+        throw std::runtime_error("igpu_bootstrap_ms must be finite in [0, 3600000]");
+    if (!std::isfinite(cold_exploration_fraction) || cold_exploration_fraction < 0 ||
+        cold_exploration_fraction > 1)
+        throw std::runtime_error("cold_exploration_fraction must be finite in [0, 1]");
     if (!workers || workers > 256)
         throw std::runtime_error("workers must be in [1, 256]");
     if (!metadata_workers || metadata_workers > 256)

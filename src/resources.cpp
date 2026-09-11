@@ -2,8 +2,10 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 
 namespace same {
 namespace {
@@ -18,15 +20,21 @@ void add(std::uint64_t& target, std::uint64_t value) {
 } // namespace
 
 Resources::Resources(const Config& config)
-    : Resources(config, try_cuda_compute, try_igpu_compute) {}
+    : Resources(config, try_cuda_compute, try_igpu_compute, {}, {}, try_igpu_profile) {}
 Resources::Resources(const Config& config, detail::CudaFactory factory)
     : Resources(config, std::move(factory), detail::CudaFactory{}) {}
-Resources::Resources(const Config& config, detail::ModelPriorLoader prior)
-    : Resources(config, try_cuda_compute, try_igpu_compute, std::move(prior)) {}
+Resources::Resources(const Config& config, detail::ModelPriorLoader prior,
+                     detail::SetupPriorLoader setup)
+    : Resources(config, try_cuda_compute, try_igpu_compute, std::move(prior), std::move(setup),
+                try_igpu_profile) {}
 Resources::Resources(const Config& config, detail::CudaFactory factory, detail::CudaFactory igpu,
-                     detail::ModelPriorLoader prior)
+                     detail::ModelPriorLoader prior, detail::SetupPriorLoader setup,
+                     detail::IgpuProbe probe)
     : pgo_(config.pgo), auto_mode_(config.backend == "auto"), forced_gpu_(config.backend == "cuda"),
-      forced_igpu_(config.backend == "igpu"), prior_loader_(std::move(prior)),
+      forced_igpu_(config.backend == "igpu"), setup_loader_(std::move(setup)),
+      igpu_probe_(std::move(probe)), igpu_setup_estimate_ms_(config.igpu_bootstrap_ms),
+      cold_exploration_fraction_(config.cold_exploration_fraction),
+      credit_divisor_(static_cast<double>(config.workers)), prior_loader_(std::move(prior)),
       igpu_factory_(std::move(igpu)), capacity_(config.queue_capacity),
       cuda_factory_(std::move(factory)) {
     config.validate();
@@ -111,10 +119,15 @@ void Resources::enqueue(std::function<void(Worker&)> task) {
 
 void Resources::load_prior(Worker& worker, BackendKind kind, const Compute& compute,
                            std::size_t block) {
+    load_prior(worker, kind, compute.profile(), block);
+}
+
+void Resources::load_prior(Worker& worker, BackendKind kind, const DeviceProfile& profile,
+                           std::size_t block) {
     const auto slot = static_cast<unsigned>(kind);
     if (worker.prior_loaded[slot])
         return;
-    worker.devices[slot] = compute.profile();
+    worker.devices[slot] = profile;
     worker.devices[slot].backend = kind;
     auto& batch = worker.devices[slot].effective_batch_bytes;
     batch = batch ? std::min<std::uint64_t>(batch, block) : block;
@@ -207,27 +220,101 @@ Resources::choose_backend(Worker& worker, std::uint64_t bytes, bool hash,
     return known ? std::pair{best, Reason::model} : std::pair{preferred, Reason::fixed};
 }
 
-bool Resources::select_igpu(Worker& worker) {
+bool Resources::discover_igpu(Worker& worker) {
     bool idle = false;
     if (!igpu_busy_.compare_exchange_strong(idle, true, std::memory_order_acquire)) {
         ++worker.igpu_busy;
         return false;
     }
     try {
-        if (!igpu_attempted_) {
-            igpu_attempted_ = true;
-            const auto setup_start = std::chrono::steady_clock::now();
+        if (!igpu_probed_) {
+            igpu_probed_ = true;
+            const auto start = std::chrono::steady_clock::now();
             try {
-                igpu_compute_ = igpu_factory_(igpu_block_bytes_, igpu_budget_);
+                if (igpu_probe_) {
+                    const auto profile = igpu_probe_(igpu_block_bytes_, igpu_budget_);
+                    igpu_present_ = profile.has_value();
+                    if (profile) {
+                        igpu_profile_ = *profile;
+                        igpu_profile_.backend = BackendKind::igpu;
+                        auto& batch = igpu_profile_.effective_batch_bytes;
+                        batch = batch ? std::min<std::uint64_t>(batch, igpu_block_bytes_)
+                                      : igpu_block_bytes_;
+                    }
+                }
             } catch (...) {
-                igpu_setup_ms_ = std::chrono::duration<double, std::milli>(
-                                     std::chrono::steady_clock::now() - setup_start)
-                                     .count();
+                igpu_present_ = false;
+                igpu_discovery_ms_ = std::chrono::duration<double, std::milli>(
+                                         std::chrono::steady_clock::now() - start)
+                                         .count();
                 throw;
             }
-            igpu_setup_ms_ = std::chrono::duration<double, std::milli>(
-                                 std::chrono::steady_clock::now() - setup_start)
-                                 .count();
+            igpu_discovery_ms_ =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                    .count();
+            if (igpu_present_ && igpu_probe_ && setup_loader_ && pgo_) {
+                const auto estimate = setup_loader_(BackendKind::igpu, igpu_profile_);
+                if (std::isfinite(estimate) && estimate > 0)
+                    igpu_setup_estimate_ms_ = estimate;
+            }
+        }
+        if (igpu_present_ && igpu_probe_)
+            load_prior(worker, BackendKind::igpu, igpu_profile_, igpu_block_bytes_);
+        const bool present = igpu_present_ && !igpu_retired_;
+        igpu_busy_.store(false, std::memory_order_release);
+        return present;
+    } catch (const ComputeError&) {
+        igpu_present_ = false;
+        igpu_busy_.store(false, std::memory_order_release);
+        return false;
+    } catch (...) {
+        igpu_busy_.store(false, std::memory_order_release);
+        throw;
+    }
+}
+
+bool Resources::admit_cold_igpu(const Worker& worker) const {
+    if (!auto_mode_ || !pgo_)
+        return true;
+    const auto cpu = worker.model.predict(BackendKind::cpu, worker.candidate_contexts[0]);
+    const auto igpu = worker.model.predict(BackendKind::igpu, worker.candidate_contexts[2]);
+    const auto saving = detail::RoutingParameters::cpu_advantage_factor * cpu.ms - cpu.error_ms -
+                        (igpu.ms + igpu.error_ms);
+    if (cpu.known && igpu.known && !cpu.out_of_domain && !igpu.out_of_domain &&
+        saving >= igpu_setup_estimate_ms_)
+        return true;
+    return cold_credit_ms_.load(std::memory_order_relaxed) - cold_spent_ms_ >=
+           igpu_setup_estimate_ms_;
+}
+
+bool Resources::select_igpu(Worker& worker) {
+    bool idle = false;
+    if (!igpu_busy_.compare_exchange_strong(idle, true, std::memory_order_acquire)) {
+        ++worker.igpu_busy;
+        return false;
+    }
+    bool starting = false;
+    std::chrono::steady_clock::time_point setup_start;
+    const auto record_setup = [&] {
+        if (!starting)
+            return;
+        igpu_setup_ms_ = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - setup_start)
+                             .count();
+        cold_spent_ms_ += igpu_setup_ms_;
+        starting = false;
+    };
+    try {
+        if (!igpu_attempted_) {
+            if (!admit_cold_igpu(worker)) {
+                ++igpu_deferred_;
+                igpu_busy_.store(false, std::memory_order_release);
+                return false;
+            }
+            igpu_attempted_ = true;
+            starting = true;
+            setup_start = std::chrono::steady_clock::now();
+            igpu_compute_ = igpu_factory_(igpu_block_bytes_, igpu_budget_);
             if (igpu_compute_) {
                 igpu_first_.resize(igpu_block_bytes_);
                 igpu_second_.resize(igpu_block_bytes_);
@@ -235,17 +322,32 @@ bool Resources::select_igpu(Worker& worker) {
                 auto device = igpu_compute_->hasher();
                 cpu->update(igpu_first_);
                 device->update(igpu_first_);
-                if (cpu->finish() != device->finish()) {
-                    igpu_retired_ = true;
+                if (cpu->finish() != device->finish())
                     throw std::runtime_error("iGPU correctness validation mismatch");
-                }
+                auto actual = igpu_compute_->profile();
+                actual.backend = BackendKind::igpu;
+                auto& batch = actual.effective_batch_bytes;
+                batch =
+                    batch ? std::min<std::uint64_t>(batch, igpu_block_bytes_) : igpu_block_bytes_;
+                const auto identity = [](const DeviceProfile& p) {
+                    return std::tie(p.backend, p.device_name, p.vendor, p.driver_version,
+                                    p.implementation_version, p.architecture, p.compute_units,
+                                    p.hardware_threads, p.global_memory_bytes,
+                                    p.max_allocation_bytes, p.effective_batch_bytes,
+                                    p.unified_memory);
+                };
+                if (igpu_probe_ && identity(actual) != identity(igpu_profile_))
+                    throw std::runtime_error(
+                        "iGPU profile changed between discovery and activation");
+                igpu_profile_ = std::move(actual);
             }
+            record_setup();
         }
         if (!igpu_compute_ || igpu_retired_) {
             igpu_busy_.store(false, std::memory_order_release);
             return false;
         }
-        load_prior(worker, BackendKind::igpu, *igpu_compute_, igpu_block_bytes_);
+        load_prior(worker, BackendKind::igpu, igpu_profile_, igpu_block_bytes_);
         std::swap(worker.compute, igpu_compute_);
         worker.first.swap(igpu_first_);
         worker.second.swap(igpu_second_);
@@ -253,11 +355,13 @@ bool Resources::select_igpu(Worker& worker) {
         worker.selected_backend = worker.compute.get();
         return true;
     } catch (const ComputeError&) {
+        record_setup();
         igpu_retired_ = true;
         igpu_compute_.reset();
         igpu_busy_.store(false, std::memory_order_release);
         return false;
     } catch (...) {
+        record_setup();
         igpu_retired_ = true;
         igpu_compute_.reset();
         igpu_busy_.store(false, std::memory_order_release);
@@ -360,6 +464,9 @@ void Resources::select_backend(Worker& worker, std::uint64_t bytes, bool hash) n
                 worker.device_budget_bytes && !worker.gpu_retired &&
                 (!worker.gpu_attempted || worker.gpu_enabled),
             (auto_mode_ || forced_igpu_) && igpu_factory_ && igpu_block_bytes_};
+        if (candidates[2] &&
+            ((hash && bytes && bytes >= worker.gpu_floor) || (!hash && forced_igpu_)))
+            candidates[2] = discover_igpu(worker);
         const auto band = bytes ? (std::bit_width(bytes) - 1) / detail::OnlineModel::band_shift : 0;
         if (auto_mode_ && pgo_ && hash && bytes >= worker.gpu_floor && bytes)
             ++worker.arrivals[band];
@@ -505,9 +612,16 @@ void Resources::run(Worker& worker) {
         // Access the model only on its owner, outside the queue lock; exclude failed/retried work.
         if (pgo_ && worker.sample.valid && !worker.startup_error &&
             worker.fallback_count == retries && worker.compute.get() == worker.selected_backend) {
-            if (worker.sample.bytes == worker.decision_context.bytes)
+            if (worker.sample.bytes == worker.decision_context.bytes) {
                 worker.model.observe(worker.decision_backend, worker.decision_context,
                                      worker.sample.service_ms);
+                if (worker.decision_backend == BackendKind::cpu && worker.sample.bytes &&
+                    worker.sample.bytes >= worker.gpu_floor &&
+                    std::isfinite(worker.sample.service_ms) && worker.sample.service_ms > 0)
+                    cold_credit_ms_.fetch_add(cold_exploration_fraction_ *
+                                                  worker.sample.service_ms / credit_divisor_,
+                                              std::memory_order_relaxed);
+            }
             if (worker.sample.gpu && worker.gpu_inflight_at_selection > 1)
                 ++worker.contended_samples;
         }

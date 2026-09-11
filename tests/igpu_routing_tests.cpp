@@ -51,6 +51,7 @@ private:
 same::Config config() {
     same::Config c;
     c.workers = 2;
+    c.igpu_bootstrap_ms = 0; // 明确允许快速路由实验。 / Explicit fast-routing experiment.
     c.backend = "igpu";
     c.block_bytes = 1024;
     c.gpu_min_bytes = 0;
@@ -202,6 +203,81 @@ void lazy_prior_reselection() {
     require(factories == 1 && pool.gpu_peak_concurrency() == 0,
             "discovery counted as executed CUDA work or repeated initialization");
 }
+/// 轻量发现与实际设备身份一致。 / Lightweight discovery matches activation identity.
+same::detail::IgpuProbe probe(unsigned& calls) {
+    return [&calls](std::size_t block, std::size_t) -> std::optional<same::DeviceProfile> {
+        ++calls;
+        Device device(same::BackendKind::igpu, block);
+        return device.profile();
+    };
+}
+/// 未知短任务不支付初始化，累计完成工作后只初始化一次。
+/// Unknown short tasks defer setup; accumulated completed work eventually activates once.
+void startup_credit() {
+    auto c = config();
+    c.backend = "auto";
+    c.workers = 1;
+    c.igpu_bootstrap_ms = 100;
+    c.cold_exploration_fraction = 1;
+    unsigned probes = 0, factories = 0;
+    same::Resources pool(
+        c, {},
+        [&](std::size_t block, auto) {
+            ++factories;
+            return std::make_unique<Device>(same::BackendKind::igpu, block);
+        },
+        {}, [](auto, const auto&) { return 10.0; }, probe(probes));
+    auto submit = [&] {
+        return pool
+            .submit_hash(
+                [](same::Worker& worker) {
+                    const auto kind = worker.compute->kind();
+                    worker.sample = {1024, 5, false, true, kind};
+                    return kind;
+                },
+                1024)
+            .get();
+    };
+    require(submit() == same::BackendKind::cpu && submit() == same::BackendKind::cpu,
+            "short unknown tasks paid cold activation");
+    pool.wait_idle();
+    require(probes == 1 && factories == 0 && pool.cold_credit_ms() == 10 &&
+                pool.igpu_setup_estimate_ms() == 10 && pool.igpu_deferred() > 0,
+            "discovery/history/credit accounting wrong");
+    require(submit() == same::BackendKind::igpu, "earned credit never admitted cold exploration");
+    pool.wait_idle();
+    require(factories == 1 && pool.igpu_attempted() && pool.cold_spent_ms() == pool.igpu_setup_ms(),
+            "setup not charged exactly once");
+}
+/// 先验劣势避免工厂；单任务净收益足够时无需已完成工作额度。
+/// Slow priors avoid activation; profitable current work needs no earned credit.
+void startup_prior(bool profitable) {
+    auto c = config();
+    c.backend = "auto";
+    c.workers = 1;
+    c.igpu_bootstrap_ms = 100;
+    unsigned probes = 0, factories = 0;
+    same::Resources pool(
+        c, {},
+        [&](std::size_t block, auto) {
+            ++factories;
+            return std::make_unique<Device>(same::BackendKind::igpu, block);
+        },
+        [profitable](same::BackendKind kind, const same::DeviceProfile& profile) {
+            same::detail::OnlineModel prior;
+            const auto ms = kind == same::BackendKind::cpu ? (profitable ? 1000.0 : 1.0) : 10.0;
+            prior.observe(kind, {1024, profile.effective_batch_bytes, 0}, ms);
+            return prior.delta();
+        },
+        {}, probe(probes));
+    const auto actual =
+        pool.submit_hash([](same::Worker& worker) { return worker.compute->kind(); }, 1024).get();
+    pool.wait_idle();
+    require(probes == 1 && factories == (profitable ? 1U : 0U) &&
+                actual == (profitable ? same::BackendKind::igpu : same::BackendKind::cpu) &&
+                pool.cold_credit_ms() == 0,
+            "startup prior did not control activation");
+}
 /// 三设备各自探索且模型不混合。 / All three devices explored without model aliasing.
 void exploration() {
     auto c = config();
@@ -234,6 +310,9 @@ int main() {
         unavailable();
         contextual_prior();
         lazy_prior_reselection();
+        startup_credit();
+        startup_prior(false);
+        startup_prior(true);
         exploration();
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

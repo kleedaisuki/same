@@ -88,6 +88,11 @@ std::string default_config() {
         << "\n# 运行时剖析引导路由，非编译器 PGO；不控制汇总输出 / Runtime profile-guided routing, "
            "not compiler PGO or summary output\n"
         << "pgo = " << (c.pgo ? "true" : "false")
+        << "\n# 未知核显初始化估计（ms），非实测 / Unknown iGPU setup estimate (ms), not measured\n"
+        << "igpu_bootstrap_ms = " << c.igpu_bootstrap_ms
+        << "\n# 冷探索预算：完成 CPU 工作/线程数的比例，非墙钟保证 / CPU work/workers fraction, "
+           "not wall-time guarantee\n"
+        << "cold_exploration_fraction = " << c.cold_exploration_fraction
         << "\n# 本地跨运行诊断，可能包含敏感路径和配置；不上传，与 PGO/summary 独立。\n"
         << "# Local cross-run diagnostics may contain sensitive paths/configuration; no upload, "
            "independent of PGO/summary.\n"

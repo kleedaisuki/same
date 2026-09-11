@@ -17,6 +17,10 @@
 namespace same {
 namespace detail {
 /// 可注入设备创建器；返回空表示不可用。 / Injectable device factory; null means unavailable.
+/// 冷启动历史估计；零表示未知。 / Historical cold-start estimate; zero means unknown.
+using SetupPriorLoader = std::function<double(BackendKind, const DeviceProfile&)>;
+/// 轻量设备探测，不得创建上下文。 / Lightweight probe must not create a context.
+using IgpuProbe = std::function<std::optional<DeviceProfile>(std::size_t, std::size_t)>;
 using ModelPriorLoader = std::function<OnlineModel::State(BackendKind, const DeviceProfile&)>;
 /// 可注入设备创建器。 / Injectable device factory.
 using CudaFactory = std::function<std::unique_ptr<Compute>(std::size_t, std::size_t)>;
@@ -207,10 +211,12 @@ public:
     Resources(const Config& config, detail::CudaFactory factory);
     /// 独立注入两设备工厂。 / Independently inject both device factories.
     Resources(const Config& config, detail::CudaFactory cuda, detail::CudaFactory igpu,
-              detail::ModelPriorLoader prior = {});
+              detail::ModelPriorLoader prior = {}, detail::SetupPriorLoader setup = {},
+              detail::IgpuProbe probe = {});
     /// 只读先验查询在初始化时执行，必须线程安全且不得访问 SQL。
     /// Read-only prior lookup runs at initialization; thread-safe and SQL-free.
-    Resources(const Config& config, detail::ModelPriorLoader prior);
+    Resources(const Config& config, detail::ModelPriorLoader prior,
+              detail::SetupPriorLoader setup = {});
     /// 排空已接收任务并在所属线程销毁设备。 / Drain admitted tasks and destroy devices on owner
     /// threads.
     ~Resources();
@@ -268,6 +274,26 @@ public:
     }
     double igpu_setup_ms() const {
         return igpu_setup_ms_;
+    }
+    /// 以下冷启动统计在 idle 后读取，时间单位毫秒。 / Cold-start idle-time statistics in
+    /// milliseconds.
+    const DeviceProfile& igpu_profile() const {
+        return igpu_profile_;
+    }
+    double igpu_discovery_ms() const {
+        return igpu_discovery_ms_;
+    }
+    double igpu_setup_estimate_ms() const {
+        return igpu_setup_estimate_ms_;
+    }
+    std::uint64_t igpu_deferred() const {
+        return igpu_deferred_;
+    }
+    double cold_credit_ms() const {
+        return cold_credit_ms_.load(std::memory_order_relaxed);
+    }
+    double cold_spent_ms() const {
+        return cold_spent_ms_;
     }
     std::uint64_t exploration_jobs() const;
     std::pair<std::uint64_t, std::uint64_t> read_bytes() const;
@@ -338,6 +364,18 @@ private:
     /// 单上下文、统一内存配额；原子准入失败立即继续其他后端。
     /// One context and unified-memory quota; failed atomic admission never waits.
     bool select_igpu(Worker& worker);
+    bool discover_igpu(Worker& worker);
+    bool admit_cold_igpu(const Worker& worker) const;
+    void load_prior(Worker& worker, BackendKind kind, const DeviceProfile& profile,
+                    std::size_t block);
+    detail::SetupPriorLoader setup_loader_;
+    detail::IgpuProbe igpu_probe_;
+    DeviceProfile igpu_profile_;
+    bool igpu_probed_{}, igpu_present_{true};
+    double igpu_discovery_ms_{}, igpu_setup_estimate_ms_{}, cold_spent_ms_{};
+    double cold_exploration_fraction_{}, credit_divisor_{};
+    std::uint64_t igpu_deferred_{};
+    std::atomic<double> cold_credit_ms_{0};
     detail::ModelPriorLoader prior_loader_;
     /// 实际执行中的后端数量，用于上下文，不是线程调度锁。
     /// Active backends inform context; these counters are not scheduling locks.

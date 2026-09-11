@@ -12,9 +12,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <deque>
 #include <future>
 #include <iomanip>
+#include <limits>
 #include <locale>
 #include <map>
 #include <numeric>
@@ -217,13 +219,38 @@ struct Learning {
     DeviceProfile cpu;
     /// 初始化回调计数，不在每任务热路径更新。 / Initialization counters, not per-task hot-path
     /// updates.
-    std::atomic<std::uint64_t> loads{}, hits{}, invalid{};
+    std::atomic<std::uint64_t> loads{}, hits{}, invalid{}, setup_loads{}, setup_hits{};
     /// 空闲收尾结果与冷路径时间。 / Idle-finalization results and cold-path timings.
-    std::uint64_t saved{}, save_errors{};
+    std::uint64_t saved{}, save_errors{}, setup_saved{};
     double startup_ms{}, save_ms{};
     /// 可见存储故障，不改变摘要或分组。 / Visible storage failures never change hashes or groups.
     std::string diagnostic;
+    /// 持久化安全禁用原因；不关闭线程内学习。 / Persistence safety reason; in-run learning remains
+    /// active.
+    std::string disabled_reason;
+    /// 空闲保存的逐设备历史，供最终遥测导出。 / Per-device saved histories for final telemetry
+    /// export.
+    std::map<std::string, SetupHistory> setup_snapshots;
 };
+/// 每个真实初始化形成一个观测，键相同的历史只加载一次。
+/// Each actual initialization adds one observation; load a keyed history only once.
+void add_setup_history(std::map<std::string, SetupHistory>& histories, Learning& learning,
+                       const Config& config, BackendKind backend, const DeviceProfile& device,
+                       double milliseconds) {
+    if (!std::isfinite(milliseconds) || milliseconds <= 0 || milliseconds > 1e9)
+        return;
+    const auto key = learning_key(config, learning.cpu, backend, device);
+    auto [entry, inserted] = histories.try_emplace(key);
+    if (inserted)
+        entry->second = learning.store->load_setup(key).value_or(SetupHistory{});
+    auto& history = entry->second;
+    if (history.samples == std::numeric_limits<std::uint64_t>::max())
+        return;
+    ++history.samples;
+    history.last_ms = milliseconds;
+    history.mean_ms += (milliseconds - history.mean_ms) / static_cast<double>(history.samples);
+    history.max_ms = std::max(history.max_ms, milliseconds);
+}
 /// 相同键只合并一次先验，再添加每线程本轮增量；失败扫描不调用。
 /// Merge each keyed prior once, then per-worker run deltas; never called for failed scans.
 void save_learning(Learning& learning, const Config& config, const Resources& resources) {
@@ -232,7 +259,11 @@ void save_learning(Learning& learning, const Config& config, const Resources& re
     const auto start = Clock::now();
     try {
         std::map<std::string, detail::OnlineModel::State> merged;
+        std::map<std::string, SetupHistory> setups;
         for (const auto& worker : resources.worker_profiles()) {
+            if (worker.gpu_enabled)
+                add_setup_history(setups, learning, config, BackendKind::cuda, worker.devices[1],
+                                  worker.setup_ms);
             for (unsigned i = 0; i < 3; ++i) {
                 if (!worker.delta[i].samples)
                     continue;
@@ -244,6 +275,18 @@ void save_learning(Learning& learning, const Config& config, const Resources& re
                 auto entry = merged.try_emplace(key, prior).first;
                 if (!detail::OnlineModel::merge(entry->second, delta))
                     throw std::runtime_error("model aggregate rejected");
+            }
+        }
+        if (resources.igpu_attempted())
+            add_setup_history(setups, learning, config, BackendKind::igpu, resources.igpu_profile(),
+                              resources.igpu_setup_ms());
+        for (const auto& [key, history] : setups) {
+            if (learning.store->save_setup(key, history)) {
+                ++learning.setup_saved;
+                learning.setup_snapshots.emplace(key, history);
+            } else {
+                ++learning.save_errors;
+                learning.diagnostic = learning.store->diagnostic();
             }
         }
         for (const auto& [key, state] : merged) {
@@ -262,12 +305,19 @@ void save_learning(Learning& learning, const Config& config, const Resources& re
 }
 /// 独立于遥测开关报告学习健康。 / Report learning health independently of telemetry.
 void render_learning(const Learning& learning, bool enabled, std::ostream& out) {
-    out << "model_learning_enabled=" << enabled << " model_db=.same/model.db"
+    out << "model_learning_enabled=" << enabled
+        << " model_persistence_enabled=" << bool(learning.store)
+        << " model_persistence_disabled_reason="
+        << (learning.disabled_reason.empty() ? "none" : learning.disabled_reason)
+        << " model_db=.same/model.db"
         << " model_load_attempts=" << learning.loads.load()
         << " model_prior_hits=" << learning.hits.load()
         << " model_invalid=" << learning.invalid.load() << " model_saved_keys=" << learning.saved
         << " model_save_errors=" << learning.save_errors
         << " model_startup_ms=" << learning.startup_ms << " model_save_ms=" << learning.save_ms
+        << " model_setup_load_attempts=" << learning.setup_loads.load()
+        << " model_setup_prior_hits=" << learning.setup_hits.load()
+        << " model_setup_saved_keys=" << learning.setup_saved
         << " model_run_decay=" << learning_decay << '\n';
 }
 /// Main-thread-only diagnostic totals. 仅由主线程维护的诊断统计。
@@ -802,8 +852,13 @@ void render_pretty_profile(const Counters& counters, const Resources& resources,
     row("iGPU", std::string(resources.igpu_service_enabled() ? "available"
                             : resources.igpu_retired()       ? "retired"
                             : resources.igpu_attempted()     ? "unavailable"
+                            : resources.igpu_deferred()      ? "activation deferred"
                                                              : "not probed") +
-                    " | setup " + human_duration(resources.igpu_setup_ms()));
+                    " | discovery " + human_duration(resources.igpu_discovery_ms()) +
+                    " | activation " + human_duration(resources.igpu_setup_ms()));
+    row("iGPU cold budget", "credit " + human_duration(resources.cold_credit_ms()) + " | spent " +
+                                human_duration(resources.cold_spent_ms()) + " | setup estimate " +
+                                human_duration(resources.igpu_setup_estimate_ms()));
     row("CPU size route",
         std::to_string(resources.cpu_routed_hashes()) + " hash attempts (policy, not failure)");
     const auto [cpu_attempts, gpu_attempts] = resources.hash_attempts();
@@ -869,7 +924,12 @@ void render_profile(const Counters& counters, const Resources& resources,
     profile << "igpu_attempted=" << resources.igpu_attempted()
             << " igpu_available=" << resources.igpu_service_enabled()
             << " igpu_retired=" << resources.igpu_retired()
-            << " igpu_setup_ms=" << resources.igpu_setup_ms() << " ";
+            << " igpu_setup_ms=" << resources.igpu_setup_ms()
+            << " igpu_discovery_ms=" << resources.igpu_discovery_ms()
+            << " igpu_deferred=" << resources.igpu_deferred()
+            << " igpu_setup_estimate_ms=" << resources.igpu_setup_estimate_ms()
+            << " igpu_cold_credit_ms=" << resources.cold_credit_ms()
+            << " igpu_cold_spent_ms=" << resources.cold_spent_ms() << " ";
     profile << "igpu_hashes=" << igpu_attempts << " cpu_hashes=" << cpu_attempts
             << " gpu_hashes=" << gpu_attempts << " gpu_block_bytes=" << resources.gpu_block_bytes()
             << " scheduler=worker-local single_queue=1" << '\n';
@@ -987,6 +1047,11 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
     metric("igpu_attempted", resources->igpu_attempted() ? 1 : 0);
     metric("igpu_retired", resources->igpu_retired() ? 1 : 0);
     metric("igpu_setup_ms", resources->igpu_setup_ms(), "ms");
+    metric("igpu_discovery_ms", resources->igpu_discovery_ms(), "ms");
+    metric("igpu_deferred", static_cast<double>(resources->igpu_deferred()));
+    metric("igpu_setup_estimate_ms", resources->igpu_setup_estimate_ms(), "ms");
+    metric("igpu_cold_credit_ms", resources->cold_credit_ms(), "ms");
+    metric("igpu_cold_spent_ms", resources->cold_spent_ms(), "ms");
     parameter("routing", "model_scope", "worker-local-cross-run");
     const auto profile = resources->profile_snapshot();
 #define PROFILE(field, unit) metric("pgo." #field, static_cast<double>(profile.field), unit)
@@ -1247,8 +1312,12 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
                         throw std::runtime_error("model path must be a regular non-link file");
                 }
                 learning.cpu = make_cpu_compute()->profile();
-                learning.store = std::make_unique<ModelStore>(root / ".same" / "model.db");
-                learning.diagnostic = learning.store->diagnostic();
+                if (learning.cpu.device_name.empty())
+                    learning.disabled_reason = "cpu_identity_unknown";
+                else {
+                    learning.store = std::make_unique<ModelStore>(root / ".same" / "model.db");
+                    learning.diagnostic = learning.store->diagnostic();
+                }
                 if (!learning.diagnostic.empty())
                     ++learning.invalid;
             } catch (const std::exception& error) {
@@ -1278,7 +1347,23 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
                     return detail::OnlineModel::State{};
                 }
             };
-        resources = std::make_unique<Resources>(config, std::move(loader));
+        detail::SetupPriorLoader setup_loader;
+        if (learning.store)
+            setup_loader = [&](BackendKind backend, const DeviceProfile& device) {
+                ++learning.setup_loads;
+                try {
+                    const auto history = learning.store->load_setup(
+                        learning_key(config, learning.cpu, backend, device));
+                    if (!history)
+                        return 0.0;
+                    ++learning.setup_hits;
+                    return history->max_ms;
+                } catch (...) {
+                    ++learning.invalid;
+                    return 0.0;
+                }
+            };
+        resources = std::make_unique<Resources>(config, std::move(loader), std::move(setup_loader));
         end_stage(Clock::now());
         stage = 1;
         event("log", "scan.start", stage_start, stage_start, 3, 1);
@@ -1332,6 +1417,26 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
             final.parameters.push_back(
                 {"model", "feature_version", std::to_string(detail::OnlineModel::feature_version)});
             final.parameters.push_back({"model", "diagnostic", learning.diagnostic});
+            final.parameters.push_back(
+                {"model", "persistence_disabled_reason", learning.disabled_reason});
+            final.parameters.push_back({"model", "durability", "advisory-WAL-NORMAL"});
+            std::size_t setup_index = 0;
+            for (const auto& [key, history] : learning.setup_snapshots) {
+                const auto category = "model.setup." + std::to_string(setup_index++);
+                final.parameters.push_back({category, "identity_key", key});
+                final.parameters.push_back({category, "samples", std::to_string(history.samples)});
+                final.metrics.push_back({category + ".last_ms", history.last_ms, "ms"});
+                final.metrics.push_back({category + ".mean_ms", history.mean_ms, "ms"});
+                final.metrics.push_back({category + ".max_ms", history.max_ms, "ms"});
+            }
+            final.metrics.push_back(
+                {"model.persistence_enabled", double(bool(learning.store)), "bool"});
+            final.metrics.push_back({"model.setup_load_attempts",
+                                     static_cast<double>(learning.setup_loads.load()), "count"});
+            final.metrics.push_back({"model.setup_prior_hits",
+                                     static_cast<double>(learning.setup_hits.load()), "count"});
+            final.metrics.push_back(
+                {"model.setup_saved_keys", static_cast<double>(learning.setup_saved), "count"});
             final.metrics.push_back(
                 {"model.load_attempts", static_cast<double>(learning.loads.load()), "count"});
             final.metrics.push_back(

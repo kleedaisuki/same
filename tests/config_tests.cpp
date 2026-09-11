@@ -28,6 +28,15 @@ int main() {
     if (!same::Config::load(root).pgo)
         throw std::runtime_error("runtime PGO must default to enabled");
     const auto defaults = same::Config::load(root);
+    if (defaults.igpu_bootstrap_ms != 100.0 || defaults.cold_exploration_fraction != 0.05)
+        throw std::runtime_error("cold-start budget defaults");
+    {
+        std::ofstream file(root / ".same/config.toml");
+        file << "igpu_bootstrap_ms = 0\ncold_exploration_fraction = 1.0\n";
+    }
+    const auto cold = same::Config::load(root);
+    if (cold.igpu_bootstrap_ms != 0 || cold.cold_exploration_fraction != 1)
+        throw std::runtime_error("cold-start budget override");
     if (!defaults.telemetry || defaults.telemetry_queue_capacity != 4096 ||
         defaults.telemetry_retention_runs != 64 || defaults.telemetry_max_events != 16384)
         throw std::runtime_error("telemetry defaults");
@@ -77,6 +86,13 @@ int main() {
     if (!rejected)
         throw std::runtime_error("invalid config accepted");
     for (const auto* invalid : {"workers = 2.0\n",
+                                "igpu_bootstrap_ms = -1\n",
+                                "igpu_bootstrap_ms = inf\n",
+                                "igpu_bootstrap_ms = true\n",
+                                "cold_exploration_fraction = nan\n",
+                                "cold_exploration_fraction = -0.1\n",
+                                "cold_exploration_fraction = 1.1\n",
+                                "cold_exploration_fraction = '0.5'\n",
                                 "workers = true\n",
                                 "rehash = 1\n",
                                 "backend = 1\n",
