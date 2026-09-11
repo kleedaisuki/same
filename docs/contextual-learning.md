@@ -83,10 +83,13 @@ Prioritize controlled interleaved comparisons and ablations over utilization alo
 设备探测（probe）与激活（activation）分离：探测建立设备身份与能力，激活才创建执行资源、编译内核并检查正确性。探测本身仍可能调用驱动、产生耗时，不能称为免费。初始化历史独立于稳态服务模型，保存在模型库 schema 2；不能把初始化时间作为每个 payload 的哈希服务标签。
 Probing identifies capabilities; activation creates executable resources and checks correctness. Probe costs are not necessarily zero. Schema 2 stores setup history separately from steady-state service statistics.
 
-自动且启用 PGO 时，冷 iGPU 激活必须满足下列条件之一：当前任务的已知预测节省至少覆盖历史最大初始化耗时；或本轮探索信用足以覆盖初始化估计。信用约为 `cold_exploration_fraction × eligible_CPU_work_ms / workers − actual_setup_spent_ms`。它只在本轮累积，不跨运行结转。历史不足时使用显式配置 `igpu_bootstrap_ms=100.0` 毫秒；`cold_exploration_fraction=0.05` 为默认值。
-Automatic PGO admission amortizes estimated setup against either known current-task savings or run-local exploration credit. Credit uses eligible CPU work divided by worker count and subtracts actual setup spending; it is not persisted.
+自动且启用 PGO 时，只有临时决策实际请求某设备，才执行其冷启动预检（preflight）。共享非阻塞门槛要求：当前 CPU 任务的已知保守成本至少覆盖 bootstrap 估计，或本轮探索信用覆盖该估计，才允许 OpenCL ICD 探测或 CUDA 创建。竞争失败直接继续 CPU，不等待；静态 no-PGO 决策为 CPU 时不探测设备。首次未知且很短的扫描因此有意保持 CPU。`cuda_bootstrap_ms=100.0` 是 CUDA 的独立默认估计。
+Automatic PGO preflights only a provisionally requested device, before ICD discovery or CUDA creation. A shared nonblocking gate requires known CPU-task potential or funded credit; unknown short scans intentionally remain CPU. This is not guaranteed optimal under unknown cold costs.
 
-这是预算启发式，不是随机探索概率、硬实时上界或百分之五总耗时保证。首次初始化的实际耗时可能超过 100 毫秒估计，历史最大值也不保证未来成本上界。`--igpu` 绕过自动冷启动门槛，但仍保留设备资格、内存预算和错误回退；`--no-pgo` 保持静态路由语义。
+获得设备 profile 后，冷 iGPU 激活还必须满足下列条件之一：当前任务的已知预测节省至少覆盖历史最大初始化耗时；或本轮探索信用足以覆盖初始化估计。信用约为 `cold_exploration_fraction × eligible_CPU_work_ms / workers − actual_cold_spent_ms`。共享支出包括 OpenCL 发现、iGPU 激活及 CUDA 初始化的实际耗时。它只在本轮累积，不跨运行结转。历史不足时使用显式配置 `igpu_bootstrap_ms=100.0` 毫秒；`cold_exploration_fraction=0.05` 为默认值。
+Automatic PGO admission amortizes estimated setup against either known current-task savings or run-local exploration credit. Credit uses eligible CPU work divided by worker count and subtracts actual discovery, iGPU activation and CUDA setup spending; it is not persisted.
+
+这是预算启发式，不是随机探索概率、硬实时上界或百分之五总耗时保证。首次初始化的实际耗时可能超过 100 毫秒估计，历史最大值也不保证未来成本上界。历史初始化最大值不随稳态统计衰减，一次异常尖峰可能长期使准入更保守。`--igpu` 绕过自动冷启动门槛，但仍保留设备资格、内存预算和错误回退；`--no-pgo` 保持静态路由语义。
 The fraction is a credit budget, not a probability or overhead guarantee. First activation can exceed its estimate. Forced iGPU bypasses this automatic gate; static no-PGO routing is unchanged.
 
 模型库采用预写日志（write-ahead logging, WAL）与 `synchronous=NORMAL`。学习状态是建议性数据：断电可能丢失最近提交，允许退回较旧学习状态；摘要与精确比较的正确性契约不因此放宽。主机 CPU 身份为空时禁用跨运行复用，而不是关闭本轮学习。
@@ -94,3 +97,6 @@ WAL/NORMAL trades recent-learning durability for lower advisory-state overhead; 
 
 早期初始化策略造成的负收益保留在 [扫描性能记录](contextual-scan-performance.md)，作为历史反例，不删除或改写为成功。冷启动修正后的性能需另行测量，本文不预先宣称已消除回归。
 The earlier negative result remains in the performance record. Post-fix performance is pending measurement, not assumed improved.
+
+显式把某后端启动估计设为零，可用于允许不受启动信用限制的校准实验；已加载的正核显历史估计仍优先于零回退值。默认值不采用这种实验设置。
+An explicit zero bootstrap estimate permits unbudgeted calibration; a loaded positive iGPU setup estimate still overrides the zero fallback. Defaults do not enable this experiment mode.

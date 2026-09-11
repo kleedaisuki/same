@@ -240,6 +240,7 @@ rehash = false
 | `backend` | `"auto"` | `"auto"`, `"cpu"`, `"cuda"`, `"igpu"` |
 | `rehash` | `false` | 布尔值 / boolean |
 | `igpu_bootstrap_ms` | `100.0` | 缺少历史时的核显初始化估计，毫秒 / Initial setup estimate without history, ms |
+| `cuda_bootstrap_ms` | `100.0` | CUDA 冷启动预检估计，毫秒 / CUDA preflight estimate, ms |
 | `cold_exploration_fraction` | `0.05` | 自动 PGO 本轮冷启动信用比例，不是概率或硬耗时保证 / Run-local cold-start credit fraction, not a guarantee |
 | `pgo` | `true` | 运行时剖析引导路由；`--no-pgo` 可覆盖关闭 / Runtime profile-guided routing; CLI can disable |
 | `telemetry` | `true` | 持久化本地遥测；`--no-telemetry` 可覆盖关闭 / Persist local telemetry; CLI can disable |
@@ -260,7 +261,7 @@ PGO persists model statistics independently of telemetry. Disabling telemetry pr
 数学定义、统计口径、探索局限与持久化契约见 [上下文学习](docs/contextual-learning.md)。旧架构报告保留为历史证据，不证明当前实现性能。
 See [contextual learning](docs/contextual-learning.md) for mathematics and limitations; historical routing benchmarks do not establish current performance.
 
-设备探测与激活分离，自动 PGO 用预测节省或本轮探索信用支付冷启动估计；`--igpu` 绕过自动门槛。初始化历史与稳态模型分开保存。旧策略的负收益保留于 [扫描性能记录](docs/contextual-scan-performance.md)，修正后结果仍须实测。 / Probe and activation are separate; automatic cold admission uses predicted savings or run-local credit. Setup history is independent of steady-state learning. Earlier negative results remain documented; post-fix gains are not assumed.
+设备探测与激活分离，自动 PGO 仅为实际请求设备执行共享非阻塞冷启动预检，用已知 CPU 任务潜力或本轮探索信用覆盖估计；取得 profile 后再检查 iGPU 预测节省；`--igpu` 绕过自动门槛。初始化历史与稳态模型分开保存。旧策略的负收益保留于 [扫描性能记录](docs/contextual-scan-performance.md)，修正后结果仍须实测。 / Probe and activation are separate; automatic cold admission uses predicted savings or run-local credit. Setup history is independent of steady-state learning. Earlier negative results remain documented; post-fix gains are not assumed.
 
 ### 有界扫描流水线 / Bounded scanning pipeline
 
