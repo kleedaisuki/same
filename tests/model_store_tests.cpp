@@ -78,7 +78,7 @@ int main() {
             same::ModelStore db(path);
             require(!db.load("machine-a") && !db.diagnostic().empty(), "unknown schema accepted");
         }
-        sql(path, "PRAGMA user_version=1; PRAGMA ignore_check_constraints=ON; UPDATE models SET "
+        sql(path, "PRAGMA user_version=2; PRAGMA ignore_check_constraints=ON; UPDATE models SET "
                   "payload=x'00'");
         {
             same::ModelStore db(path);
@@ -97,6 +97,51 @@ int main() {
             require(!db.diagnostic().empty() && !db.save("x", state), "foreign database accepted");
         }
         require(read_bytes(foreign) == before, "foreign database modified");
+        const auto legacy = std::filesystem::canonical(directory) / "legacy.db";
+        sql(legacy, "PRAGMA application_id=1396788556; PRAGMA user_version=1; CREATE TABLE "
+                    "models(key BLOB PRIMARY KEY NOT NULL,version INTEGER NOT NULL,payload BLOB "
+                    "NOT NULL CHECK(length(payload)=744)) WITHOUT ROWID; INSERT INTO models "
+                    "VALUES(x'61',1,zeroblob(744))");
+        {
+            same::ModelStore db(legacy);
+            require(db.diagnostic().empty() && db.load("a").has_value(),
+                    "v1 migration lost models");
+            require(!db.load_setup("a"), "invented setup history");
+            require(db.save_setup("a", {12, 10, 15, 3}), "save setup");
+            require(!db.save_setup("a", {0, 10, 15, 3}), "zero setup accepted");
+            require(!db.save_setup("a", {12, 16, 15, 3}), "invalid setup mean accepted");
+            require(!db.save_setup("a", {12, 10, std::numeric_limits<double>::infinity(), 3}),
+                    "infinite setup accepted");
+        }
+        {
+            same::ModelStore db(legacy);
+            require(db.load("a").has_value(), "migrated model missing");
+            const auto setup = db.load_setup("a");
+            require(setup && setup->last_ms == 12 && setup->mean_ms == 10 && setup->max_ms == 15 &&
+                        setup->samples == 3,
+                    "setup roundtrip");
+            require(!db.load_setup("other"), "setup key isolation");
+            sql(legacy, "CREATE TRIGGER reject_setup BEFORE INSERT ON setups BEGIN SELECT "
+                        "RAISE(ABORT,'test'); END");
+            require(!db.save_setup("a", {20, 20, 20, 1}), "failed setup transaction accepted");
+            sql(legacy, "DROP TRIGGER reject_setup");
+            {
+                same::ModelStore reopened(legacy);
+                require(reopened.load_setup("a")->last_ms == 12,
+                        "setup transaction lost previous state");
+            }
+            for (int i = 0; i < 40; ++i)
+                require(db.save_setup("s" + std::to_string(i), {1, 1, 1, 1}), "bounded setup save");
+        }
+        {
+            same::ModelStore db(legacy);
+            require(db.diagnostic().empty() && db.load_setup("s39"), "setup bound/reopen");
+        }
+        sql(legacy, "UPDATE setups SET payload=zeroblob(32)");
+        {
+            same::ModelStore db(legacy);
+            require(!db.diagnostic().empty() && !db.load_setup("s39"), "malicious setup accepted");
+        }
         const auto bounded = std::filesystem::canonical(directory) / "bounded.db";
         {
             same::ModelStore db(bounded);

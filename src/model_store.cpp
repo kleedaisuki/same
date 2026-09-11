@@ -1,5 +1,6 @@
 #include "same/model_store.hpp"
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <map>
 #include <sqlite3.h>
@@ -13,7 +14,7 @@
 namespace same {
 namespace {
 /// 格式与大小固定，不依赖本机字节序或结构填充。 / Fixed format independent of endianness/padding.
-constexpr int schema_version = 1;
+constexpr int schema_version = 2;
 constexpr std::size_t payload_size = 3 * (30 * 8 + 8);
 /// 拒绝链接和特殊文件，包括 SQLite 边车。 / Reject links and special files, including SQLite
 /// sidecars.
@@ -61,6 +62,12 @@ std::uint64_t take(const unsigned char*& bytes) {
         value |= std::uint64_t(*bytes++) << (i * 8);
     return value;
 }
+/// 严格验证初始化历史的数值域。 / Strictly validate setup history's numeric domain.
+bool valid_setup(const SetupHistory& h) {
+    return h.samples > 0 && std::isfinite(h.last_ms) && std::isfinite(h.mean_ms) &&
+           std::isfinite(h.max_ms) && h.last_ms > 0 && h.mean_ms > 0 && h.max_ms <= 1e9 &&
+           h.last_ms <= h.max_ms && h.mean_ms <= h.max_ms;
+}
 /// 显式字段序列化，不保存 ABI。 / Explicit field serialization, never ABI serialization.
 std::vector<unsigned char> encode(const detail::OnlineModel::State& state) {
     std::vector<unsigned char> bytes;
@@ -105,6 +112,8 @@ struct ModelStore::Impl {
     std::string diagnostic;
     /// 启动快照支持并发只读查询。 / Startup snapshot supports concurrent read-only lookup.
     std::map<std::string, detail::OnlineModel::State, std::less<>> entries;
+    /// 初始化历史冷路径快照。 / Cold-path setup history snapshot.
+    std::map<std::string, SetupHistory, std::less<>> setups;
     ~Impl() {
         sqlite3_close(db);
     }
@@ -143,7 +152,7 @@ ModelStore::ModelStore(const std::filesystem::path& path) : impl_(std::make_uniq
         if (sqlite3_step(version.value) != SQLITE_ROW)
             throw std::runtime_error("missing model schema version");
         const int v = sqlite3_column_int(version.value, 0);
-        if (v != 0 && v != schema_version)
+        if (v != 0 && v != 1 && v != schema_version)
             throw std::runtime_error("unsupported model schema version");
         sqlite3_finalize(version.value);
         version.value = nullptr;
@@ -162,6 +171,17 @@ ModelStore::ModelStore(const std::filesystem::path& path) : impl_(std::make_uniq
                                "NULL, version INTEGER NOT NULL, "
                                "payload BLOB NOT NULL CHECK(length(payload)=744)) WITHOUT ROWID; "
                                "PRAGMA user_version=1; PRAGMA application_id=1396788556; COMMIT;");
+        if (v < 2)
+            execute(impl_->db,
+                    "BEGIN IMMEDIATE; CREATE TABLE setups(key BLOB PRIMARY KEY NOT NULL, "
+                    "payload BLOB NOT NULL CHECK(length(payload)=32)) WITHOUT ROWID; PRAGMA "
+                    "user_version=2; COMMIT;");
+        // 仅在确认归属与版本后设置日志；学习状态允许断电丢失最近提交。
+        // Change journaling only after ownership/version checks; recent learning may be lost on
+        // power failure.
+        execute(
+            impl_->db,
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=64;");
         Statement query;
         check(impl_->db,
               sqlite3_prepare_v2(impl_->db, "SELECT key,version,payload FROM models LIMIT 33", -1,
@@ -191,9 +211,39 @@ ModelStore::ModelStore(const std::filesystem::path& path) : impl_(std::make_uniq
                 state);
         }
 
+        Statement setups;
+        check(impl_->db, sqlite3_prepare_v2(impl_->db, "SELECT key,payload FROM setups LIMIT 33",
+                                            -1, &setups.value, nullptr));
+        count = 0;
+        for (;;) {
+            const int rc = sqlite3_step(setups.value);
+            if (rc == SQLITE_DONE)
+                break;
+            if (rc != SQLITE_ROW)
+                check(impl_->db, rc);
+            const int length = sqlite3_column_bytes(setups.value, 0);
+            if (++count > 32 || sqlite3_column_type(setups.value, 0) != SQLITE_BLOB || length < 1 ||
+                length > 4096 || sqlite3_column_type(setups.value, 1) != SQLITE_BLOB ||
+                sqlite3_column_bytes(setups.value, 1) != 32)
+                throw std::runtime_error("malformed setup history");
+            const auto* bytes =
+                static_cast<const unsigned char*>(sqlite3_column_blob(setups.value, 1));
+            SetupHistory h;
+            h.last_ms = std::bit_cast<double>(take(bytes));
+            h.mean_ms = std::bit_cast<double>(take(bytes));
+            h.max_ms = std::bit_cast<double>(take(bytes));
+            h.samples = take(bytes);
+            if (!valid_setup(h))
+                throw std::runtime_error("invalid setup statistics");
+            impl_->setups.emplace(
+                std::string(static_cast<const char*>(sqlite3_column_blob(setups.value, 0)), length),
+                h);
+        }
+
     } catch (const std::exception& e) {
         impl_->diagnostic = e.what();
         impl_->entries.clear();
+        impl_->setups.clear();
         sqlite3_close(impl_->db);
         impl_->db = nullptr;
     }
@@ -250,4 +300,49 @@ bool ModelStore::save(std::string_view key, const detail::OnlineModel::State& st
         return false;
     }
 }
+std::optional<SetupHistory> ModelStore::load_setup(std::string_view key) const {
+    const auto it = impl_->setups.find(key);
+    if (it == impl_->setups.end())
+        return std::nullopt;
+    return it->second;
+}
+bool ModelStore::save_setup(std::string_view key, const SetupHistory& history) {
+    if (!impl_->db)
+        return false;
+    try {
+        if (key.empty() || key.size() > 4096 || !valid_setup(history))
+            throw std::runtime_error("invalid setup history/key");
+        std::vector<unsigned char> bytes;
+        bytes.reserve(32);
+        append(bytes, std::bit_cast<std::uint64_t>(history.last_ms));
+        append(bytes, std::bit_cast<std::uint64_t>(history.mean_ms));
+        append(bytes, std::bit_cast<std::uint64_t>(history.max_ms));
+        append(bytes, history.samples);
+        execute(impl_->db, "BEGIN IMMEDIATE");
+        Statement insert;
+        check(impl_->db, sqlite3_prepare_v2(
+                             impl_->db, "INSERT OR REPLACE INTO setups(key,payload) VALUES(?,?)",
+                             -1, &insert.value, nullptr));
+        check(impl_->db, sqlite3_bind_blob(insert.value, 1, key.data(),
+                                           static_cast<int>(key.size()), SQLITE_TRANSIENT));
+        check(impl_->db, sqlite3_bind_blob(insert.value, 2, bytes.data(), 32, SQLITE_TRANSIENT));
+        check(impl_->db, sqlite3_step(insert.value));
+        Statement prune;
+        check(impl_->db, sqlite3_prepare_v2(impl_->db,
+                                            "DELETE FROM setups WHERE key IN (SELECT key FROM "
+                                            "setups WHERE key<>? ORDER BY key LIMIT -1 OFFSET 31)",
+                                            -1, &prune.value, nullptr));
+        check(impl_->db, sqlite3_bind_blob(prune.value, 1, key.data(), static_cast<int>(key.size()),
+                                           SQLITE_TRANSIENT));
+        check(impl_->db, sqlite3_step(prune.value));
+        execute(impl_->db, "COMMIT");
+        impl_->diagnostic.clear();
+        return true;
+    } catch (const std::exception& e) {
+        sqlite3_exec(impl_->db, "ROLLBACK", nullptr, nullptr, nullptr);
+        impl_->diagnostic = e.what();
+        return false;
+    }
+}
+
 } // namespace same
