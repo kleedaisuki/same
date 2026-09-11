@@ -311,3 +311,274 @@ Recommendation: account for startup cost and remaining eligible work before devi
   }
 ]
 ```
+
+## Post-startup-budget revision / 启动预算修订后复测
+
+Binary SHA-256: `a45ca83e29dfdd3e8aee7524f06d76f3a65c0f46b3cfe20eaabf02f4dc766e0d`. Identical harness, new isolated fixtures, two warmups and seven paired randomized measured rounds. Both new runs completed all 148 invocations with expected groups, full hashing, no cache bypass and zero fallback. Earlier adverse results above remain intact. The experiments are sequential, not a randomized old/new binary crossover, so wall-time differences across revisions are descriptive rather than controlled causal effect sizes.
+
+同一工具、全新独立状态、两轮预热七轮测量；共148次调用全部正确且无回退。保留前次负面基线。版本间顺序测量而非新旧二进制交叉随机试验，跨版本时间差只能描述，不能视为精确因果效应。
+
+- Default floor / 默认阈值: `build/contextual-scan-1cbdd7effb08`
+- Zero floor / 零阈值: `build/contextual-scan-70cab17b4389`
+
+Each directory retains `raw.jsonl`, `summary.json`, `environment.json`. Times below are median milliseconds; discovery is separately instrumented and must not be silently classified as zero startup when context creation is deferred.
+
+各目录保留完整原始数据。下表中位数单位毫秒；发现设备的时间独立记录，不能因延迟创建上下文就将其视为零启动成本。
+
+| Floor | Workload | Mode | Wall | iGPU discovery | iGPU setup | Model save | iGPU attempted range |
+|---|---|---|---:|---:|---:|---:|---|
+| 16MiB | small | cpu_pgo | 112.325 | 0.000 | 0.000 | 3.845 | 0–0 |
+| 16MiB | small | cpu_no_pgo | 103.421 | 0.000 | 0.000 | 0.000 | 0–0 |
+| 16MiB | small | auto_pgo | 117.687 | 0.000 | 0.000 | 4.061 | 0–0 |
+| 16MiB | small | auto_no_pgo | 109.090 | 0.000 | 0.000 | 0.000 | 0–0 |
+| 16MiB | mixed | cpu_pgo | 110.020 | 0.000 | 0.000 | 3.636 | 0–0 |
+| 16MiB | mixed | cpu_no_pgo | 97.351 | 0.000 | 0.000 | 0.000 | 0–0 |
+| 16MiB | mixed | auto_pgo | 268.246 | 136.167 | 0.000 | 3.749 | 0–0 |
+| 16MiB | mixed | auto_no_pgo | 218.989 | 124.857 | 0.000 | 0.000 | 0–0 |
+| 0 | small | cpu_pgo | 115.196 | 0.000 | 0.000 | 3.324 | 0–0 |
+| 0 | small | cpu_no_pgo | 102.305 | 0.000 | 0.000 | 0.000 | 0–0 |
+| 0 | small | auto_pgo | 216.927 | 132.362 | 0.000 | 3.452 | 0–0 |
+| 0 | small | auto_no_pgo | 169.469 | 130.180 | 0.000 | 0.000 | 0–0 |
+| 0 | mixed | cpu_pgo | 104.439 | 0.000 | 0.000 | 3.304 | 0–0 |
+| 0 | mixed | cpu_no_pgo | 89.021 | 0.000 | 0.000 | 0.000 | 0–0 |
+| 0 | mixed | auto_pgo | 222.275 | 121.869 | 0.000 | 3.599 | 0–0 |
+| 0 | mixed | auto_no_pgo | 185.812 | 126.003 | 0.000 | 0.000 | 0–0 |
+
+**Verified:** default-floor mixed auto PGO has `igpu_attempted=0`, `igpu_setup_ms=0`, and `igpu_cold_spent_ms=0` in every measured run. Thus the new admission path avoids expensive iGPU context/kernel initialization in this short workload. It does not eliminate all costs: device discovery takes 122.941–145.232 ms (median 136.167 ms), and CUDA worker setup reaches roughly 90–101 ms. Auto PGO remains slower than forced CPU; auto without PGO now also incurs discovery. CPU-only model persistence remains a measurable millisecond lifecycle cost, not eliminated by this revision.
+
+**已核实：** 默认阈值混合自动 PGO 的七轮均未尝试 iGPU 初始化、setup/spent 为零，说明预算准入有效避免短任务的昂贵上下文/内核初始化。但发现设备仍为122.941–145.232毫秒（中位136.167），CUDA 启动仍约90–101毫秒。自动 PGO 仍慢于 CPU，自动无 PGO 现在也承担设备发现成本。CPU 模型持久化仍有毫秒级生命周期成本，不能声称此次修订完全消除开销。
+
+Priority follow-up: defer discovery itself until useful work justifies its cost, or persist safely invalidated device identity without creating an ICD context. Re-measure CPU-only persistence separately from prediction arithmetic. A short-workload admission test is not sufficient evidence that sustained work eventually activates acceleration; that requires a separate live-device activation test.
+
+优先后续：设备发现也需按有效工作量延迟，或安全保存并失效设备身份；单独评估模型持久化成本。短负载不初始化不证明长负载最终能启用加速，需要另行真实设备激活实验。
+
+### Post-fix raw wall samples / 修订后原始墙钟
+
+```json
+[
+  {
+    "floor": "16MiB",
+    "workload": "small",
+    "mode": "cpu_pgo",
+    "wall_ms": [
+      124.7043,
+      118.1859,
+      112.3245,
+      111.7967,
+      110.1893,
+      176.004,
+      105.4491
+    ]
+  },
+  {
+    "floor": "16MiB",
+    "workload": "small",
+    "mode": "cpu_no_pgo",
+    "wall_ms": [
+      103.4209,
+      128.4205,
+      106.1287,
+      100.971,
+      100.322,
+      106.2231,
+      95.0369
+    ]
+  },
+  {
+    "floor": "16MiB",
+    "workload": "small",
+    "mode": "auto_pgo",
+    "wall_ms": [
+      133.2904,
+      120.9668,
+      113.3813,
+      117.6869,
+      111.1153,
+      145.2946,
+      106.7484
+    ]
+  },
+  {
+    "floor": "16MiB",
+    "workload": "small",
+    "mode": "auto_no_pgo",
+    "wall_ms": [
+      112.6733,
+      109.09,
+      97.3497,
+      113.4987,
+      108.4205,
+      109.4498,
+      92.4075
+    ]
+  },
+  {
+    "floor": "16MiB",
+    "workload": "mixed",
+    "mode": "cpu_pgo",
+    "wall_ms": [
+      171.1151,
+      128.5442,
+      108.951,
+      107.3009,
+      110.0198,
+      103.43,
+      158.197
+    ]
+  },
+  {
+    "floor": "16MiB",
+    "workload": "mixed",
+    "mode": "cpu_no_pgo",
+    "wall_ms": [
+      96.0948,
+      128.493,
+      92.583,
+      97.351,
+      95.2724,
+      108.6282,
+      109.5844
+    ]
+  },
+  {
+    "floor": "16MiB",
+    "workload": "mixed",
+    "mode": "auto_pgo",
+    "wall_ms": [
+      267.3014,
+      286.4894,
+      290.999,
+      265.9302,
+      251.9184,
+      268.2459,
+      277.7493
+    ]
+  },
+  {
+    "floor": "16MiB",
+    "workload": "mixed",
+    "mode": "auto_no_pgo",
+    "wall_ms": [
+      196.5997,
+      368.2068,
+      297.0397,
+      221.9861,
+      213.5607,
+      214.2449,
+      218.9888
+    ]
+  },
+  {
+    "floor": "0",
+    "workload": "small",
+    "mode": "cpu_pgo",
+    "wall_ms": [
+      107.4831,
+      115.1957,
+      104.0655,
+      108.3558,
+      138.4125,
+      117.5266,
+      121.9118
+    ]
+  },
+  {
+    "floor": "0",
+    "workload": "small",
+    "mode": "cpu_no_pgo",
+    "wall_ms": [
+      105.0344,
+      94.776,
+      102.3051,
+      99.0982,
+      90.0051,
+      121.2083,
+      107.7927
+    ]
+  },
+  {
+    "floor": "0",
+    "workload": "small",
+    "mode": "auto_pgo",
+    "wall_ms": [
+      191.2551,
+      206.0172,
+      220.6466,
+      199.9358,
+      216.927,
+      220.9347,
+      227.3589
+    ]
+  },
+  {
+    "floor": "0",
+    "workload": "small",
+    "mode": "auto_no_pgo",
+    "wall_ms": [
+      169.4685,
+      152.3991,
+      170.6853,
+      159.7564,
+      157.8028,
+      183.0214,
+      171.7009
+    ]
+  },
+  {
+    "floor": "0",
+    "workload": "mixed",
+    "mode": "cpu_pgo",
+    "wall_ms": [
+      104.4392,
+      97.7622,
+      107.5653,
+      108.8236,
+      107.469,
+      100.8757,
+      90.4667
+    ]
+  },
+  {
+    "floor": "0",
+    "workload": "mixed",
+    "mode": "cpu_no_pgo",
+    "wall_ms": [
+      89.7131,
+      87.4412,
+      100.894,
+      89.7999,
+      89.0214,
+      83.6993,
+      84.9264
+    ]
+  },
+  {
+    "floor": "0",
+    "workload": "mixed",
+    "mode": "auto_pgo",
+    "wall_ms": [
+      222.2752,
+      217.0944,
+      245.6962,
+      235.6188,
+      218.2622,
+      253.7567,
+      217.6245
+    ]
+  },
+  {
+    "floor": "0",
+    "workload": "mixed",
+    "mode": "auto_no_pgo",
+    "wall_ms": [
+      192.0012,
+      185.2623,
+      212.59,
+      203.5501,
+      184.9649,
+      180.6208,
+      185.8117
+    ]
+  }
+]
+```
