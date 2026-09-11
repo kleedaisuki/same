@@ -5,6 +5,7 @@ project(same VERSION 0.4.0 LANGUAGES C CXX)
 # 原生语言及目标元数据同时服务构建与 IDE 代码模型。
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(SAME_ENABLE_CUDA "Build CUDA backend when a supported compiler is available" ON)
+option(SAME_ENABLE_OPENCL "Build optional dynamically loaded iGPU OpenCL backend" ON)
 option(SAME_SANITIZERS "Enable address and undefined behavior sanitizers" OFF)
 option(SAME_REQUIRE_CUDA "Fail configuration unless CUDA is usable" OFF)
 include(cmake/Cuda.cmake)
@@ -44,6 +45,16 @@ if(SAME_CUDA)
 else()
   target_sources(same_core PRIVATE src/compute_stub.cpp)
 endif()
+# No loader is linked: missing runtime remains a supported CPU fallback.
+# 不链接 OpenCL 加载器；运行时缺失仍是受支持的 CPU 回退路径。
+if(SAME_ENABLE_OPENCL)
+  include(cmake/OpenCL.cmake)
+  target_sources(same_core PRIVATE src/compute_opencl.cpp)
+  target_link_libraries(same_core PRIVATE OpenCL::Headers ${CMAKE_DL_LIBS})
+  target_compile_definitions(same_core PRIVATE CL_TARGET_OPENCL_VERSION=120)
+else()
+  target_sources(same_core PRIVATE src/compute_opencl_stub.cpp)
+endif()
 if(MSVC)
   # Public headers and tests contain UTF-8 text; preserve their execution encoding.
   # 公开头文件与测试包含 UTF-8 文本，消费者必须使用一致的执行字符集。
@@ -78,7 +89,7 @@ add_executable(online_queue_benchmark EXCLUDE_FROM_ALL tools/online_queue_benchm
 target_link_libraries(online_queue_benchmark PRIVATE same_core)
 
 if(BUILD_TESTING)
-  foreach(test compute files config store resources adaptive_routing async_scan run_lock terminal walk completion hash_retry dispatch online_model online_resources unified_cuda telemetry workspace)
+  foreach(test igpu_compute compute files config store resources adaptive_routing async_scan run_lock terminal walk completion hash_retry dispatch online_model online_resources unified_cuda telemetry workspace)
     add_executable(${test}_tests tests/${test}_tests.cpp)
     target_link_libraries(${test}_tests PRIVATE same_core)
     add_test(NAME ${test} COMMAND ${test}_tests)

@@ -34,7 +34,8 @@
       "displayName": "CPU-only Release",
       "cacheVariables": {
         "SAME_ENABLE_CUDA": "OFF",
-        "SAME_REQUIRE_CUDA": "OFF"
+        "SAME_REQUIRE_CUDA": "OFF",
+        "SAME_ENABLE_OPENCL": "OFF"
       }
     },
     {
@@ -44,6 +45,14 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "SAME_SANITIZERS": "ON"
+      }
+    },
+    {
+      "name": "igpu",
+      "inherits": "cpu",
+      "displayName": "Release with optional iGPU OpenCL / 可选核显",
+      "cacheVariables": {
+        "SAME_ENABLE_OPENCL": "ON"
       }
     }
   ],
@@ -63,6 +72,10 @@
     {
       "name": "asan",
       "configurePreset": "asan"
+    },
+    {
+      "name": "igpu",
+      "configurePreset": "igpu"
     }
   ],
   "testPresets": [
@@ -90,6 +103,13 @@
     {
       "name": "asan",
       "configurePreset": "asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "igpu",
+      "configurePreset": "igpu",
       "output": {
         "outputOnFailure": true
       }
