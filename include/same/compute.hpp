@@ -12,6 +12,28 @@ namespace same {
 /// GPUs.
 enum class BackendKind { cpu, cuda, igpu };
 
+/**
+ * @brief 初始化时捕获的设备身份与容量，非实测性能。 / Initialization-time identity and capacity,
+ * not measured throughput. 零和空串表示未知；计算单元跨厂商不可直接等价。 / Zero/empty means
+ * unknown; compute units are not equivalent across vendors. Persist all fields with unambiguous
+ * encoding and include application/model schema versions. 持久化须无歧义编码并包含应用/模型版本。
+ */
+struct DeviceProfile {
+    /// 后端类别；默认测试替身仍以 kind() 为准。 / Backend; kind() remains authoritative for fakes.
+    BackendKind backend = BackendKind::cpu;
+    /// 硬件、供应商、驱动、算法版本和架构身份。 / Hardware, vendor, driver, algorithm and
+    /// architecture.
+    std::string device_name, vendor, driver_version, implementation_version, architecture;
+    /// GPU 计算单元及主机逻辑线程；未知为零。 / GPU units and host logical threads; zero is
+    /// unknown.
+    std::uint32_t compute_units = 0, hardware_threads = 0;
+    /// 设备可见内存、单次最大分配、实际输入批容量。 / Visible memory, maximum allocation and input
+    /// batch.
+    std::uint64_t global_memory_bytes = 0, max_allocation_bytes = 0, effective_batch_bytes = 0;
+    /// 驱动报告统一内存，不意味着免费传输。 / Driver reports unified memory, not free transfers.
+    bool unified_memory = false;
+};
+
 /// 固定诊断名称；不分配内存。 / Stable diagnostic name without allocation.
 constexpr const char* backend_name(BackendKind kind) noexcept {
     switch (kind) {
@@ -59,6 +81,12 @@ public:
 /// is reusable on return.
 class Compute {
 public:
+    /// 返回不可变缓存，不在热路径探测；默认替身返回未知资料。 / Return cached immutable data;
+    /// no hot-path probing. Default test doubles return unknown information.
+    virtual const DeviceProfile& profile() const {
+        static const DeviceProfile unknown;
+        return unknown;
+    }
     /// 释放后端持有的资源。 / Release resources owned by the backend.
     virtual ~Compute() = default;
     /**

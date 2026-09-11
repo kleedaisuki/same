@@ -106,6 +106,8 @@ struct Program {
     cl_device_id id = nullptr;
     cl_context context = nullptr;
     cl_program program = nullptr;
+    /// 编译设备的不可变能力快照。 / Immutable compiled-device capabilities.
+    DeviceProfile profile;
     /// 部分初始化也安全释放。 / Partial initialization is safely released.
     ~Program() {
         if (program)
@@ -118,6 +120,22 @@ struct Program {
         cl_bool v = CL_FALSE;
         check(api->clGetDeviceInfo(id, key, sizeof(v), &v, nullptr));
         return v == CL_TRUE;
+    }
+    /// 查询固定大小设备属性。 / Read a fixed-width device property.
+    template <class T> T property(cl_device_info key) {
+        T value{};
+        check(api->clGetDeviceInfo(id, key, sizeof(value), &value, nullptr));
+        return value;
+    }
+    /// 初始化时读取设备字符串。 / Read device strings during initialization.
+    std::string text_property(cl_device_info key) {
+        std::size_t size = 0;
+        check(api->clGetDeviceInfo(id, key, 0, nullptr, &size));
+        std::string value(size, '\0');
+        check(api->clGetDeviceInfo(id, key, size, value.data(), nullptr));
+        if (!value.empty() && value.back() == '\0')
+            value.pop_back();
+        return value;
     }
     /// 生产只接受统一内存 GPU；测试允许 CPU ICD。 / Production accepts unified-memory GPU only.
     void init(bool testing) {
@@ -147,6 +165,17 @@ struct Program {
         }
         if (!id)
             throw ComputeError("No suitable OpenCL device");
+        profile.backend = BackendKind::igpu;
+        profile.device_name = text_property(CL_DEVICE_NAME);
+        profile.vendor = text_property(CL_DEVICE_VENDOR);
+        profile.driver_version = text_property(CL_DRIVER_VERSION);
+        profile.architecture =
+            text_property(CL_DEVICE_VERSION) + "/" + text_property(CL_DEVICE_OPENCL_C_VERSION);
+        profile.implementation_version = "same-blake3-opencl-leaves-v1/CL1.2";
+        profile.compute_units = property<cl_uint>(CL_DEVICE_MAX_COMPUTE_UNITS);
+        profile.global_memory_bytes = property<cl_ulong>(CL_DEVICE_GLOBAL_MEM_SIZE);
+        profile.max_allocation_bytes = property<cl_ulong>(CL_DEVICE_MAX_MEM_ALLOC_SIZE);
+        profile.unified_memory = flag(CL_DEVICE_HOST_UNIFIED_MEMORY);
         cl_int e = 0;
         context = api->clCreateContext(nullptr, 1, &id, nullptr, nullptr, &e);
         check(e);
@@ -182,6 +211,8 @@ std::shared_ptr<Program> program_for(bool testing) {
 struct Device {
     /// 程序先于所有子资源存在。 / Program outlives child resources.
     std::shared_ptr<Program> p;
+    /// 工作线程批容量纳入设备身份。 / Worker batch capacity is part of device identity.
+    DeviceProfile profile;
     /// 按顺序执行的私有队列、内核和缓冲。 / Private in-order queue, kernel, and buffers.
     cl_command_queue queue = nullptr;
     cl_kernel kernel = nullptr;
@@ -193,7 +224,9 @@ struct Device {
     std::vector<std::array<std::uint32_t, 8>> host_cvs;
     /// 仅分配主机数组，设备分配单独执行。 / Allocate host array before device resources.
     Device(std::shared_ptr<Program> program, std::size_t cap)
-        : p(std::move(program)), capacity(cap), host_cvs(cap / 1024) {}
+        : p(std::move(program)), profile(p->profile), capacity(cap), host_cvs(cap / 1024) {
+        profile.effective_batch_bytes = cap;
+    }
     /// 无借用主机内存的异步传输；退出仍收敛设备工作。 / No borrowed async host storage; drain
     /// device work.
     ~Device() {
@@ -341,15 +374,13 @@ public:
     }
     /// 驱动报告的设备名，仅用于诊断。 / Driver-reported device name for diagnostics.
     std::string device_name() const {
-        std::size_t size = 0;
-        auto& p = *device_->p;
-        check(p.api->clGetDeviceInfo(p.id, CL_DEVICE_NAME, 0, nullptr, &size));
-        std::string name(size, '\0');
-        check(p.api->clGetDeviceInfo(p.id, CL_DEVICE_NAME, size, name.data(), nullptr));
-        if (!name.empty() && name.back() == '\0')
-            name.pop_back();
-        return name;
+        return device_->profile.device_name;
     }
+    /// 直接返回初始化快照。 / Return the initialization snapshot directly.
+    const DeviceProfile& profile() const override {
+        return device_->profile;
+    }
+
     /// 完成内核计数，不含初始化自检。 / Completed kernels excluding startup validation.
     std::uint64_t submissions() const {
         return device_->submissions;

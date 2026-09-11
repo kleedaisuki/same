@@ -68,6 +68,8 @@ __global__ void subtree_kernel(const unsigned char* input, std::uint32_t* cvs, s
  * from construction so destruction cleans up partial allocation failures.
  */
 struct Device {
+    /// 初始化时冻结的硬件和运行库身份。 / Frozen hardware and runtime identity.
+    DeviceProfile profile;
     /// 输入设备缓冲，含 capacity 字节。 / Device input buffer containing capacity bytes.
     unsigned char* a = nullptr;
     /// 完整子树及至多 31 个尾叶链值。 / Full-subtree CVs plus up to 31 trailing leaf CVs.
@@ -105,6 +107,22 @@ struct Device {
     /// 在零初始化句柄上逐项申请，供析构处理部分失败。 / Allocate into zero-initialized handles so
     /// destruction handles partial failure.
     void allocate() {
+        int ordinal = 0, driver = 0, runtime = 0;
+        cudaDeviceProp prop{};
+        check(cudaGetDevice(&ordinal));
+        check(cudaGetDeviceProperties(&prop, ordinal));
+        check(cudaDriverGetVersion(&driver));
+        check(cudaRuntimeGetVersion(&runtime));
+        profile.backend = BackendKind::cuda;
+        profile.device_name = prop.name;
+        profile.vendor = "NVIDIA";
+        profile.driver_version = std::to_string(driver) + "/runtime=" + std::to_string(runtime);
+        profile.implementation_version = "same-blake3-cuda-subtree32-v1";
+        profile.architecture = "sm_" + std::to_string(prop.major) + std::to_string(prop.minor);
+        profile.compute_units = static_cast<std::uint32_t>(prop.multiProcessorCount);
+        profile.global_memory_bytes = prop.totalGlobalMem;
+        profile.effective_batch_bytes = capacity;
+        profile.unified_memory = prop.integrated != 0;
         check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         check(cudaMalloc(reinterpret_cast<void**>(&a), capacity));
         check(cudaMalloc(reinterpret_cast<void**>(&cvs), host_cvs.size() * 32));
@@ -250,6 +268,10 @@ public:
     /// 接管已成功申请的设备资源共享所有权。 / Retain shared ownership of successfully allocated
     /// device resources.
     explicit CudaCompute(std::shared_ptr<Device> device) : device_(std::move(device)) {}
+    /// 不重新探测设备。 / Return immutable initialization metadata.
+    const DeviceProfile& profile() const override {
+        return device_->profile;
+    }
     /// 注册稳定的调用方输入；Device 与存活的 Hasher 共同持有注册生命周期。 / Register stable
     /// caller input; Device and surviving Hashers jointly retain registration lifetime.
     void prepare_input(std::span<std::byte> input) override {
