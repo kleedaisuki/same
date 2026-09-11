@@ -197,7 +197,7 @@ int main(int argc, char** argv) {
     try {
         check(argc == 2, "expected CLI executable");
         const auto exe = executable_path(argv[1]);
-        base = fs::temp_directory_path() /
+        base = fs::canonical(fs::temp_directory_path()) /
                ("same-learning-" +
                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         const auto root = base / "root";
@@ -224,7 +224,10 @@ int main(int argc, char** argv) {
         same::detail::OnlineModel::State first{};
         {
             same::ModelStore store(database);
-            first = *store.load(key);
+            const auto loaded = store.load(key);
+            check(loaded.has_value(), std::string("first model load: ") +
+                                          std::string(store.diagnostic()));
+            first = *loaded;
         }
         // 队列容量不是设备身份，改变它仍应复用相同先验。
         // Queue capacity is not device identity; changing it must retain the same prior.
@@ -236,7 +239,10 @@ int main(int argc, char** argv) {
         check(metric(read(err), "model_prior_hits") == 2, "both workers did not load prior");
         {
             same::ModelStore store(database);
-            const auto second = *store.load(key);
+            const auto loaded = store.load(key);
+            check(loaded.has_value(), std::string("second model load: ") +
+                                          std::string(store.diagnostic()));
+            const auto second = *loaded;
             const auto delta = second[0].samples - first[0].samples;
             check(delta == 16, "prior was multiplied by worker count or run samples lost");
             check(std::abs(second[0].weight - (0.9 * first[0].weight + 16)) < 1e-8,
