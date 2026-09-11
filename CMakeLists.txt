@@ -14,7 +14,7 @@ include(cmake/Dependencies.cmake)
 
 add_library(same_core
   src/config.cpp src/files.cpp src/store.cpp src/compute_cpu.cpp
-  src/resources.cpp src/application.cpp src/run_lock.cpp src/terminal.cpp src/walk.cpp src/dispatch.cpp src/online_model.cpp src/telemetry.cpp src/workspace.cpp)
+  src/resources.cpp src/application.cpp src/run_lock.cpp src/terminal.cpp src/walk.cpp src/dispatch.cpp src/online_model.cpp src/model_store.cpp src/telemetry.cpp src/workspace.cpp)
 # Propagate the public C++ contract without changing CUDA's separate standard.
 # 传播公开 C++ 契约，不改变 CUDA 独立语言标准；头文件集提供 IDE 元数据。
 target_compile_features(same_core PUBLIC cxx_std_23)
@@ -26,7 +26,7 @@ target_sources(same_core PUBLIC FILE_SET HEADERS BASE_DIRS include FILES
   include/same/files.hpp include/same/resources.hpp include/same/run_lock.hpp
   include/same/store.hpp include/same/terminal.hpp include/same/detail/windows_metadata.hpp
   include/same/detail/windows_path.hpp include/same/walk.hpp include/same/detail/completion_jobs.hpp
-  include/same/detail/dispatch.hpp include/same/detail/online_model.hpp include/same/telemetry.hpp include/same/workspace.hpp)
+  include/same/detail/dispatch.hpp include/same/detail/online_model.hpp include/same/model_store.hpp include/same/telemetry.hpp include/same/workspace.hpp)
 target_link_libraries(same_core PUBLIC sqlite3 BLAKE3::blake3 tomlplusplus::tomlplusplus Threads::Threads)
 if(WIN32)
   # Include the opt-in in every executable, including tests, for CRT/STL long paths.
@@ -87,9 +87,12 @@ add_executable(online_model_benchmark EXCLUDE_FROM_ALL tools/online_model_benchm
 target_link_libraries(online_model_benchmark PRIVATE same_core)
 add_executable(online_queue_benchmark EXCLUDE_FROM_ALL tools/online_queue_benchmark.cpp)
 target_link_libraries(online_queue_benchmark PRIVATE same_core)
+# 固定维度模型热路径测量，不加入默认构建。 / Fixed-dimensional model hot-path microbenchmark.
+add_executable(contextual_model_benchmark EXCLUDE_FROM_ALL tools/contextual_model_benchmark.cpp)
+target_link_libraries(contextual_model_benchmark PRIVATE same_core)
 
 if(BUILD_TESTING)
-  foreach(test igpu_compute igpu_routing compute files config store resources adaptive_routing async_scan run_lock terminal walk completion hash_retry dispatch online_model online_resources unified_cuda telemetry workspace)
+  foreach(test igpu_compute igpu_routing compute files config store resources adaptive_routing async_scan run_lock terminal walk completion hash_retry dispatch online_model contextual_model model_store online_resources unified_cuda telemetry workspace)
     add_executable(${test}_tests tests/${test}_tests.cpp)
     target_link_libraries(${test}_tests PRIVATE same_core)
     add_test(NAME ${test} COMMAND ${test}_tests)
@@ -104,6 +107,14 @@ if(BUILD_TESTING)
   endif()
   add_test(NAME integration COMMAND integration_tests "$<TARGET_FILE:same>")
   set_tests_properties(integration PROPERTIES TIMEOUT 120)
+  # 跨进程学习与故障隔离。 / Cross-process learning and failure isolation.
+  add_executable(learning_integration_tests tests/learning_integration_tests.cpp)
+  target_link_libraries(learning_integration_tests PRIVATE same_core)
+  if(WIN32)
+    target_link_libraries(learning_integration_tests PRIVATE shell32)
+  endif()
+  add_test(NAME learning_integration COMMAND learning_integration_tests "$<TARGET_FILE:same>")
+  set_tests_properties(learning_integration PROPERTIES TIMEOUT 120)
 endif()
 
 include(cmake/Format.cmake)

@@ -37,7 +37,17 @@ int main() {
         config.memory_bytes = config.device_memory_bytes = 128ULL * 1024 * 1024;
         config.gpu_min_bytes = 1;
         config.backend = "auto";
-        same::Resources pool(config);
+        // 本测试隔离 CUDA 并发，不以在线探索顺序或 iGPU 可用性作为条件。
+        // Isolate CUDA concurrency from online exploration order and iGPU availability.
+        same::Resources pool(
+            config, same::try_cuda_compute, {},
+            [](same::BackendKind kind, const same::DeviceProfile& profile) {
+                same::detail::OnlineModel prior;
+                for (double peers : {0.0, 1.0})
+                    prior.observe(kind, {64ULL * 1024 * 1024, profile.effective_batch_bytes, peers},
+                                  kind == same::BackendKind::cpu ? 100 : 1);
+                return prior.delta();
+            });
         // 先结束一次共享运行时冷启动；此测试验证就绪后的双设备任务能力。
         // Finish shared-runtime bootstrap first; test concurrent admission after readiness.
         pool.submit_hash([](same::Worker& worker) { return worker.compute->name(); },

@@ -21,12 +21,16 @@ Resources::Resources(const Config& config)
     : Resources(config, try_cuda_compute, try_igpu_compute) {}
 Resources::Resources(const Config& config, detail::CudaFactory factory)
     : Resources(config, std::move(factory), detail::CudaFactory{}) {}
-Resources::Resources(const Config& config, detail::CudaFactory factory, detail::CudaFactory igpu)
+Resources::Resources(const Config& config, detail::ModelPriorLoader prior)
+    : Resources(config, try_cuda_compute, try_igpu_compute, std::move(prior)) {}
+Resources::Resources(const Config& config, detail::CudaFactory factory, detail::CudaFactory igpu,
+                     detail::ModelPriorLoader prior)
     : pgo_(config.pgo), auto_mode_(config.backend == "auto"), forced_gpu_(config.backend == "cuda"),
-      forced_igpu_(config.backend == "igpu"), igpu_factory_(std::move(igpu)),
-      capacity_(config.queue_capacity), cuda_factory_(std::move(factory)) {
+      forced_igpu_(config.backend == "igpu"), prior_loader_(std::move(prior)),
+      igpu_factory_(std::move(igpu)), capacity_(config.queue_capacity),
+      cuda_factory_(std::move(factory)) {
     config.validate();
-        auto remaining = config.memory_bytes - buffer_cost(config.block_bytes) * config.workers;
+    auto remaining = config.memory_bytes - buffer_cost(config.block_bytes) * config.workers;
     if ((auto_mode_ || forced_igpu_) && igpu_factory_) {
         auto block = std::min(config.block_bytes, detail::RoutingParameters::gpu_block_bytes);
         const auto allowance = forced_igpu_ ? remaining : remaining / 2;
@@ -66,6 +70,7 @@ Resources::Resources(const Config& config, detail::CudaFactory factory, detail::
         worker->gpu_block_bytes = gpu_block_bytes_;
         worker->device_budget_bytes = gpu_device_budget_;
         worker->gpu_reuses_cpu_buffers = forced_gpu_;
+        load_prior(*worker, BackendKind::cpu, *worker->compute, config.block_bytes);
         workers_.push_back(std::move(worker));
     }
     try {
@@ -104,63 +109,105 @@ void Resources::enqueue(std::function<void(Worker&)> task) {
     ready_.notify_one();
 }
 
-std::pair<bool, Resources::Reason> Resources::choose_backend(Worker& worker, std::uint64_t bytes,
-                                                             bool hash) {
-    if (!hash)
-        return {forced_gpu_, Reason::fixed};
-    if (!bytes || bytes < worker.gpu_floor)
-        return {false, Reason::size};
-    if (!auto_mode_)
-        return {forced_gpu_, Reason::fixed};
-    const bool initial_gpu = bytes >= detail::RoutingParameters::static_gpu_floor_bytes;
-    if (!pgo_)
-        return {initial_gpu, Reason::fixed};
-    const auto band = (std::bit_width(bytes) - 1) / detail::OnlineModel::band_shift;
-    const auto arrival = ++worker.arrivals[band];
-    if (arrival % detail::RoutingParameters::exploration_period == 0)
-        return {(arrival / detail::RoutingParameters::exploration_period) % 2 != 0,
-                Reason::explore};
-    const auto cpu = worker.model.predict(false, bytes);
-    const auto gpu = worker.model.predict(true, bytes);
-    if (cpu.known && gpu.known)
-        return {detail::gpu_service_wins(cpu, gpu), Reason::model};
-    // 两后端各自最多两次冷启动探索；局部机会不被其他线程消耗。
-    // At most two initial probes per backend; another worker never consumes local opportunities.
-    bool choose_gpu = initial_gpu;
-    if (cpu.known && !gpu.known)
-        choose_gpu = true;
-    else if (!cpu.known && gpu.known)
-        choose_gpu = false;
-    auto& attempts = choose_gpu ? worker.initial_gpu[band] : worker.initial_cpu[band];
-    if (attempts < detail::RoutingParameters::initial_gpu_explorations) {
-        ++attempts;
-        return {choose_gpu, Reason::explore};
+void Resources::load_prior(Worker& worker, BackendKind kind, const Compute& compute,
+                           std::size_t block) {
+    const auto slot = static_cast<unsigned>(kind);
+    if (worker.prior_loaded[slot])
+        return;
+    worker.devices[slot] = compute.profile();
+    worker.devices[slot].backend = kind;
+    auto& batch = worker.devices[slot].effective_batch_bytes;
+    batch = batch ? std::min<std::uint64_t>(batch, block) : block;
+    worker.prior_loaded[slot] = true;
+    if (pgo_ && prior_loader_) {
+        const auto prior = prior_loader_(kind, worker.devices[slot]);
+        worker.model.initialize_backend(kind, prior[slot]);
     }
-    return {initial_gpu, Reason::fixed};
 }
 
-bool Resources::select_igpu(Worker& worker, std::uint64_t bytes, bool hash) {
-    if ((!auto_mode_ && !forced_igpu_) || !igpu_block_bytes_ ||
-        (hash && (!bytes || bytes < worker.gpu_floor)) || (!hash && !forced_igpu_))
-        return false;
-    bool want = forced_igpu_;
-    if (auto_mode_) {
-        const auto igpu = worker.model.predict(BackendKind::igpu, bytes);
-        const auto cpu = worker.model.predict(BackendKind::cpu, bytes);
-        const auto cuda = worker.model.predict(BackendKind::cuda, bytes);
-        // 探索每个工作线程的独立设备模型；无 PGO 时只使用静态轮换。
-        // Explore independent owner models; no-PGO uses static rotation only.
-        const auto turn = ++worker.igpu_selections;
-        const auto band = (std::bit_width(bytes) - 1) / detail::OnlineModel::band_shift;
-        want = pgo_ ? ((!igpu.known && worker.initial_igpu[band] < 2 && turn % 3 == 0) ||
-                       (turn % detail::RoutingParameters::exploration_period != 1 && igpu.known &&
-                        cpu.known && detail::gpu_service_wins(cpu, igpu) &&
-                        (!cuda.known || igpu.ms + igpu.error_ms < cuda.ms + cuda.error_ms)) ||
-                       turn % detail::RoutingParameters::exploration_period == 0)
-                    : bytes >= detail::RoutingParameters::static_gpu_floor_bytes && turn % 2 == 0;
+detail::OnlineModel::Context Resources::context(const Worker& worker, BackendKind kind,
+                                                std::uint64_t bytes) const {
+    const auto slot = static_cast<unsigned>(kind);
+    auto batch = worker.devices[slot].effective_batch_bytes;
+    if (!batch)
+        batch = kind == BackendKind::cpu    ? worker.cpu_block_bytes
+                : kind == BackendKind::cuda ? worker.gpu_block_bytes
+                                            : igpu_block_bytes_;
+    // CPU 与 iGPU 共享主机资源，CUDA 仅记录同设备竞争；不是因果带宽估计。
+    // CPU/iGPU share host resources; CUDA counts device peers, not causal bandwidth estimates.
+    const auto peers = kind == BackendKind::cuda
+                           ? backend_active_[1].load(std::memory_order_relaxed)
+                           : backend_active_[0].load(std::memory_order_relaxed) +
+                                 backend_active_[2].load(std::memory_order_relaxed);
+    return {bytes, batch, static_cast<double>(peers)};
+}
+
+std::pair<BackendKind, Resources::Reason>
+Resources::choose_backend(Worker& worker, std::uint64_t bytes, bool hash,
+                          const std::array<bool, 3>& candidates) {
+    if (hash && (!bytes || bytes < worker.gpu_floor))
+        return {BackendKind::cpu, Reason::size};
+    if (!auto_mode_ || !hash) {
+        const auto forced = forced_gpu_    ? BackendKind::cuda
+                            : forced_igpu_ ? BackendKind::igpu
+                                           : BackendKind::cpu;
+        return {candidates[static_cast<unsigned>(forced)] ? forced : BackendKind::cpu,
+                Reason::fixed};
     }
-    if (!want)
-        return false;
+    const bool large = bytes >= detail::RoutingParameters::static_gpu_floor_bytes;
+    const auto preferred = large && candidates[1]   ? BackendKind::cuda
+                           : large && candidates[2] ? BackendKind::igpu
+                                                    : BackendKind::cpu;
+    if (!pgo_)
+        return {preferred, Reason::fixed};
+    const auto band = (std::bit_width(bytes) - 1) / detail::OnlineModel::band_shift;
+    const auto arrival = worker.arrivals[band];
+    if (arrival && arrival % detail::RoutingParameters::exploration_period == 0) {
+        const auto start = (arrival / detail::RoutingParameters::exploration_period) % 3;
+        for (unsigned i = 0; i < 3; ++i) {
+            const auto slot = (start + i) % 3;
+            if (candidates[slot])
+                return {static_cast<BackendKind>(slot), Reason::explore};
+        }
+    }
+    std::array<detail::OnlineModel::Prediction, 3> estimates{};
+    for (unsigned slot = 0; slot < 3; ++slot)
+        if (candidates[slot]) {
+            const auto kind = static_cast<BackendKind>(slot);
+            estimates[slot] = worker.model.predict(kind, worker.candidate_contexts[slot]);
+        }
+    const std::array<unsigned, 3> order =
+        large ? std::array<unsigned, 3>{1, 0, 2} : std::array<unsigned, 3>{0, 1, 2};
+    const std::array<unsigned, 3> attempts{worker.initial_cpu[band], worker.initial_gpu[band],
+                                           worker.initial_igpu[band]};
+    unsigned least_probes = detail::RoutingParameters::initial_gpu_explorations;
+    unsigned probe_slot = 3;
+    for (auto slot : order)
+        if (candidates[slot] && (!estimates[slot].known || estimates[slot].out_of_domain) &&
+            attempts[slot] < least_probes) {
+            least_probes = attempts[slot];
+            probe_slot = slot;
+        }
+    if (probe_slot < 3)
+        return {static_cast<BackendKind>(probe_slot), Reason::explore};
+    auto best = BackendKind::cpu;
+    bool known = estimates[0].known && !estimates[0].out_of_domain;
+    double score = known ? detail::RoutingParameters::cpu_advantage_factor * estimates[0].ms -
+                               estimates[0].error_ms
+                         : std::numeric_limits<double>::infinity();
+    for (unsigned slot = 1; slot < 3; ++slot) {
+        const auto& prediction = estimates[slot];
+        if (candidates[slot] && prediction.known && !prediction.out_of_domain &&
+            prediction.ms + prediction.error_ms < score) {
+            score = prediction.ms + prediction.error_ms;
+            best = static_cast<BackendKind>(slot);
+            known = true;
+        }
+    }
+    return known ? std::pair{best, Reason::model} : std::pair{preferred, Reason::fixed};
+}
+
+bool Resources::select_igpu(Worker& worker) {
     bool idle = false;
     if (!igpu_busy_.compare_exchange_strong(idle, true, std::memory_order_acquire)) {
         ++worker.igpu_busy;
@@ -198,15 +245,11 @@ bool Resources::select_igpu(Worker& worker, std::uint64_t bytes, bool hash) {
             igpu_busy_.store(false, std::memory_order_release);
             return false;
         }
+        load_prior(worker, BackendKind::igpu, *igpu_compute_, igpu_block_bytes_);
         std::swap(worker.compute, igpu_compute_);
         worker.first.swap(igpu_first_);
         worker.second.swap(igpu_second_);
         worker.igpu_selected = true;
-        if (pgo_ && hash && bytes) {
-            const auto band = (std::bit_width(bytes) - 1) / detail::OnlineModel::band_shift;
-            if (worker.initial_igpu[band] < 2)
-                ++worker.initial_igpu[band];
-        }
         worker.selected_backend = worker.compute.get();
         return true;
     } catch (const ComputeError&) {
@@ -257,6 +300,7 @@ bool Resources::prepare_gpu(Worker& worker) {
         gpu->update(input);
         if (cpu->finish() != gpu->finish())
             throw std::runtime_error("GPU correctness validation mismatch");
+        load_prior(worker, BackendKind::cuda, *worker.gpu_compute, worker.gpu_block_bytes);
         worker.gpu_enabled = true;
         gpu_workers_.fetch_add(1, std::memory_order_relaxed);
         record_time();
@@ -274,79 +318,136 @@ bool Resources::prepare_gpu(Worker& worker) {
     }
 }
 
+bool Resources::activate_cuda(Worker& worker) {
+    bool owns_bootstrap = false;
+    if (auto_mode_ && !worker.gpu_attempted) {
+        auto state = Bootstrap::cold;
+        owns_bootstrap = bootstrap_.compare_exchange_strong(state, Bootstrap::initializing,
+                                                            std::memory_order_acq_rel);
+        if (!owns_bootstrap && state == Bootstrap::initializing) {
+            ++worker.cold_start_cpu;
+            return false;
+        }
+    }
+    bool available = false;
+    try {
+        available = prepare_gpu(worker);
+    } catch (...) {
+        if (owns_bootstrap)
+            bootstrap_.store(Bootstrap::ready, std::memory_order_release);
+        throw;
+    }
+    if (owns_bootstrap)
+        bootstrap_.store(Bootstrap::ready, std::memory_order_release);
+    if (!available)
+        return false;
+    std::swap(worker.compute, worker.gpu_compute);
+    if (!worker.gpu_reuses_cpu_buffers) {
+        worker.first.swap(worker.gpu_first);
+        worker.second.swap(worker.gpu_second);
+    }
+    worker.gpu_selected = true;
+    return true;
+}
+
 void Resources::select_backend(Worker& worker, std::uint64_t bytes, bool hash) noexcept {
     worker.startup_error = {};
     worker.selected_backend = worker.compute.get();
-    bool owns_bootstrap = false;
     try {
-        if (select_igpu(worker, bytes, hash))
-            return;
-        const bool eligible = hash && bytes && bytes >= worker.gpu_floor;
-        // 不等待冷启动持有者；本次工作继续 CPU，局部探索与设备尝试均保持未消费。
-        // Never wait for the cold-start owner: continue on CPU without consuming local GPU
-        // attempts.
-        if (auto_mode_ && eligible && !worker.gpu_attempted &&
-            bootstrap_.load(std::memory_order_acquire) == Bootstrap::initializing) {
-            ++worker.cold_start_cpu;
-            return;
-        }
-        const auto band = auto_mode_ && eligible && pgo_
-                              ? (std::bit_width(bytes) - 1) / detail::OnlineModel::band_shift
-                              : 0;
-        const auto initial_gpu = worker.initial_gpu[band];
-        const auto [want_gpu, reason] = choose_backend(worker, bytes, hash);
-        if (auto_mode_ && want_gpu && !worker.gpu_attempted && !worker.gpu_retired) {
-            auto state = Bootstrap::cold;
-            owns_bootstrap = bootstrap_.compare_exchange_strong(state, Bootstrap::initializing,
-                                                                std::memory_order_acq_rel);
-            if (!owns_bootstrap && state == Bootstrap::initializing) {
-                worker.initial_gpu[band] = initial_gpu;
-                ++worker.cold_start_cpu;
-                return;
+        std::array<bool, 3> candidates{
+            true,
+            (auto_mode_ || forced_gpu_) && cuda_factory_ && worker.gpu_block_bytes &&
+                worker.device_budget_bytes && !worker.gpu_retired &&
+                (!worker.gpu_attempted || worker.gpu_enabled),
+            (auto_mode_ || forced_igpu_) && igpu_factory_ && igpu_block_bytes_};
+        const auto band = bytes ? (std::bit_width(bytes) - 1) / detail::OnlineModel::band_shift : 0;
+        if (auto_mode_ && pgo_ && hash && bytes >= worker.gpu_floor && bytes)
+            ++worker.arrivals[band];
+        // 两设备各至多一次首次资料重选及一次排除；最后必有 CPU。
+        // Each device permits one discovery reconsideration and one exclusion; CPU always remains.
+        for (unsigned attempt = 0; attempt < 6; ++attempt) {
+            if (attempt == 5)
+                candidates = {true, false, false};
+            for (unsigned slot = 0; slot < 3; ++slot)
+                worker.candidate_contexts[slot] =
+                    context(worker, static_cast<BackendKind>(slot), bytes);
+            const auto [kind, reason] = choose_backend(worker, bytes, hash, candidates);
+            const auto slot = static_cast<unsigned>(kind);
+            const bool known_device = worker.prior_loaded[slot];
+            const bool activated =
+                kind == BackendKind::cpu ||
+                (kind == BackendKind::cuda ? activate_cuda(worker) : select_igpu(worker));
+            if (!activated) {
+                candidates[slot] = false;
+                ++worker.excluded[slot];
+                if (kind == BackendKind::cuda && worker.gpu_attempted)
+                    ++worker.unavailable_cpu;
+                continue;
             }
-        }
-        const bool gpu = want_gpu && prepare_gpu(worker);
-        if (owns_bootstrap)
-            bootstrap_.store(Bootstrap::ready, std::memory_order_release);
-        if (hash) {
-            if (want_gpu && !gpu)
-                ++worker.unavailable_cpu;
-            else if (reason == Reason::size)
-                ++worker.size_cpu;
-            else if (reason == Reason::explore)
+            worker.selected_backend = worker.compute.get();
+            if (auto_mode_ && pgo_ && !known_device && kind != BackendKind::cpu) {
+                // 首次发现的真实容量与先验必须参与执行前的同一选择过程。
+                // Newly discovered capacity/prior participates before execution, not after it.
+                finish_task(worker);
+                continue;
+            }
+            worker.selected_backend = worker.compute.get();
+            worker.decision_backend = kind;
+            worker.decision_context = worker.candidate_contexts[slot];
+            // 首次初始化才知道实际批容量；冻结并记录该执行形状的预测。
+            // First setup reveals actual capacity; freeze and predict this execution shape.
+            worker.decision_context.effective_batch_bytes =
+                worker.devices[slot].effective_batch_bytes;
+            worker.decision_prediction = pgo_ ? worker.model.predict(kind, worker.decision_context)
+                                              : detail::OnlineModel::Prediction{};
+            backend_active_[slot].fetch_add(1, std::memory_order_relaxed);
+            worker.decision_active = true;
+            if (kind == BackendKind::cuda) {
+                worker.gpu_counted = true;
+                worker.gpu_inflight_at_selection =
+                    gpu_active_.fetch_add(1, std::memory_order_relaxed) + 1;
+                worker.gpu_peak_concurrency =
+                    std::max(worker.gpu_peak_concurrency, worker.gpu_inflight_at_selection);
+                auto peak = gpu_peak_.load(std::memory_order_relaxed);
+                while (peak < worker.gpu_inflight_at_selection &&
+                       !gpu_peak_.compare_exchange_weak(peak, worker.gpu_inflight_at_selection,
+                                                        std::memory_order_relaxed)) {
+                }
+            }
+            if (!hash)
+                return;
+            const auto reason_slot = reason == Reason::explore ? 2
+                                     : reason == Reason::model ? 1
+                                                               : 0;
+            ++worker.decisions[slot][reason_slot];
+            if (reason == Reason::explore) {
                 ++worker.exploration_jobs;
-            else if (reason == Reason::model)
-                ++(gpu ? worker.model_gpu : worker.model_cpu);
-            else
-                ++(gpu ? worker.static_gpu : worker.static_cpu);
-        }
-        if (!gpu)
+                auto& probes = kind == BackendKind::cpu    ? worker.initial_cpu[band]
+                               : kind == BackendKind::cuda ? worker.initial_gpu[band]
+                                                           : worker.initial_igpu[band];
+                if (probes < detail::RoutingParameters::initial_gpu_explorations)
+                    ++probes;
+            } else if (reason == Reason::size)
+                ++worker.size_cpu;
+            else if (reason == Reason::model && kind != BackendKind::igpu)
+                ++(kind == BackendKind::cuda ? worker.model_gpu : worker.model_cpu);
+            else if (reason == Reason::fixed && kind != BackendKind::igpu)
+                ++(kind == BackendKind::cuda ? worker.static_gpu : worker.static_cpu);
+            if (kind == BackendKind::igpu)
+                ++worker.igpu_selections;
             return;
-        std::swap(worker.compute, worker.gpu_compute);
-        if (!worker.gpu_reuses_cpu_buffers) {
-            worker.first.swap(worker.gpu_first);
-            worker.second.swap(worker.gpu_second);
-        }
-        worker.gpu_selected = true;
-        worker.selected_backend = worker.compute.get();
-        worker.gpu_inflight_at_selection = gpu_active_.fetch_add(1, std::memory_order_relaxed) + 1;
-        worker.gpu_peak_concurrency =
-            std::max(worker.gpu_peak_concurrency, worker.gpu_inflight_at_selection);
-        auto peak = gpu_peak_.load(std::memory_order_relaxed);
-        while (peak < worker.gpu_inflight_at_selection &&
-               !gpu_peak_.compare_exchange_weak(peak, worker.gpu_inflight_at_selection,
-                                                std::memory_order_relaxed)) {
         }
     } catch (...) {
-        // 首次失败不应剥夺其他工作线程独立初始化的机会。
-        // A first failure must not remove other workers' independent initialization opportunities.
-        if (owns_bootstrap)
-            bootstrap_.store(Bootstrap::ready, std::memory_order_release);
         worker.startup_error = std::current_exception();
     }
 }
 
 void Resources::finish_task(Worker& worker) {
+    if (worker.decision_active) {
+        backend_active_[static_cast<unsigned>(worker.decision_backend)].fetch_sub(
+            1, std::memory_order_relaxed);
+        worker.decision_active = false;
+    }
     if (worker.igpu_selected) {
         if (worker.igpu_retired || worker.compute.get() != worker.selected_backend) {
             igpu_retired_ = true;
@@ -372,7 +473,10 @@ void Resources::finish_task(Worker& worker) {
             worker.second.swap(worker.gpu_second);
         }
         worker.gpu_selected = false;
-        gpu_active_.fetch_sub(1, std::memory_order_relaxed);
+        if (worker.gpu_counted) {
+            gpu_active_.fetch_sub(1, std::memory_order_relaxed);
+            worker.gpu_counted = false;
+        }
     } else if (worker.gpu_retired) {
         worker.gpu_compute.reset();
         worker.gpu_enabled = false;
@@ -401,10 +505,9 @@ void Resources::run(Worker& worker) {
         // Access the model only on its owner, outside the queue lock; exclude failed/retried work.
         if (pgo_ && worker.sample.valid && !worker.startup_error &&
             worker.fallback_count == retries && worker.compute.get() == worker.selected_backend) {
-            worker.model.observe(worker.sample.backend == BackendKind::igpu ? BackendKind::igpu
-                                 : worker.sample.gpu                        ? BackendKind::cuda
-                                                                            : BackendKind::cpu,
-                                 worker.sample.bytes, worker.sample.service_ms);
+            if (worker.sample.bytes == worker.decision_context.bytes)
+                worker.model.observe(worker.decision_backend, worker.decision_context,
+                                     worker.sample.service_ms);
             if (worker.sample.gpu && worker.gpu_inflight_at_selection > 1)
                 ++worker.contended_samples;
         }
@@ -473,6 +576,14 @@ detail::OnlineModel::Snapshot Resources::profile_snapshot() const {
         add(total.igpu_known_bands, local.igpu_known_bands);
         add(total.rejected_samples, local.rejected_samples);
         add(total.predicted_samples, local.predicted_samples);
+        add(total.out_of_domain_samples, local.out_of_domain_samples);
+        add(total.numerical_rejections, local.numerical_rejections);
+        total.absolute_error_sum_ms +=
+            std::min(local.absolute_error_sum_ms,
+                     std::numeric_limits<double>::max() - total.absolute_error_sum_ms);
+        total.squared_error_sum_ms2 +=
+            std::min(local.squared_error_sum_ms2,
+                     std::numeric_limits<double>::max() - total.squared_error_sum_ms2);
         add(total.cpu_known_bands, local.cpu_known_bands);
         add(total.gpu_known_bands, local.gpu_known_bands);
         for (std::size_t i = 0; i < total.latency_histogram.size(); ++i) {
@@ -490,6 +601,14 @@ std::vector<WorkerProfile> Resources::worker_profiles() const {
         p.index = w->index;
         p.snapshot = w->model.snapshot();
         p.parameters = w->model.parameters();
+        p.prior = w->model.prior();
+        p.delta = w->model.delta();
+        p.devices = w->devices;
+        p.decision_context = w->decision_context;
+        p.decision_prediction = w->decision_prediction;
+        p.decision_backend = w->decision_backend;
+        p.decisions = w->decisions;
+        p.excluded = w->excluded;
         p.cpu_block_bytes = w->cpu_block_bytes;
         p.gpu_block_bytes = w->gpu_block_bytes;
         p.device_budget_bytes = w->device_budget_bytes;

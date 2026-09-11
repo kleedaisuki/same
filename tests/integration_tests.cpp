@@ -783,6 +783,19 @@ void igpu_backend(const fs::path& exe) {
     check(f.run(0, {"scan", "--summary", "--cpu", "--rehash", "--no-telemetry"}) == expected &&
               f.stats["cpu_hashes"] == 3 && f.stats["igpu_hashes"] == 0,
           "CPU override of iGPU path");
+    // 新工作区、同一区间至少三个任务；不把两任务区间误当成三设备探索证明。
+    // A fresh workspace needs three tasks in one band to demonstrate three-device exploration.
+    Fixture automatic(exe);
+    automatic.config({{"backend", "\"auto\""}, {"workers", "1"},
+                      {"gpu_min_bytes", "0"}, {"memory_bytes", "134217728"},
+                      {"device_memory_bytes", "134217728"}});
+    automatic.file("a", content);
+    automatic.file("b", content);
+    automatic.file("different", changed);
+    automatic.expect(expected);
+    if (required && std::string_view(required) == "1")
+        check(automatic.stats["igpu_hashes"] >= 1 && automatic.stats["pgo_igpu_samples"] >= 1,
+              "auto route failed to explore and observe available iGPU");
 }
 
 /// 大小路由必须保留完整摘要/缓存语义，并能显式禁用。 / Size routing preserves hashes/cache and can
@@ -829,10 +842,6 @@ void size_routing(const fs::path& exe) {
         check(f.stats["gpu_workers"] == 1 && f.stats["worker_count"] == 1 &&
                   f.stats["gpu_hashes"] >= 1,
               "repeated local-band input did not explore the available worker-local device");
-    const char* igpu_required = std::getenv("SAME_REQUIRE_IGPU");
-    if (igpu_required && std::string_view(igpu_required) == "1")
-        check(f.stats["igpu_hashes"] >= 1 && f.stats["pgo_igpu_samples"] >= 1,
-              "auto route failed to explore and observe available iGPU");
     f.config({{"backend", "\"auto\""}, {"gpu_min_bytes", "0"}});
     f.expect(expected);
     check(f.stats["cached"] == 4 && f.stats["gpu_workers"] == 0 &&

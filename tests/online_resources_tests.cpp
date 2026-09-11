@@ -54,11 +54,11 @@ void samples(bool enabled) {
     auto c = config();
     c.pgo = enabled;
     same::Resources pool(c, factory());
-    pool.submit([](same::Worker& w) { w.sample = {1048576, 2, false, true}; }).get();
+    pool.submit_hash([](same::Worker& w) { w.sample = {1048576, 2, false, true}; }, 1048576).get();
     pool.wait_idle();
     require(pool.profile_snapshot().samples == (enabled ? 1 : 0),
             "sample learning switch violated");
-    pool.submit([](same::Worker& w) { w.sample = {1048576, 3, true, false}; }).get();
+    pool.submit_hash([](same::Worker& w) { w.sample = {1048576, 3, true, false}; }, 1048576).get();
     pool.wait_idle();
     require(pool.profile_snapshot().samples == (enabled ? 1 : 0), "invalid sample learned");
 }
@@ -68,8 +68,8 @@ void switching() {
     auto c = config();
     same::Resources pool(c, factory());
     pool.submit([](same::Worker& w) {
-            w.model.observe(false, 1048576, 30);
-            w.model.observe(true, 1048576, 1);
+            w.model.observe(same::BackendKind::cpu, {1048576, w.cpu_block_bytes, 0}, 30);
+            w.model.observe(same::BackendKind::cuda, {1048576, w.gpu_block_bytes, 0}, 1);
         })
         .get();
     pool.wait_idle();
@@ -79,8 +79,8 @@ void switching() {
     pool.wait_idle();
     pool.submit([](same::Worker& w) {
             for (int i = 0; i < 128; ++i) {
-                w.model.observe(false, 1048576, 1);
-                w.model.observe(true, 1048576, 30);
+                w.model.observe(same::BackendKind::cpu, {1048576, w.cpu_block_bytes, 0}, 1);
+                w.model.observe(same::BackendKind::cuda, {1048576, w.gpu_block_bytes, 0}, 30);
             }
         })
         .get();

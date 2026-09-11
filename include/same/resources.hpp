@@ -17,6 +17,8 @@
 namespace same {
 namespace detail {
 /// 可注入设备创建器；返回空表示不可用。 / Injectable device factory; null means unavailable.
+using ModelPriorLoader = std::function<OnlineModel::State(BackendKind, const DeviceProfile&)>;
+/// 可注入设备创建器。 / Injectable device factory.
 using CudaFactory = std::function<std::unique_ptr<Compute>(std::size_t, std::size_t)>;
 /// 路由参数的唯一来源，运行记录直接引用。 / Single source for routing policy and run snapshots.
 struct RoutingParameters {
@@ -54,6 +56,18 @@ struct Worker {
     /// 仅所属线程预测和观测，不加锁。 / Owner-thread-only prediction and observation, without
     /// locks.
     detail::OnlineModel model;
+    /// 冻结上下文保证预测与训练使用同一特征。 / Freeze features shared by prediction and training.
+    detail::OnlineModel::Context decision_context{};
+    detail::OnlineModel::Prediction decision_prediction{};
+    BackendKind decision_backend{BackendKind::cpu};
+    std::array<DeviceProfile, 3> devices{};
+    std::array<bool, 3> prior_loaded{};
+    /// 每后端固定/模型/探索选择次数，以及候选不可用次数。
+    /// Per-backend fixed/model/exploration decisions and unavailable exclusions.
+    std::array<std::array<std::uint64_t, 3>, 3> decisions{};
+    std::array<std::uint64_t, 3> excluded{};
+    bool decision_active{}, gpu_counted{};
+    std::array<detail::OnlineModel::Context, 3> candidate_contexts{};
     /// 成功任务的已有计时；所属线程在回调后消费。 / Existing successful-task timing consumed after
     /// callback.
     struct Sample {
@@ -143,6 +157,14 @@ struct WorkerProfile {
     std::size_t index{};
     detail::OnlineModel::Snapshot snapshot;
     detail::OnlineModel::Parameters parameters;
+    /// 本轮增量不包含共享先验。 / Run delta excludes the shared prior.
+    detail::OnlineModel::State prior{}, delta{};
+    std::array<DeviceProfile, 3> devices{};
+    detail::OnlineModel::Context decision_context{};
+    detail::OnlineModel::Prediction decision_prediction{};
+    BackendKind decision_backend{BackendKind::cpu};
+    std::array<std::array<std::uint64_t, 3>, 3> decisions{};
+    std::array<std::uint64_t, 3> excluded{};
     /// 固定资源配额与惰性初始化状态。 / Fixed resource quotas and lazy initialization state.
     std::size_t cpu_block_bytes{}, gpu_block_bytes{}, device_budget_bytes{};
     double setup_ms{};
@@ -184,7 +206,11 @@ public:
     /// Injected factories may be invoked concurrently by owners and must be thread-safe.
     Resources(const Config& config, detail::CudaFactory factory);
     /// 独立注入两设备工厂。 / Independently inject both device factories.
-    Resources(const Config& config, detail::CudaFactory cuda, detail::CudaFactory igpu);
+    Resources(const Config& config, detail::CudaFactory cuda, detail::CudaFactory igpu,
+              detail::ModelPriorLoader prior = {});
+    /// 只读先验查询在初始化时执行，必须线程安全且不得访问 SQL。
+    /// Read-only prior lookup runs at initialization; thread-safe and SQL-free.
+    Resources(const Config& config, detail::ModelPriorLoader prior);
     /// 排空已接收任务并在所属线程销毁设备。 / Drain admitted tasks and destroy devices on owner
     /// threads.
     ~Resources();
@@ -290,7 +316,15 @@ private:
     void close();
     /// 本地成本与有界探索，不读取时钟或其他模型。 / Local costs and bounded exploration; no clock
     /// or peer model reads.
-    std::pair<bool, Reason> choose_backend(Worker& worker, std::uint64_t bytes, bool hash);
+    std::pair<BackendKind, Reason> choose_backend(Worker& worker, std::uint64_t bytes, bool hash,
+                                                  const std::array<bool, 3>& candidates);
+    /// 取得配置与实际容量组成的上下文，不查询驱动。 / Context from config/cached capacity, no
+    /// driver query.
+    detail::OnlineModel::Context context(const Worker& worker, BackendKind kind,
+                                         std::uint64_t bytes) const;
+    /// 初始化时只加载对应设备的先验。 / Load only this device prior at initialization.
+    void load_prior(Worker& worker, BackendKind kind, const Compute& compute, std::size_t block);
+    bool activate_cuda(Worker& worker);
     /// 捕获初始化异常但不跳过用户回调。 / Capture setup exceptions without skipping the callback.
     void select_backend(Worker& worker, std::uint64_t bytes, bool hash) noexcept;
     /// 所属线程首次初始化并验证，失败不重新探测。 / Owner-thread one-time
@@ -303,7 +337,11 @@ private:
     bool pgo_{}, auto_mode_{}, forced_gpu_{}, forced_igpu_{};
     /// 单上下文、统一内存配额；原子准入失败立即继续其他后端。
     /// One context and unified-memory quota; failed atomic admission never waits.
-    bool select_igpu(Worker& worker, std::uint64_t bytes, bool hash);
+    bool select_igpu(Worker& worker);
+    detail::ModelPriorLoader prior_loader_;
+    /// 实际执行中的后端数量，用于上下文，不是线程调度锁。
+    /// Active backends inform context; these counters are not scheduling locks.
+    std::array<std::atomic<std::size_t>, 3> backend_active_{};
     std::atomic<bool> igpu_busy_{false};
     bool igpu_attempted_{}, igpu_retired_{};
     double igpu_setup_ms_{};
