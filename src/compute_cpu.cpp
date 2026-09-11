@@ -2,6 +2,9 @@
 #include <algorithm>
 #include <blake3.h>
 #include <cstring>
+#include <fstream>
+#include <set>
+#include <sstream>
 #include <thread>
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
@@ -13,13 +16,46 @@
 #endif
 namespace same {
 namespace {
+#if defined(__linux__) && (defined(__aarch64__) || defined(__arm__))
+/// 限量读取公开 CPU 型号字段，不采集序列号或机器 ID。 / Read bounded public CPU model fields,
+/// never serial numbers or machine IDs. Preserve heterogeneous core identities without core counts.
+std::string arm_cpu_name() {
+    std::ifstream file("/proc/cpuinfo", std::ios::binary);
+    std::string bytes(256 * 1024, '\0');
+    file.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    bytes.resize(static_cast<std::size_t>(file.gcount()));
+    std::istringstream input(bytes);
+    std::string line;
+    std::set<std::string> models;
+    while (std::getline(input, line)) {
+        const auto colon = line.find(':');
+        if (colon == std::string::npos || line.size() > 1024)
+            continue;
+        auto key = line.substr(0, colon);
+        key.erase(key.find_last_not_of(" \t") + 1);
+        if (key == "CPU implementer" || key == "CPU architecture" || key == "CPU variant" ||
+            key == "CPU part" || key == "CPU revision" || key == "model name")
+            models.insert(line);
+    }
+    // 没有可区分芯片的字段时保持未知，调用方禁止跨运行重用。 / Keep unknown without chip fields;
+    // callers must disable cross-run reuse for unknown identity.
+    bool chip = false;
+    std::string result;
+    for (const auto& model : models) {
+        chip = chip || model.starts_with("CPU part") || model.starts_with("model name");
+        result += model + "\n";
+    }
+    return chip ? result : std::string{};
+}
+#endif
 /// 廉价且缓存的硬件身份；不推测带宽。 / Cheap cached hardware identity without bandwidth guesses.
 DeviceProfile cpu_profile() {
     DeviceProfile p;
     p.backend = BackendKind::cpu;
     p.hardware_threads = std::thread::hardware_concurrency();
     p.unified_memory = true;
-    p.implementation_version = std::string("same-blake3-cpu-v1/") + blake3_version();
+    p.implementation_version =
+        std::string("same-blake3-cpu-v1/") + blake3_version() + "/" + SAME_BLAKE3_BUILD_ID;
 #if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
     p.architecture = sizeof(void*) == 8 ? "x86_64" : "x86";
     auto cpuid = [](unsigned leaf, unsigned* r) {
@@ -53,6 +89,9 @@ DeviceProfile cpu_profile() {
     p.architecture = "arm";
 #else
     p.architecture = "unknown";
+#endif
+#if defined(__linux__) && (defined(__aarch64__) || defined(__arm__))
+    p.device_name = arm_cpu_name();
 #endif
 #ifdef __APPLE__
     char name[256]{};

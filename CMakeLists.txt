@@ -20,6 +20,16 @@ add_library(same_core
 target_compile_features(same_core PUBLIC cxx_std_23)
 # Keep executable and persisted run identities aligned. / 程序与持久运行记录共用版本来源。
 target_compile_definitions(same_core PUBLIC SAME_VERSION="${PROJECT_VERSION}")
+# Fingerprint the dependency's selected SIMD implementation and configurable compiler flags.
+# 将依赖实际选择的 SIMD 实现及可配置编译参数加入学习缓存身份。
+set(_same_blake3_config "${BLAKE3_SIMD_TYPE}|${BLAKE3_USE_TBB}|${CMAKE_C_COMPILER_ID}|${CMAKE_C_COMPILER_VERSION}|${CMAKE_C_FLAGS}|${CMAKE_C_FLAGS_RELEASE}|${BLAKE3_CFLAGS_SSE2}|${BLAKE3_CFLAGS_SSE4.1}|${BLAKE3_CFLAGS_AVX2}|${BLAKE3_CFLAGS_AVX512}|${BLAKE3_CFLAGS_NEON}")
+get_target_property(_same_blake3_definitions blake3 COMPILE_DEFINITIONS)
+get_target_property(_same_blake3_options blake3 COMPILE_OPTIONS)
+get_target_property(_same_blake3_sources blake3 SOURCES)
+string(APPEND _same_blake3_config "|${_same_blake3_definitions}|${_same_blake3_options}|${_same_blake3_sources}|${CMAKE_C_FLAGS_DEBUG}|${CMAKE_C_FLAGS_RELWITHDEBINFO}|${CMAKE_C_FLAGS_MINSIZEREL}")
+string(SHA256 _same_blake3_config_hash "${_same_blake3_config}")
+target_compile_definitions(same_core PRIVATE SAME_BLAKE3_BUILD_ID="${_same_blake3_config_hash}-$<CONFIG>")
+
 set_target_properties(same_core PROPERTIES CXX_EXTENSIONS OFF)
 target_sources(same_core PUBLIC FILE_SET HEADERS BASE_DIRS include FILES
   include/same/application.hpp include/same/compute.hpp include/same/config.hpp
