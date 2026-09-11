@@ -8,6 +8,14 @@ C++23 · BLAKE3 · SQLite · optional CUDA / OpenCL iGPU。扫描目录 → 只�
 
 Traverse → hash new or metadata-changed files → compare equal-size/equal-digest candidates byte for byte. Digest equality alone is not proof of content equality.
 
+## 下载 / Download
+
+[GitHub Releases](https://github.com/kleedaisuki/same/releases/latest) 提供经过 Actions 测试的下载包。
+Windows/Linux 的 `standard` 包包含 CPU 与可选 OpenCL iGPU，`cuda` 包额外包含 CUDA；macOS ARM64 提供 standard 包。
+CUDA 包需要兼容驱动，无须自行安装 CUDA 编译器。每个包包含构建信息、许可证与 SHA-256 校验；平台基线及发布流程见 [发布文档](docs/releasing.md)。
+
+GitHub Releases provides tested archives; `cuda` explicitly includes the CUDA backend rather than silently falling back at build time. See the release guide for supported platforms and provenance verification.
+
 ## 构建 / Build
 
 需要 CMake ≥ 3.25、C/C++23 编译器和首次下载依赖所需的网络。依赖由 FetchContent 固定版本及 SHA-256：BLAKE3 1.8.2、toml++ 3.4.0、SQLite 3.53.4。CUDA 翻译单元（translation unit）使用 C++20，主程序使用 C++23。

@@ -1,0 +1,100 @@
+# Branch/PR builds exercise the exact packages used by tag releases.
+# 分支与 PR 验证正式标签发布所用的同一打包流程。
+name: validate-and-release
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+  packages:
+    name: package (${{ matrix.platform }}, ${{ matrix.flavor }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: windows-2022, platform: windows-x64, flavor: standard, cuda: 'OFF'}
+          - {os: windows-2022, platform: windows-x64, flavor: cuda, cuda: 'ON'}
+          - {os: ubuntu-24.04, platform: linux-x64, flavor: standard, cuda: 'OFF'}
+          - {os: ubuntu-24.04, platform: linux-x64, flavor: cuda, cuda: 'ON'}
+          - {os: macos-14, platform: macos-arm64, flavor: standard, cuda: 'OFF'}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install CUDA compiler and runtime (no GPU driver)
+        if: matrix.cuda == 'ON'
+        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
+        with:
+          cuda: '12.8.0'
+          method: network
+          sub-packages: ${{ runner.os == 'Windows' && '["nvcc", "cudart", "visual_studio_integration"]' || '["nvcc", "cudart-dev"]' }}
+          use-github-cache: 'false'
+      - name: Configure tested Release package
+        run: cmake -S . -B build/package -DCMAKE_BUILD_TYPE=Release -DSAME_ENABLE_OPENCL=ON -DSAME_ENABLE_CUDA=${{ matrix.cuda }} -DSAME_REQUIRE_CUDA=${{ matrix.cuda }} -DCMAKE_CUDA_RUNTIME_LIBRARY=Static -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+      - run: cmake --build build/package --config Release --parallel 4
+      - run: ctest --test-dir build/package -C Release --output-on-failure --timeout 120 --output-junit results.xml
+      - name: Package and smoke-test extracted binary
+        run: python tools/package_release.py --build build/package --platform ${{ matrix.platform }} --flavor ${{ matrix.flavor }} --output dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.platform }}-${{ matrix.flavor }}
+          path: dist/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: package-tests-${{ matrix.platform }}-${{ matrix.flavor }}
+          path: |
+            build/package/results.xml
+            build/package/Testing/Temporary/LastTest.log
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    needs: [checks, packages]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify release tag and main ancestry
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python tools/package_release.py --verify-tag "$RELEASE_TAG"
+          git merge-base --is-ancestor HEAD origin/main
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Verify package inventory and checksums
+        run: |
+          test "$(find dist -name '*.sha256' | wc -l)" -eq 5
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: 'dist/*'
+      - name: Publish tested assets atomically through a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft > existing-draft.txt 2>/dev/null; then
+            test "$(cat existing-draft.txt)" = true
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "same $RELEASE_TAG" --notes-file "docs/releases/$RELEASE_TAG.md"
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --latest
