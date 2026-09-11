@@ -119,7 +119,10 @@ void isolation() {
     require(profiles.size() == 2, "snapshot omitted a worker model");
     require(profiles[a.first].snapshot.samples == 1 && profiles[b.first].snapshot.samples == 0,
             "snapshot merged histories between workers");
-    require(profiles[a.first].parameters.size() == 64 && profiles[b.first].parameters.size() == 64,
+    constexpr auto cells =
+        same::detail::OnlineModel::backend_count * same::detail::OnlineModel::band_count;
+    require(profiles[a.first].parameters.size() == cells &&
+                profiles[b.first].parameters.size() == cells,
             "worker snapshot omitted model bands");
 }
 } // namespace

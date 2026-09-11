@@ -21,6 +21,8 @@ void help() {
            "  --summary  show Summary, Database and profiling (off by default)\n"
            "  --rehash       ignore cached hashes for this scan\n"
            "  --cpu          force the CPU backend\n"
+           "  --cuda         select CUDA (CPU fallback when unavailable)\n"
+           "  --igpu         select integrated OpenCL GPU (CPU fallback when unavailable/busy)\n"
            "  --no-pgo       disable runtime profile-guided routing (not compiler PGO)\n"
            "  --no-telemetry disable persistent local diagnostics (not PGO or summary)\n"
            "  --unique-files show unmatched paths (TSV: group 0)\n"
@@ -48,7 +50,8 @@ int main(int argc, char** argv) {
             if (command != "scan" && command != "new" && command != "clean")
                 throw std::runtime_error("unknown command: " + std::string(command));
         }
-        bool rehash = false, cpu = false, unique_files = false;
+        bool rehash = false, unique_files = false;
+        std::string_view backend;
         bool recursive = false, summary = false, no_pgo = false;
         bool no_telemetry = false;
         auto color_mode = same::ColorMode::automatic;
@@ -72,9 +75,12 @@ int main(int argc, char** argv) {
                                          std::string(arg));
             if (arg == "--rehash")
                 rehash = true;
-            else if (arg == "--cpu")
-                cpu = true;
-            else if (arg == "--no-pgo")
+            else if (arg == "--cpu" || arg == "--cuda" || arg == "--igpu") {
+                const auto selected = arg.substr(2);
+                if (!backend.empty() && backend != selected)
+                    throw std::runtime_error("conflicting compute backend options");
+                backend = selected;
+            } else if (arg == "--no-pgo")
                 no_pgo = true;
             else if (arg == "--no-telemetry")
                 no_telemetry = true;
@@ -106,8 +112,8 @@ int main(int argc, char** argv) {
         auto config = same::Config::load(root);
         if (rehash)
             config.rehash = true;
-        if (cpu)
-            config.backend = "cpu";
+        if (!backend.empty())
+            config.backend = backend;
         if (no_pgo)
             config.pgo = false;
         if (no_telemetry)

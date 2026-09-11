@@ -1,4 +1,5 @@
 #pragma once
+#include "same/compute.hpp"
 #include <array>
 #include <cstdint>
 
@@ -16,8 +17,8 @@ public:
     static constexpr unsigned band_shift = 2;
     /// 完整 uint64_t 大小空间的区间数。 / Band count for the complete uint64_t size space.
     static constexpr unsigned band_count = 64 / band_shift;
-    /// CPU 与 GPU 两个独立后端。 / Two independent backends: CPU and GPU.
-    static constexpr unsigned backend_count = 2;
+    /// CPU、CUDA 与 iGPU 独立后端。 / Independent CPU, CUDA and iGPU backends.
+    static constexpr unsigned backend_count = 3;
     /// 单个区间的原始学习参数；未知区间保留零值但不代表零成本。
     /// Raw learned band parameters; unknown zero values do not imply zero cost.
     struct BandParameters {
@@ -33,9 +34,11 @@ public:
         unsigned band_index{};
         /// false 为 CPU，true 为 GPU。 / False identifies CPU, true identifies GPU.
         bool gpu{};
+        /// 实际后端，gpu 仅表示 CUDA。 / Actual backend; legacy gpu means CUDA only.
+        BackendKind backend{BackendKind::cpu};
     };
-    /// 固定大小导出，先 CPU 后 GPU，各自按区间索引递增。
-    /// Fixed-size export: CPU then GPU, with ascending band indices within each backend.
+    /// 固定大小导出，依次 CPU、CUDA、iGPU，各自按区间索引递增。
+    /// Fixed-size export: CPU, CUDA, then iGPU, with ascending band indices within each backend.
     using Parameters = std::array<BandParameters, backend_count * band_count>;
     /// 相同四倍大小区间内的估计；未知不是零成本。
     /// Estimate within the same factor-four size band; unknown is not zero cost.
@@ -53,31 +56,46 @@ public:
     struct Snapshot {
         /// 成功与拒绝的样本数；计数器饱和而不回绕。
         /// Accepted and rejected samples; counters saturate rather than wrap.
-        std::uint64_t samples{}, cpu_samples{}, gpu_samples{}, rejected_samples{};
+        std::uint64_t samples{}, cpu_samples{}, gpu_samples{}, igpu_samples{}, rejected_samples{};
         /// 已有预测的观测数及绝对预测误差 EWMA。
         /// Count of observations with a prior prediction and absolute prediction-error EWMA.
         std::uint64_t predicted_samples{};
         /// 含校准先验的有效区间数。 / Known bands including calibration priors.
-        std::uint64_t cpu_known_bands{}, gpu_known_bands{};
+        std::uint64_t cpu_known_bands{}, gpu_known_bands{}, igpu_known_bands{};
         double mean_absolute_error_ms{};
         /// 服务时间与预测残差的有界分布。 / Bounded service-time and residual distributions.
         std::array<std::uint64_t, 32> latency_histogram{}, residual_histogram{};
     };
     /// 只查询对应后端与大小区间，不向未测量区间外推。
     /// Query only this backend/size band; never extrapolate into unmeasured bands.
-    Prediction predict(bool gpu, std::uint64_t bytes) const noexcept;
+    Prediction predict(BackendKind backend, std::uint64_t bytes) const noexcept;
     /// 记录成功任务；拒绝零大小及非正或非有限时间。
     /// Record successful work; reject zero bytes and nonpositive/nonfinite durations.
-    bool observe(bool gpu, std::uint64_t bytes, double service_ms) noexcept;
+    bool observe(BackendKind backend, std::uint64_t bytes, double service_ms) noexcept;
     /// 独立播种某一校准形状，不覆盖已有观测，不增加任务统计。
     /// Seed one calibration shape independently; preserve observations and task statistics.
-    bool seed(bool gpu, std::uint64_t bytes, double service_ms) noexcept;
+    bool seed(BackendKind backend, std::uint64_t bytes, double service_ms) noexcept;
     /// 在外部锁内取得固定大小快照。 / Obtain a fixed-size snapshot under caller's lock.
     Snapshot snapshot() const noexcept;
     /// 在外部锁内或空闲后复制参数；不分配、不采样、不改变预测。
     /// Copy parameters under caller's lock or after idle; no allocation, sampling or mutation.
     /// Example: const auto bands = model.parameters(); // bands[0] is CPU band zero.
     Parameters parameters() const noexcept;
+
+    /// 兼容 CUDA 布尔调用。 / Compatibility for CUDA boolean callers.
+    Prediction predict(bool gpu, std::uint64_t bytes) const noexcept {
+        return predict(gpu ? BackendKind::cuda : BackendKind::cpu, bytes);
+    }
+
+    /// 兼容 CUDA 布尔调用。 / Compatibility for CUDA boolean callers.
+    bool observe(bool gpu, std::uint64_t bytes, double service_ms) noexcept {
+        return observe(gpu ? BackendKind::cuda : BackendKind::cpu, bytes, service_ms);
+    }
+
+    /// 兼容 CUDA 布尔调用。 / Compatibility for CUDA boolean callers.
+    bool seed(bool gpu, std::uint64_t bytes, double service_ms) noexcept {
+        return seed(gpu ? BackendKind::cuda : BackendKind::cpu, bytes, service_ms);
+    }
 
 private:
     /// 每字节成本及残差，alpha=1/8，约五个样本的半衰期。

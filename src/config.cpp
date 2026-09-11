@@ -120,8 +120,8 @@ void Config::validate() const {
             "memory_bytes must cover two blocks plus compute staging per worker");
     if (!device_memory_bytes)
         throw std::runtime_error("device_memory_bytes must be positive");
-    if (backend != "auto" && backend != "cpu" && backend != "cuda")
-        throw std::runtime_error("backend must be auto, cpu or cuda");
+    if (backend != "auto" && backend != "cpu" && backend != "cuda" && backend != "igpu")
+        throw std::runtime_error("backend must be auto, cpu, cuda or igpu");
 }
 namespace {
 /// Match a bracket expression using ASCII/POSIX byte classes, independent of locale.

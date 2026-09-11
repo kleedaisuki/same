@@ -27,8 +27,8 @@ struct Config {
     std::size_t device_memory_bytes{64 * 1024 * 1024};
     /// Bound both queued work and retained futures. 同时限制排队任务与保留的 future 数量。
     std::size_t queue_capacity;
-    /// auto lets each unified worker choose CPU/GPU using its private online model.
-    /// auto 由同质工作线程的私有在线模型选择 CPU/GPU；cuda 显式卸载，cpu 不探测。
+    /// auto lets each worker choose CPU/CUDA/iGPU using its private online model.
+    /// auto 使用线程私有三设备模型；cuda/igpu 显式卸载，cpu 不探测。
     std::string backend{"auto"};
     /// Ignore stored hashes even when file stamps match. 即使文件戳匹配也重新计算哈希。
     bool rehash{false};

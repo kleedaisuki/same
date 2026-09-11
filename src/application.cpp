@@ -77,9 +77,12 @@ FileRecord hash_file(const fs::path& root, FileRecord record, Worker& worker,
     // 资源工作线程已选择独有后端及匹配缓冲，应用层不二次路由。
     // The worker has selected its private backend and matching buffer; do not reroute here.
     auto& selected = worker.compute;
-    const bool gpu = selected->name() == "cuda";
+    const bool gpu = selected->kind() == BackendKind::cuda;
+    const bool igpu = selected->kind() == BackendKind::igpu;
     if (gpu)
         ++worker.gpu_hashes;
+    else if (igpu)
+        ++worker.igpu_hashes;
     else
         ++worker.cpu_hashes;
     auto hasher = selected->hasher();
@@ -89,6 +92,8 @@ FileRecord hash_file(const fs::path& root, FileRecord record, Worker& worker,
         worker.hash_bytes += count;
         if (gpu)
             worker.gpu_hash_bytes += count;
+        else if (igpu)
+            worker.igpu_hash_bytes += count;
         else
             worker.cpu_hash_bytes += count;
         if (!count)
@@ -250,6 +255,7 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
                                   (detail::RoutingParameters::small_sample_period - 1)) == 0);
             const auto cpu_before = worker.cpu_hashes;
             const auto gpu_before = worker.gpu_hashes;
+            const auto igpu_before = worker.igpu_hashes;
             const auto start = Clock::now();
             // 固定事件只复用已有采样和时钟；不进入调度器锁，不读取文件内容。
             // Fixed events reuse sampling and clocks; no scheduler lock or file contents.
@@ -258,14 +264,18 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
                     return;
                 const auto gpu_attempts = worker.gpu_hashes - gpu_before;
                 const auto cpu_attempts = worker.cpu_hashes - cpu_before;
-                const bool retry = gpu_attempts + cpu_attempts > 1;
+                const auto igpu_attempts = worker.igpu_hashes - igpu_before;
+                const bool retry = gpu_attempts + cpu_attempts + igpu_attempts > 1;
                 if (!sample && !retry && success)
                     return;
                 telemetry::Event event;
                 event.type = sample ? "span" : "log";
                 event.name = sample ? "hash" : (success ? "hash.fallback" : "hash.error");
                 event.severity = success ? (retry ? "warn" : "info") : "error";
-                event.backend = retry ? "gpu+cpu" : (gpu_attempts ? "gpu" : "cpu");
+                event.backend = retry ? (igpu_attempts ? "igpu+cpu" : "gpu+cpu")
+                                      : (igpu_attempts  ? "igpu"
+                                         : gpu_attempts ? "gpu"
+                                                        : "cpu");
                 event.message = record.path;
                 event.span_id = span_id;
                 event.parent_span_id = 3;
@@ -299,8 +309,11 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
             report(ended, true);
             // 复用已有计时；仅完整成功且没有重试的实际后端样本进入模型。
             // Reuse existing timing; only successful single-attempt samples train the model.
-            if (sample && worker.cpu_hashes - cpu_before + worker.gpu_hashes - gpu_before == 1)
-                worker.sample = {hashed.stamp.size, elapsed, worker.gpu_hashes != gpu_before, true};
+            if (sample && worker.cpu_hashes - cpu_before + worker.gpu_hashes - gpu_before +
+                                  worker.igpu_hashes - igpu_before ==
+                              1)
+                worker.sample = {hashed.stamp.size, elapsed, worker.gpu_hashes != gpu_before, true,
+                                 worker.compute->kind()};
             return HashResult{std::move(hashed), elapsed};
         };
         // 统一队列只携带载荷；工作线程在锁外选择并学习自己的后端。
@@ -520,8 +533,8 @@ void render_online_profile(const Resources& resources, std::ostream& out, bool p
     if (pretty) {
         out << "  Online PGO      " << (enabled ? "enabled" : "disabled") << " | "
             << profile.samples << " samples (" << profile.cpu_samples << " CPU | "
-            << profile.gpu_samples << " GPU) | " << resources.exploration_jobs()
-            << " exploration jobs\n"
+            << profile.gpu_samples << " CUDA | " << profile.igpu_samples << " iGPU) | "
+            << resources.exploration_jobs() << " exploration jobs\n"
             << "  Model coverage  " << profile.cpu_known_bands << " CPU | "
             << profile.gpu_known_bands << " GPU observed worker-band pairs\n"
             << "  Model residual  " << profile.predicted_samples
@@ -532,6 +545,7 @@ void render_online_profile(const Resources& resources, std::ostream& out, bool p
     }
     out << "pgo_enabled=" << enabled << " pgo_samples=" << profile.samples
         << " pgo_exploration_jobs=" << resources.exploration_jobs()
+        << " pgo_igpu_samples=" << profile.igpu_samples
         << " pgo_cpu_samples=" << profile.cpu_samples << " pgo_gpu_samples=" << profile.gpu_samples
         << " pgo_cpu_known_bands=" << profile.cpu_known_bands
         << " pgo_gpu_known_bands=" << profile.gpu_known_bands
@@ -545,22 +559,24 @@ void render_online_profile(const Resources& resources, std::ostream& out, bool p
 void render_worker_profiles(const Resources& resources, std::ostream& out, bool pretty) {
     const auto workers = resources.worker_profiles();
     out << (pretty ? "  Worker count    " : "worker_count=") << workers.size() << '\n';
-    std::uint64_t cpu_bytes = 0, gpu_bytes = 0;
+    std::uint64_t cpu_bytes = 0, gpu_bytes = 0, igpu_bytes = 0;
     std::size_t gpu_peak = 0, gpu_available = 0;
     for (const auto& worker : workers) {
         cpu_bytes += worker.cpu_hash_bytes;
         gpu_bytes += worker.gpu_hash_bytes;
+        igpu_bytes += worker.igpu_hash_bytes;
         gpu_peak = std::max(gpu_peak, worker.gpu_peak_concurrency);
         gpu_available += worker.gpu_enabled ? 1 : 0;
     }
     if (pretty)
         out << "  Backend reads   " << human_bytes(static_cast<double>(cpu_bytes)) << " CPU | "
-            << human_bytes(static_cast<double>(gpu_bytes)) << " GPU | peak " << gpu_peak
+            << human_bytes(static_cast<double>(gpu_bytes)) << " CUDA | "
+            << human_bytes(static_cast<double>(igpu_bytes)) << " iGPU | peak " << gpu_peak
             << " concurrent GPU tasks\n";
     else
         out << "cpu_hash_read_bytes=" << cpu_bytes << " gpu_hash_read_bytes=" << gpu_bytes
-            << " gpu_peak_concurrency=" << gpu_peak << " gpu_available_workers=" << gpu_available
-            << '\n';
+            << " igpu_hash_read_bytes=" << igpu_bytes << " gpu_peak_concurrency=" << gpu_peak
+            << " gpu_available_workers=" << gpu_available << '\n';
     for (const auto& worker : workers) {
         const auto& profile = worker.snapshot;
         const auto error =
@@ -568,7 +584,8 @@ void render_worker_profiles(const Resources& resources, std::ostream& out, bool 
         if (pretty) {
             out << "  Worker " << worker.index << "        " << worker.cpu_hashes << " CPU | "
                 << worker.gpu_hashes << " GPU attempts | " << worker.cpu_hash_bytes << " CPU B | "
-                << worker.gpu_hash_bytes << " GPU B\n"
+                << worker.gpu_hash_bytes << " CUDA B | " << worker.igpu_hashes
+                << " iGPU attempts | " << worker.igpu_hash_bytes << " iGPU B\n"
                 << "                  " << profile.samples << " samples | local error EWMA "
                 << error << " ms | GPU setup " << human_duration(worker.setup_ms) << " | init "
                 << (worker.gpu_attempted ? "attempted" : "not-needed") << " | GPU "
@@ -581,6 +598,9 @@ void render_worker_profiles(const Resources& resources, std::ostream& out, bool 
 #define WORKER_VALUE(field) out << prefix << #field << '=' << worker.field << ' '
         WORKER_VALUE(cpu_hashes);
         WORKER_VALUE(gpu_hashes);
+        WORKER_VALUE(igpu_hashes);
+        WORKER_VALUE(igpu_hash_bytes);
+        WORKER_VALUE(igpu_busy);
         WORKER_VALUE(cpu_hash_bytes);
         WORKER_VALUE(gpu_hash_bytes);
         WORKER_VALUE(hash_bytes);
@@ -669,12 +689,18 @@ void render_pretty_profile(const Counters& counters, const Resources& resources,
     row("Read rate", human_bytes(rate) + "/s");
     row("Backend", std::to_string(resources.gpu_workers()) + " workers initialized CUDA | " +
                        std::to_string(resources.fallbacks()) + " CPU fallbacks");
+    row("iGPU", std::string(resources.igpu_service_enabled() ? "available"
+                            : resources.igpu_retired()       ? "retired"
+                            : resources.igpu_attempted()     ? "unavailable"
+                                                             : "not probed") +
+                    " | setup " + human_duration(resources.igpu_setup_ms()));
     row("CPU size route",
         std::to_string(resources.cpu_routed_hashes()) + " hash attempts (policy, not failure)");
     const auto [cpu_attempts, gpu_attempts] = resources.hash_attempts();
-    row("Hash backends",
-        std::to_string(cpu_attempts) + " CPU | " + std::to_string(gpu_attempts) + " GPU attempts");
-    row("Scheduling", "one queue | worker-local CPU/GPU selection and models");
+    row("Hash backends", std::to_string(cpu_attempts) + " CPU | " + std::to_string(gpu_attempts) +
+                             " CUDA | " + std::to_string(resources.igpu_hash_attempts()) +
+                             " iGPU attempts");
+    row("Scheduling", "one queue | worker-local CPU/CUDA/iGPU selection and models");
     row("GPU input", human_bytes(static_cast<double>(resources.gpu_block_bytes())));
     render_online_profile(resources, out, true);
     render_worker_profiles(resources, out, true);
@@ -727,8 +753,15 @@ void render_profile(const Counters& counters, const Resources& resources,
             << " walk_result_peak=" << counters.walk_result_peak << '\n';
     profile << "cpu_routed_hashes=" << resources.cpu_routed_hashes() << '\n';
     const auto [cpu_attempts, gpu_attempts] = resources.hash_attempts();
-    profile << "cpu_hashes=" << cpu_attempts << " gpu_hashes=" << gpu_attempts
-            << " gpu_block_bytes=" << resources.gpu_block_bytes()
+    std::uint64_t igpu_attempts = 0;
+    for (const auto& worker : resources.worker_profiles())
+        igpu_attempts += worker.igpu_hashes;
+    profile << "igpu_attempted=" << resources.igpu_attempted()
+            << " igpu_available=" << resources.igpu_service_enabled()
+            << " igpu_retired=" << resources.igpu_retired()
+            << " igpu_setup_ms=" << resources.igpu_setup_ms() << " ";
+    profile << "igpu_hashes=" << igpu_attempts << " cpu_hashes=" << cpu_attempts
+            << " gpu_hashes=" << gpu_attempts << " gpu_block_bytes=" << resources.gpu_block_bytes()
             << " scheduler=worker-local single_queue=1" << '\n';
     render_online_profile(resources, profile, false);
     render_worker_profiles(resources, profile, false);
@@ -839,12 +872,18 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
     const auto [cpu, gpu] = resources->hash_attempts();
     metric("cpu_hashes", static_cast<double>(cpu));
     metric("gpu_hashes", static_cast<double>(gpu));
+    metric("igpu_hashes", static_cast<double>(resources->igpu_hash_attempts()));
+    metric("igpu_available", resources->igpu_service_enabled() ? 1 : 0);
+    metric("igpu_attempted", resources->igpu_attempted() ? 1 : 0);
+    metric("igpu_retired", resources->igpu_retired() ? 1 : 0);
+    metric("igpu_setup_ms", resources->igpu_setup_ms(), "ms");
     parameter("routing", "model_scope", "worker-local-current-run");
     const auto profile = resources->profile_snapshot();
 #define PROFILE(field, unit) metric("pgo." #field, static_cast<double>(profile.field), unit)
     PROFILE(samples, "count");
     PROFILE(cpu_samples, "count");
     PROFILE(gpu_samples, "count");
+    PROFILE(igpu_samples, "count");
     PROFILE(rejected_samples, "count");
     PROFILE(predicted_samples, "count");
     PROFILE(cpu_known_bands, "count");
@@ -862,6 +901,9 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
     metric(scope + "." #field, static_cast<double>(worker.field), unit)
         WORKER_METRIC(cpu_hashes, "count");
         WORKER_METRIC(gpu_hashes, "count");
+        WORKER_METRIC(igpu_hashes, "count");
+        WORKER_METRIC(igpu_hash_bytes, "bytes");
+        WORKER_METRIC(igpu_busy, "count");
         WORKER_METRIC(cpu_hash_bytes, "bytes");
         WORKER_METRIC(gpu_hash_bytes, "bytes");
         WORKER_METRIC(hash_bytes, "bytes");
@@ -893,6 +935,7 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
         LOCAL_PROFILE(samples, "count");
         LOCAL_PROFILE(cpu_samples, "count");
         LOCAL_PROFILE(gpu_samples, "count");
+        LOCAL_PROFILE(igpu_samples, "count");
         LOCAL_PROFILE(rejected_samples, "count");
         LOCAL_PROFILE(predicted_samples, "count");
         LOCAL_PROFILE(cpu_known_bands, "count");
@@ -906,8 +949,11 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
                    static_cast<double>(local.residual_histogram[i]));
         }
         for (const auto& band : worker.parameters) {
-            const auto category =
-                scope + ".model." + (band.gpu ? "gpu." : "cpu.") + std::to_string(band.band_index);
+            const auto category = scope + ".model." +
+                                  (band.backend == BackendKind::igpu ? "igpu."
+                                   : band.gpu                        ? "gpu."
+                                                                     : "cpu.") +
+                                  std::to_string(band.band_index);
             parameter(category, "known", band.known);
             parameter(category, "samples", band.samples);
             parameter(category, "cost_ms_per_byte", band.cost_ms_per_byte);

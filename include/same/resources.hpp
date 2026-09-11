@@ -62,8 +62,12 @@ struct Worker {
         double service_ms{};
         /// 实际后端与完整成功标记。 / Actual backend and complete-success marker.
         bool gpu{}, valid{};
+        /// 三设备归属。 / Three-device attribution.
+        BackendKind backend{BackendKind::cpu};
     } sample;
     /// 本地采样开关和小任务序号。 / Local sampling switch and small-task sequence.
+    /// 当前任务持有池级 iGPU 准入。 / Task owns pool-wide iGPU admission.
+    bool igpu_selected{}, igpu_retired{};
     bool profile_enabled{};
     std::uint64_t profile_sequence{};
     /// 冻结的文件资格、实际缓冲和显存配额。 / Frozen file floor, buffer sizes and device quota.
@@ -83,6 +87,7 @@ struct Worker {
     std::atomic<std::size_t>* fallbacks{};
     /// 本地实际尝试、读取、降级和初始化失败。 / Local attempts, read bytes, fallbacks and setup
     /// failures.
+    std::uint64_t igpu_hashes{}, igpu_hash_bytes{}, igpu_busy{}, igpu_selections{};
     std::uint64_t cpu_hashes{}, gpu_hashes{}, cpu_routed_hashes{}, hash_bytes{}, compare_bytes{};
     std::uint64_t cpu_hash_bytes{}, gpu_hash_bytes{}, fallback_count{}, gpu_init_failures{};
     /// 本地选择原因，探索单列。 / Local selection reasons with separate exploration count.
@@ -95,7 +100,7 @@ struct Worker {
     /// 本地有界探索；不同工作线程不消费彼此的机会。 / Local bounded exploration; workers never
     /// consume peers' opportunities.
     std::array<std::uint64_t, 32> arrivals{};
-    std::array<unsigned char, 32> initial_cpu{}, initial_gpu{};
+    std::array<unsigned char, 32> initial_cpu{}, initial_gpu{}, initial_igpu{};
     /// GPU 争用仅作观测，不是并发闸门。 / GPU contention observations, never a concurrency gate.
     std::size_t gpu_inflight_at_selection{}, gpu_peak_concurrency{};
     std::uint64_t contended_samples{};
@@ -116,8 +121,12 @@ struct Worker {
             return operation();
         } catch (const ComputeError&) {
             compute = make_cpu_compute();
-            gpu_retired = true;
-            gpu_enabled = false;
+            if (igpu_selected)
+                igpu_retired = true;
+            else {
+                gpu_retired = true;
+                gpu_enabled = false;
+            }
             ++fallback_count;
             if (fallbacks)
                 ++*fallbacks;
@@ -139,6 +148,7 @@ struct WorkerProfile {
     double setup_ms{};
     bool gpu_attempted{}, gpu_enabled{};
     /// 实际工作及错误计数。 / Actual work and failure counters.
+    std::uint64_t igpu_hashes{}, igpu_hash_bytes{}, igpu_busy{}, igpu_selections{};
     std::uint64_t cpu_hashes{}, gpu_hashes{}, cpu_routed_hashes{}, hash_bytes{}, compare_bytes{};
     std::uint64_t cpu_hash_bytes{}, gpu_hash_bytes{}, fallbacks{}, gpu_init_failures{};
     /// 后端选择原因。 / Backend selection reasons.
@@ -173,6 +183,8 @@ public:
     /// 注入工厂可能被多个所属线程并发调用，必须线程安全。
     /// Injected factories may be invoked concurrently by owners and must be thread-safe.
     Resources(const Config& config, detail::CudaFactory factory);
+    /// 独立注入两设备工厂。 / Independently inject both device factories.
+    Resources(const Config& config, detail::CudaFactory cuda, detail::CudaFactory igpu);
     /// 排空已接收任务并在所属线程销毁设备。 / Drain admitted tasks and destroy devices on owner
     /// threads.
     ~Resources();
@@ -215,6 +227,22 @@ public:
     }
     /// 以下统计只能在 wait_idle 后读取。 / The following statistics require wait_idle.
     bool gpu_service_enabled() const;
+    /// 空闲后读取独立核显状态。 / Read independent iGPU state after idle.
+    bool igpu_service_enabled() const {
+        return igpu_attempted_ && !igpu_retired_ && igpu_compute_ != nullptr;
+    }
+    /// 空闲后合计实际核显尝试。 / Sum actual iGPU attempts after idle.
+    std::uint64_t igpu_hash_attempts() const;
+    /// 核显生命周期诊断，空闲后读取。 / iGPU lifecycle diagnostics, read after idle.
+    bool igpu_attempted() const {
+        return igpu_attempted_;
+    }
+    bool igpu_retired() const {
+        return igpu_retired_;
+    }
+    double igpu_setup_ms() const {
+        return igpu_setup_ms_;
+    }
     std::uint64_t exploration_jobs() const;
     std::pair<std::uint64_t, std::uint64_t> read_bytes() const;
     std::pair<std::uint64_t, std::uint64_t> hash_attempts() const;
@@ -272,7 +300,17 @@ private:
     /// contexts.
     void finish_task(Worker& worker);
     /// 固定配置及集中预算。 / Frozen configuration and centralized budgets.
-    bool pgo_{}, auto_mode_{}, forced_gpu_{};
+    bool pgo_{}, auto_mode_{}, forced_gpu_{}, forced_igpu_{};
+    /// 单上下文、统一内存配额；原子准入失败立即继续其他后端。
+    /// One context and unified-memory quota; failed atomic admission never waits.
+    bool select_igpu(Worker& worker, std::uint64_t bytes, bool hash);
+    std::atomic<bool> igpu_busy_{false};
+    bool igpu_attempted_{}, igpu_retired_{};
+    double igpu_setup_ms_{};
+    std::size_t igpu_block_bytes_{}, igpu_budget_{};
+    detail::CudaFactory igpu_factory_;
+    std::unique_ptr<Compute> igpu_compute_;
+    std::vector<std::byte> igpu_first_, igpu_second_;
     std::size_t capacity_{}, gpu_block_bytes_{}, gpu_device_budget_{};
     detail::CudaFactory cuda_factory_;
     /// 原子量仅统计，不限制 GPU 并发。 / Atomics are statistics only, never GPU concurrency limits.

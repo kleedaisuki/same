@@ -669,6 +669,9 @@ void command_validation(const fs::path& exe) {
                                                                        {"scan", "--unknown"},
                                                                        {"scan", "--sumary"},
                                                                        {"clean", "--cpu"},
+                                                                       {"clean", "--igpu"},
+                                                                       {"scan", "--cpu", "--igpu"},
+                                                                       {"scan", "--cuda", "--igpu"},
                                                                        {"clean", "--no-pgo"},
                                                                        {"new", "--no-pgo"},
                                                                        {"clean", "--no-telemetry"},
@@ -746,8 +749,40 @@ void backends(const fs::path& exe) {
                 {"rehash", "true"}});
     gpu.expect({group({"a", "nested/b", "c", "d"})});
     check(gpu.stats["gpu_workers"] <= 3 && gpu.stats["worker_count"] == 3 &&
-              gpu.stats["cpu_hashes"] + gpu.stats["gpu_hashes"] == 5,
+              gpu.stats["cpu_hashes"] + gpu.stats["gpu_hashes"] + gpu.stats["igpu_hashes"] == 5,
           "auto must retain exactly the configured unified workers and account for real work");
+}
+
+/// 核显命令、实际计数和跨运行缓存；缺设备正常回退，强制本机验证不得跳过。
+/// Exercise iGPU CLI, attribution and cache reuse; required physical-device runs cannot skip.
+void igpu_backend(const fs::path& exe) {
+    Fixture f(exe);
+    f.config({{"workers", "1"},
+              {"block_bytes", "65536"},
+              {"memory_bytes", "67108864"},
+              {"device_memory_bytes", "16777216"},
+              {"gpu_min_bytes", "0"}});
+    const std::string content(1048576 + 17, 'i');
+    f.file("a", content);
+    f.file("b", content);
+    auto changed = content;
+    changed.back() = 'x';
+    f.file("different", changed);
+    const auto expected = Groups{group({"a", "b"})};
+    check(f.run(0, {"scan", "--summary", "--igpu", "--no-telemetry"}) == expected,
+          "iGPU CLI changed duplicate groups");
+    check(f.stats["cpu_hashes"] + f.stats["igpu_hashes"] == 3 && f.stats["gpu_hashes"] == 0,
+          "iGPU CLI backend attribution");
+    const char* required = std::getenv("SAME_REQUIRE_IGPU");
+    if (required && std::string_view(required) == "1")
+        check(f.stats["igpu_hashes"] == 3 && f.stats["cpu_fallbacks"] == 0,
+              "required physical iGPU did not process every file");
+    check(f.run(0, {"scan", "--summary", "--igpu", "--no-telemetry"}) == expected &&
+              f.stats["cached"] == 3 && f.stats["hashed"] == 0,
+          "iGPU cache reuse");
+    check(f.run(0, {"scan", "--summary", "--cpu", "--rehash", "--no-telemetry"}) == expected &&
+              f.stats["cpu_hashes"] == 3 && f.stats["igpu_hashes"] == 0,
+          "CPU override of iGPU path");
 }
 
 /// 大小路由必须保留完整摘要/缓存语义，并能显式禁用。 / Size routing preserves hashes/cache and can
@@ -772,8 +807,9 @@ void size_routing(const fs::path& exe) {
     f.config({{"backend", "\"auto\""}, {"gpu_min_bytes", "4097"}, {"rehash", "true"}});
     f.expect(expected);
     check(f.stats["gpu_workers"] == 0 && f.stats["worker.0.gpu_attempted"] == 0 &&
-              f.stats["worker.1.gpu_attempted"] == 0 && f.stats["cpu_hashes"] == 4,
-          "below-floor payloads must not pay CUDA setup or calibration");
+              f.stats["worker.1.gpu_attempted"] == 0 && f.stats["igpu_attempted"] == 0 &&
+              f.stats["igpu_hashes"] == 0 && f.stats["cpu_hashes"] == 4,
+          "below-floor payloads must not pay device setup or calibration");
     check(read(f.base / "stderr").find("using CPU fallback") == std::string::npos,
           "intentional auto CPU policy must not report unavailable CUDA");
     // 两种大小跨越区间边界；固定一个工作者，使每个区间的第二个任务必定拥有本地 CPU 样本。
@@ -786,17 +822,23 @@ void size_routing(const fs::path& exe) {
               {"memory_bytes", "134217728"},
               {"device_memory_bytes", "134217728"}});
     f.expect(expected);
-    check(f.stats["cpu_hashes"] + f.stats["gpu_hashes"] == 4 && f.stats["cpu_fallbacks"] == 0,
+    check(f.stats["cpu_hashes"] + f.stats["gpu_hashes"] + f.stats["igpu_hashes"] == 4 &&
+              f.stats["cpu_fallbacks"] == 0,
           "adaptive attempts or retry accounting changed");
     if (std::getenv("SAME_REQUIRE_CUDA"))
         check(f.stats["gpu_workers"] == 1 && f.stats["worker_count"] == 1 &&
                   f.stats["gpu_hashes"] >= 1,
               "repeated local-band input did not explore the available worker-local device");
+    const char* igpu_required = std::getenv("SAME_REQUIRE_IGPU");
+    if (igpu_required && std::string_view(igpu_required) == "1")
+        check(f.stats["igpu_hashes"] >= 1 && f.stats["pgo_igpu_samples"] >= 1,
+              "auto route failed to explore and observe available iGPU");
     f.config({{"backend", "\"auto\""}, {"gpu_min_bytes", "0"}});
     f.expect(expected);
     check(f.stats["cached"] == 4 && f.stats["gpu_workers"] == 0 &&
-              f.stats["worker.0.gpu_attempted"] == 0 && f.stats["worker.1.gpu_attempted"] == 0,
-          "cached eligible files initialized CUDA");
+              f.stats["worker.0.gpu_attempted"] == 0 && f.stats["worker.1.gpu_attempted"] == 0 &&
+              f.stats["igpu_attempted"] == 0,
+          "cached eligible files initialized a device");
 }
 
 /// 分析器开关不改变摘要与缓存；禁用后不得产生在线样本。
@@ -815,7 +857,7 @@ void pgo_control(const fs::path& exe) {
           "pretty online summary failed");
     const auto pretty = read(f.base / "stderr");
     check(pretty.find("Online PGO") != std::string::npos &&
-              pretty.find("2 samples (2 CPU | 0 GPU)") != std::string::npos &&
+              pretty.find("2 samples (2 CPU | 0 CUDA | 0 iGPU)") != std::string::npos &&
               pretty.find("Model residual") != std::string::npos &&
               pretty.find("Sample latency") != std::string::npos,
           "pretty summary omitted online profiling evidence");
@@ -1050,6 +1092,7 @@ int main(int argc, char** argv) {
         {"invalid config", invalid_config},
         {"collisions and queue", collisions_and_queue},
         {"backends", backends},
+        {"igpu backend", igpu_backend},
         {"size routing", size_routing},
         {"presentation", presentation},
         {"scan commands", scan_commands},

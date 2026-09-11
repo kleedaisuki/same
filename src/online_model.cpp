@@ -34,33 +34,34 @@ double smooth(double old, double value) noexcept {
     return old * (1.0 - OnlineModel::smoothing_alpha) + value * OnlineModel::smoothing_alpha;
 }
 } // namespace
-OnlineModel::Prediction OnlineModel::predict(bool gpu, std::uint64_t bytes) const noexcept {
+OnlineModel::Prediction OnlineModel::predict(BackendKind backend,
+                                             std::uint64_t bytes) const noexcept {
     if (!bytes)
         return {};
-    const auto& band = bands_[gpu][band_index(bytes)];
+    const auto& band = bands_[static_cast<unsigned>(backend)][band_index(bytes)];
     const double ms = band.cost * static_cast<double>(bytes);
     const double error = band.error * static_cast<double>(bytes);
     if (!band.known || !std::isfinite(ms) || !std::isfinite(error) || ms <= 0)
         return {};
     return {ms, error, band.samples, true};
 }
-bool OnlineModel::seed(bool gpu, std::uint64_t bytes, double service_ms) noexcept {
+bool OnlineModel::seed(BackendKind backend, std::uint64_t bytes, double service_ms) noexcept {
     if (!valid(bytes, service_ms))
         return false;
-    auto& band = bands_[gpu][band_index(bytes)];
+    auto& band = bands_[static_cast<unsigned>(backend)][band_index(bytes)];
     if (band.known)
         return false;
     band.cost = service_ms / static_cast<double>(bytes);
     band.known = true;
     return true;
 }
-bool OnlineModel::observe(bool gpu, std::uint64_t bytes, double service_ms) noexcept {
+bool OnlineModel::observe(BackendKind backend, std::uint64_t bytes, double service_ms) noexcept {
     if (!valid(bytes, service_ms)) {
         increment(totals_.rejected_samples);
         return false;
     }
-    auto& band = bands_[gpu][band_index(bytes)];
-    const auto before = predict(gpu, bytes);
+    auto& band = bands_[static_cast<unsigned>(backend)][band_index(bytes)];
+    const auto before = predict(backend, bytes);
     const double cost = service_ms / static_cast<double>(bytes);
     if (before.known) {
         const double residual = std::abs(service_ms - before.ms);
@@ -74,7 +75,9 @@ bool OnlineModel::observe(bool gpu, std::uint64_t bytes, double service_ms) noex
     band.known = true;
     increment(band.samples);
     increment(totals_.samples);
-    increment(gpu ? totals_.gpu_samples : totals_.cpu_samples);
+    increment(backend == BackendKind::igpu   ? totals_.igpu_samples
+              : backend == BackendKind::cuda ? totals_.gpu_samples
+                                             : totals_.cpu_samples);
     increment(totals_.latency_histogram[histogram_index(service_ms)]);
     return true;
 }
@@ -84,6 +87,8 @@ OnlineModel::Snapshot OnlineModel::snapshot() const noexcept {
         result.cpu_known_bands += band.known;
     for (const auto& band : bands_[1])
         result.gpu_known_bands += band.known;
+    for (const auto& band : bands_[2])
+        result.igpu_known_bands += band.known;
     return result;
 }
 OnlineModel::Parameters OnlineModel::parameters() const noexcept {
@@ -91,8 +96,13 @@ OnlineModel::Parameters OnlineModel::parameters() const noexcept {
     for (unsigned backend = 0; backend < backend_count; ++backend) {
         for (unsigned index = 0; index < band_count; ++index) {
             const auto& band = bands_[backend][index];
-            result[backend * band_count + index] = {band.cost,  band.error, band.samples,
-                                                    band.known, index,      backend != 0};
+            result[backend * band_count + index] = {band.cost,
+                                                    band.error,
+                                                    band.samples,
+                                                    band.known,
+                                                    index,
+                                                    backend == 1,
+                                                    static_cast<BackendKind>(backend)};
         }
     }
     return result;
