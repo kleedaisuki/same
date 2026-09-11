@@ -787,7 +787,7 @@ void igpu_backend(const fs::path& exe) {
     // A fresh workspace needs three tasks in one band to demonstrate three-device exploration.
     Fixture automatic(exe);
     automatic.config({{"backend", "\"auto\""}, {"workers", "1"},
-                      {"gpu_min_bytes", "0"}, {"igpu_bootstrap_ms", "0"},
+                      {"gpu_min_bytes", "0"}, {"igpu_bootstrap_ms", "0"}, {"cuda_bootstrap_ms", "0"},
                       {"memory_bytes", "134217728"},
                       {"device_memory_bytes", "134217728"}});
     automatic.file("a", content);
@@ -831,6 +831,7 @@ void size_routing(const fs::path& exe) {
     // repeat.
     f.config({{"backend", "\"auto\""},
               {"workers", "1"},
+              {"cuda_bootstrap_ms", "0"},
               {"gpu_min_bytes", "0"},
               {"rehash", "true"},
               {"memory_bytes", "134217728"},

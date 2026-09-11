@@ -107,11 +107,14 @@ Config Config::load(const std::filesystem::path& root) {
         target = *value;
     };
     real("igpu_bootstrap_ms", result.igpu_bootstrap_ms);
+    real("cuda_bootstrap_ms", result.cuda_bootstrap_ms);
     real("cold_exploration_fraction", result.cold_exploration_fraction);
     result.validate();
     return result;
 }
 void Config::validate() const {
+    if (!std::isfinite(cuda_bootstrap_ms) || cuda_bootstrap_ms < 0 || cuda_bootstrap_ms > 3600000)
+        throw std::runtime_error("cuda_bootstrap_ms must be finite in [0, 3600000]");
     if (!std::isfinite(igpu_bootstrap_ms) || igpu_bootstrap_ms < 0 || igpu_bootstrap_ms > 3600000)
         throw std::runtime_error("igpu_bootstrap_ms must be finite in [0, 3600000]");
     if (!std::isfinite(cold_exploration_fraction) || cold_exploration_fraction < 0 ||

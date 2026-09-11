@@ -293,7 +293,11 @@ public:
         return cold_credit_ms_.load(std::memory_order_relaxed);
     }
     double cold_spent_ms() const {
-        return cold_spent_ms_;
+        return cold_spent_ms_.load(std::memory_order_relaxed);
+    }
+    /// 自动 CUDA 冷启动延后次数。 / Deferred automatic CUDA cold starts.
+    std::uint64_t cuda_deferred() const {
+        return cuda_deferred_.load(std::memory_order_relaxed);
     }
     std::uint64_t exploration_jobs() const;
     std::pair<std::uint64_t, std::uint64_t> read_bytes() const;
@@ -366,13 +370,19 @@ private:
     bool select_igpu(Worker& worker);
     bool discover_igpu(Worker& worker);
     bool admit_cold_igpu(const Worker& worker) const;
+    bool begin_cold(const Worker& worker, double estimate);
+    void end_cold();
+    std::atomic<bool> cold_start_busy_{false};
+    std::atomic<std::uint64_t> cuda_deferred_{0};
+    double igpu_bootstrap_ms_{}, cuda_bootstrap_ms_{};
     void load_prior(Worker& worker, BackendKind kind, const DeviceProfile& profile,
                     std::size_t block);
     detail::SetupPriorLoader setup_loader_;
     detail::IgpuProbe igpu_probe_;
     DeviceProfile igpu_profile_;
     bool igpu_probed_{}, igpu_present_{true};
-    double igpu_discovery_ms_{}, igpu_setup_estimate_ms_{}, cold_spent_ms_{};
+    double igpu_discovery_ms_{}, igpu_setup_estimate_ms_{};
+    std::atomic<double> cold_spent_ms_{0};
     double cold_exploration_fraction_{}, credit_divisor_{};
     std::uint64_t igpu_deferred_{};
     std::atomic<double> cold_credit_ms_{0};

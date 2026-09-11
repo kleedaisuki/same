@@ -38,6 +38,8 @@ struct Config {
     /// 未知核显冷启动估计（毫秒）；零允许显式实验，不是测量值。
     /// Unknown iGPU cold-start estimate in ms; zero enables experiments, not a measurement.
     double igpu_bootstrap_ms{100.0};
+    /// 自动 CUDA 冷启动潜在成本估计（毫秒）。 / Auto CUDA cold-start potential-cost estimate in ms.
+    double cuda_bootstrap_ms{100.0};
     /// 已完成合格 CPU 工作/线程数中可用于冷探索的比例；不是墙钟保证。
     /// Fraction of completed eligible CPU work/workers for cold exploration, not a wall-time bound.
     double cold_exploration_fraction{0.05};

@@ -36,6 +36,7 @@ private:
 /// 单工作者使路由决策可确定归因。 / One worker allows deterministic decision attribution.
 same::Config config() {
     same::Config c;
+    c.cuda_bootstrap_ms = 0;
     c.backend = "auto";
     c.workers = 1;
     c.block_bytes = 1024;

@@ -3,6 +3,7 @@
  */
 #include "same/resources.hpp"
 #include <atomic>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 namespace {
@@ -50,6 +51,7 @@ private:
 /// 有界共享预算。 / Bounded shared budget.
 same::Config config() {
     same::Config c;
+    c.cuda_bootstrap_ms = 0;
     c.workers = 2;
     c.igpu_bootstrap_ms = 0; // 明确允许快速路由实验。 / Explicit fast-routing experiment.
     c.backend = "igpu";
@@ -217,7 +219,7 @@ void startup_credit() {
     auto c = config();
     c.backend = "auto";
     c.workers = 1;
-    c.igpu_bootstrap_ms = 100;
+    c.igpu_bootstrap_ms = 0;
     c.cold_exploration_fraction = 1;
     unsigned probes = 0, factories = 0;
     same::Resources pool(
@@ -244,9 +246,14 @@ void startup_credit() {
     require(probes == 1 && factories == 0 && pool.cold_credit_ms() == 10 &&
                 pool.igpu_setup_estimate_ms() == 10 && pool.igpu_deferred() > 0,
             "discovery/history/credit accounting wrong");
-    require(submit() == same::BackendKind::igpu, "earned credit never admitted cold exploration");
+    bool admitted = false;
+    for (unsigned i = 0; i < 8 && !admitted; ++i)
+        admitted = submit() == same::BackendKind::igpu;
+    require(admitted, "earned credit never admitted cold exploration");
     pool.wait_idle();
-    require(factories == 1 && pool.igpu_attempted() && pool.cold_spent_ms() == pool.igpu_setup_ms(),
+    require(factories == 1 && pool.igpu_attempted() &&
+                std::abs(pool.cold_spent_ms() - pool.igpu_setup_ms() - pool.igpu_discovery_ms()) <
+                    1e-9,
             "setup not charged exactly once");
 }
 /// 先验劣势避免工厂；单任务净收益足够时无需已完成工作额度。
@@ -255,7 +262,7 @@ void startup_prior(bool profitable) {
     auto c = config();
     c.backend = "auto";
     c.workers = 1;
-    c.igpu_bootstrap_ms = 100;
+    c.igpu_bootstrap_ms = profitable ? 100 : 0;
     unsigned probes = 0, factories = 0;
     same::Resources pool(
         c, {},
@@ -278,11 +285,46 @@ void startup_prior(bool profitable) {
                 pool.cold_credit_ms() == 0,
             "startup prior did not control activation");
 }
+/// 默认短扫描与静态 CPU 选择均不触发发现；CUDA 冷探索也必须有依据。
+/// Default short scans and static CPU routing never discover; cold CUDA needs evidence too.
+void short_scan_discovery(bool pgo) {
+    auto c = config();
+    c.backend = "auto";
+    c.workers = 1;
+    c.pgo = pgo;
+    c.cuda_bootstrap_ms = c.igpu_bootstrap_ms = 100;
+    unsigned probes = 0, factories = 0;
+    same::Resources pool(
+        c,
+        [&](auto, auto) -> std::unique_ptr<same::Compute> {
+            ++factories;
+            return std::make_unique<Device>(same::BackendKind::cuda);
+        },
+        [&](auto, auto) -> std::unique_ptr<same::Compute> {
+            ++factories;
+            return std::make_unique<Device>(same::BackendKind::igpu);
+        },
+        {}, {}, probe(probes));
+    for (unsigned i = 0; i < 6; ++i)
+        require(pool.submit_hash(
+                        [](same::Worker& worker) {
+                            worker.sample = {1024, 1, false, true};
+                            return worker.compute->kind();
+                        },
+                        1024)
+                        .get() == same::BackendKind::cpu,
+                "short scan left CPU");
+    pool.wait_idle();
+    require(probes == 0 && factories == 0 && pool.cold_spent_ms() == 0,
+            "short scan paid discarded discovery or activation");
+}
 /// 三设备各自探索且模型不混合。 / All three devices explored without model aliasing.
 void exploration() {
     auto c = config();
     c.workers = 1;
     c.backend = "auto";
+    c.cold_exploration_fraction =
+        0; // 零估计显式允许无预算校准。 / Zero estimate opts into unfunded calibration.
     same::Resources pool(
         c, [](auto, auto) { return std::make_unique<Device>(same::BackendKind::cuda); },
         [](auto, auto) { return std::make_unique<Device>(same::BackendKind::igpu); });
@@ -301,6 +343,8 @@ void exploration() {
     }
     pool.wait_idle();
     require(seen[0] && seen[1] && seen[2], "auto never evaluated all devices");
+    require(pool.cold_credit_ms() == 0 && pool.cold_spent_ms() > 0,
+            "zero-estimate experiment did not tolerate measured startup debt");
     require(pool.profile_snapshot().igpu_samples > 0, "iGPU sample attributed incorrectly");
 }
 } // namespace
@@ -313,6 +357,8 @@ int main() {
         startup_credit();
         startup_prior(false);
         startup_prior(true);
+        short_scan_discovery(true);
+        short_scan_discovery(false);
         exploration();
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

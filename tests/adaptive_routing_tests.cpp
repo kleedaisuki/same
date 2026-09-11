@@ -37,6 +37,7 @@ private:
 /// 高预算、两个同质工作者。 / Generous budget and two homogeneous workers.
 same::Config config() {
     same::Config c;
+    c.cuda_bootstrap_ms = 0;
     c.backend = "auto";
     c.workers = 2;
     c.queue_capacity = 1;

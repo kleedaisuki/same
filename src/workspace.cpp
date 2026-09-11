@@ -90,6 +90,8 @@ std::string default_config() {
         << "pgo = " << (c.pgo ? "true" : "false")
         << "\n# 未知核显初始化估计（ms），非实测 / Unknown iGPU setup estimate (ms), not measured\n"
         << "igpu_bootstrap_ms = " << c.igpu_bootstrap_ms
+        << "\n# 自动 CUDA 冷启动估计（ms） / Auto CUDA cold-start estimate (ms)\n"
+        << "cuda_bootstrap_ms = " << c.cuda_bootstrap_ms
         << "\n# 冷探索预算：完成 CPU 工作/线程数的比例，非墙钟保证 / CPU work/workers fraction, "
            "not wall-time guarantee\n"
         << "cold_exploration_fraction = " << c.cold_exploration_fraction

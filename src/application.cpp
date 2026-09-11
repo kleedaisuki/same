@@ -856,9 +856,10 @@ void render_pretty_profile(const Counters& counters, const Resources& resources,
                                                              : "not probed") +
                     " | discovery " + human_duration(resources.igpu_discovery_ms()) +
                     " | activation " + human_duration(resources.igpu_setup_ms()));
-    row("iGPU cold budget", "credit " + human_duration(resources.cold_credit_ms()) + " | spent " +
-                                human_duration(resources.cold_spent_ms()) + " | setup estimate " +
-                                human_duration(resources.igpu_setup_estimate_ms()));
+    row("Cold-start budget", "credit " + human_duration(resources.cold_credit_ms()) + " | spent " +
+                                 human_duration(resources.cold_spent_ms()) +
+                                 " | iGPU setup estimate " +
+                                 human_duration(resources.igpu_setup_estimate_ms()));
     row("CPU size route",
         std::to_string(resources.cpu_routed_hashes()) + " hash attempts (policy, not failure)");
     const auto [cpu_attempts, gpu_attempts] = resources.hash_attempts();
@@ -929,7 +930,11 @@ void render_profile(const Counters& counters, const Resources& resources,
             << " igpu_deferred=" << resources.igpu_deferred()
             << " igpu_setup_estimate_ms=" << resources.igpu_setup_estimate_ms()
             << " igpu_cold_credit_ms=" << resources.cold_credit_ms()
-            << " igpu_cold_spent_ms=" << resources.cold_spent_ms() << " ";
+            << " igpu_cold_spent_ms=" << resources.cold_spent_ms()
+            << " cold_start_credit_ms=" << resources.cold_credit_ms()
+            << " cold_start_spent_ms=" << resources.cold_spent_ms()
+            << " cold_start_scope=aggregate_discovery_and_activation"
+            << " cuda_deferred=" << resources.cuda_deferred() << " ";
     profile << "igpu_hashes=" << igpu_attempts << " cpu_hashes=" << cpu_attempts
             << " gpu_hashes=" << gpu_attempts << " gpu_block_bytes=" << resources.gpu_block_bytes()
             << " scheduler=worker-local single_queue=1" << '\n';
@@ -951,6 +956,9 @@ std::string telemetry_config(const Config& config, OutputOptions options) {
     CONFIG_NUMBER(block_bytes);
     CONFIG_NUMBER(memory_bytes);
     CONFIG_NUMBER(device_memory_bytes);
+    CONFIG_NUMBER(igpu_bootstrap_ms);
+    CONFIG_NUMBER(cuda_bootstrap_ms);
+    CONFIG_NUMBER(cold_exploration_fraction);
     CONFIG_NUMBER(queue_capacity);
     CONFIG_NUMBER(rehash);
     CONFIG_NUMBER(pgo);
@@ -968,7 +976,8 @@ std::string telemetry_config(const Config& config, OutputOptions options) {
 /// Preserve raw counter/model state, rather than reparsing a human report.
 /// 保存原始计数和模型状态，不反向解析展示文本；调用者必须已经等待工作线程空闲。
 void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
-                       const Resources* resources, const std::array<double, 5>& phases) {
+                       const Resources* resources, const std::array<double, 5>& phases,
+                       const Config& config) {
     auto metric = [&](std::string name, double value, std::string unit = "count") {
         final.metrics.push_back({std::move(name), value, std::move(unit)});
     };
@@ -1012,6 +1021,11 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
     ROUTING(static_gpu_floor_bytes);
     ROUTING(gpu_block_bytes);
 #undef ROUTING
+    parameter("routing", "igpu_bootstrap_ms", config.igpu_bootstrap_ms);
+    parameter("routing", "cuda_bootstrap_ms", config.cuda_bootstrap_ms);
+    parameter("routing", "cold_exploration_fraction", config.cold_exploration_fraction);
+    parameter("routing", "cold_spent_scope", "aggregate-discovery-and-activation-CUDA-iGPU");
+    parameter("routing", "legacy_igpu_cold_metrics", "aliases-of-aggregate-cold-start-metrics");
     parameter("model", "smoothing_alpha", detail::OnlineModel::smoothing_alpha);
     parameter("model", "band_shift", detail::OnlineModel::band_shift);
     parameter("model", "band_count", detail::OnlineModel::band_count);
@@ -1052,6 +1066,9 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
     metric("igpu_setup_estimate_ms", resources->igpu_setup_estimate_ms(), "ms");
     metric("igpu_cold_credit_ms", resources->cold_credit_ms(), "ms");
     metric("igpu_cold_spent_ms", resources->cold_spent_ms(), "ms");
+    metric("cold_start_credit_ms", resources->cold_credit_ms(), "ms");
+    metric("cold_start_spent_ms", resources->cold_spent_ms(), "ms");
+    metric("cuda_deferred", static_cast<double>(resources->cuda_deferred()));
     parameter("routing", "model_scope", "worker-local-cross-run");
     const auto profile = resources->profile_snapshot();
 #define PROFILE(field, unit) metric("pgo." #field, static_cast<double>(profile.field), unit)
@@ -1411,7 +1428,7 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
         diagnostics << "Model learning warning: " << learning.diagnostic << '\n';
     if (trace) {
         try {
-            capture_telemetry(final, counters, resources.get(), phases);
+            capture_telemetry(final, counters, resources.get(), phases, config);
             final.parameters.push_back({"model", "run_decay", std::to_string(learning_decay)});
             final.parameters.push_back({"model", "database", ".same/model.db"});
             final.parameters.push_back(

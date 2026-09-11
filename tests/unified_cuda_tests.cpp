@@ -32,6 +32,7 @@ same::Digest digest(same::Compute& compute, std::span<std::byte> buffer, unsigne
 int main() {
     try {
         same::Config config;
+        config.cuda_bootstrap_ms = 0;
         config.workers = 2;
         config.queue_capacity = 2;
         config.memory_bytes = config.device_memory_bytes = 128ULL * 1024 * 1024;

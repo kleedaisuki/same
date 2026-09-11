@@ -188,6 +188,7 @@ void routed_file_hash(bool inject_failure, bool profiling = true) {
     const auto expected = reference->finish();
     same::FileRecord record{"file", same::stamp_path(fixture.root / "file"), {}};
     same::Config cfg;
+    cfg.cuda_bootstrap_ms = 0;
     cfg.backend = profiling ? "auto" : "cuda";
     cfg.workers = 1;
     cfg.queue_capacity = 8;
