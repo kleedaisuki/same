@@ -109,3 +109,8 @@ CUDA toolchain fallback does not disable OpenCL. Host builds and runtime availab
 Test-only requirement switches distinguish physical-device validation from PoCL kernel semantics. Workflow configuration is not proof that a particular run passed.
 
 运行与持久化学习见 [上下文学习](contextual-learning.md)。 / See the contextual-learning contract for runtime behavior.
+
+### 核显冷启动设置 / iGPU cold-start settings
+
+`igpu_bootstrap_ms=100.0` 和 `cold_exploration_fraction=0.05` 是运行时配置，不是 CMake 选项。前者为缺少历史时的初始化成本估计，后者为自动 PGO 的本轮探索信用比例。设备探测与内核激活分离；构建启用 OpenCL 不表示每次扫描都会编译内核。`--igpu` 可明确请求激活并绕过自动冷启动门槛。见 [冷启动准入契约](contextual-learning.md#冷启动准入--cold-start-admission)。
+These are runtime settings, not CMake options. Optional OpenCL support does not imply kernel activation on every scan; forced iGPU bypasses the automatic cold gate.
