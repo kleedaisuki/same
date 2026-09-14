@@ -17,6 +17,12 @@
 namespace same {
 namespace detail {
 /// 可注入设备创建器；返回空表示不可用。 / Injectable device factory; null means unavailable.
+/// 冷启动历史估计；零表示未知。 / Historical cold-start estimate; zero means unknown.
+using SetupPriorLoader = std::function<double(BackendKind, const DeviceProfile&)>;
+/// 轻量设备探测，不得创建上下文。 / Lightweight probe must not create a context.
+using IgpuProbe = std::function<std::optional<DeviceProfile>(std::size_t, std::size_t)>;
+using ModelPriorLoader = std::function<OnlineModel::State(BackendKind, const DeviceProfile&)>;
+/// 可注入设备创建器。 / Injectable device factory.
 using CudaFactory = std::function<std::unique_ptr<Compute>(std::size_t, std::size_t)>;
 /// 路由参数的唯一来源，运行记录直接引用。 / Single source for routing policy and run snapshots.
 struct RoutingParameters {
@@ -54,6 +60,18 @@ struct Worker {
     /// 仅所属线程预测和观测，不加锁。 / Owner-thread-only prediction and observation, without
     /// locks.
     detail::OnlineModel model;
+    /// 冻结上下文保证预测与训练使用同一特征。 / Freeze features shared by prediction and training.
+    detail::OnlineModel::Context decision_context{};
+    detail::OnlineModel::Prediction decision_prediction{};
+    BackendKind decision_backend{BackendKind::cpu};
+    std::array<DeviceProfile, 3> devices{};
+    std::array<bool, 3> prior_loaded{};
+    /// 每后端固定/模型/探索选择次数，以及候选不可用次数。
+    /// Per-backend fixed/model/exploration decisions and unavailable exclusions.
+    std::array<std::array<std::uint64_t, 3>, 3> decisions{};
+    std::array<std::uint64_t, 3> excluded{};
+    bool decision_active{}, gpu_counted{};
+    std::array<detail::OnlineModel::Context, 3> candidate_contexts{};
     /// 成功任务的已有计时；所属线程在回调后消费。 / Existing successful-task timing consumed after
     /// callback.
     struct Sample {
@@ -62,8 +80,12 @@ struct Worker {
         double service_ms{};
         /// 实际后端与完整成功标记。 / Actual backend and complete-success marker.
         bool gpu{}, valid{};
+        /// 三设备归属。 / Three-device attribution.
+        BackendKind backend{BackendKind::cpu};
     } sample;
     /// 本地采样开关和小任务序号。 / Local sampling switch and small-task sequence.
+    /// 当前任务持有池级 iGPU 准入。 / Task owns pool-wide iGPU admission.
+    bool igpu_selected{}, igpu_retired{};
     bool profile_enabled{};
     std::uint64_t profile_sequence{};
     /// 冻结的文件资格、实际缓冲和显存配额。 / Frozen file floor, buffer sizes and device quota.
@@ -83,6 +105,7 @@ struct Worker {
     std::atomic<std::size_t>* fallbacks{};
     /// 本地实际尝试、读取、降级和初始化失败。 / Local attempts, read bytes, fallbacks and setup
     /// failures.
+    std::uint64_t igpu_hashes{}, igpu_hash_bytes{}, igpu_busy{}, igpu_selections{};
     std::uint64_t cpu_hashes{}, gpu_hashes{}, cpu_routed_hashes{}, hash_bytes{}, compare_bytes{};
     std::uint64_t cpu_hash_bytes{}, gpu_hash_bytes{}, fallback_count{}, gpu_init_failures{};
     /// 本地选择原因，探索单列。 / Local selection reasons with separate exploration count.
@@ -95,7 +118,7 @@ struct Worker {
     /// 本地有界探索；不同工作线程不消费彼此的机会。 / Local bounded exploration; workers never
     /// consume peers' opportunities.
     std::array<std::uint64_t, 32> arrivals{};
-    std::array<unsigned char, 32> initial_cpu{}, initial_gpu{};
+    std::array<unsigned char, 32> initial_cpu{}, initial_gpu{}, initial_igpu{};
     /// GPU 争用仅作观测，不是并发闸门。 / GPU contention observations, never a concurrency gate.
     std::size_t gpu_inflight_at_selection{}, gpu_peak_concurrency{};
     std::uint64_t contended_samples{};
@@ -116,8 +139,12 @@ struct Worker {
             return operation();
         } catch (const ComputeError&) {
             compute = make_cpu_compute();
-            gpu_retired = true;
-            gpu_enabled = false;
+            if (igpu_selected)
+                igpu_retired = true;
+            else {
+                gpu_retired = true;
+                gpu_enabled = false;
+            }
             ++fallback_count;
             if (fallbacks)
                 ++*fallbacks;
@@ -134,11 +161,20 @@ struct WorkerProfile {
     std::size_t index{};
     detail::OnlineModel::Snapshot snapshot;
     detail::OnlineModel::Parameters parameters;
+    /// 本轮增量不包含共享先验。 / Run delta excludes the shared prior.
+    detail::OnlineModel::State prior{}, delta{};
+    std::array<DeviceProfile, 3> devices{};
+    detail::OnlineModel::Context decision_context{};
+    detail::OnlineModel::Prediction decision_prediction{};
+    BackendKind decision_backend{BackendKind::cpu};
+    std::array<std::array<std::uint64_t, 3>, 3> decisions{};
+    std::array<std::uint64_t, 3> excluded{};
     /// 固定资源配额与惰性初始化状态。 / Fixed resource quotas and lazy initialization state.
     std::size_t cpu_block_bytes{}, gpu_block_bytes{}, device_budget_bytes{};
     double setup_ms{};
     bool gpu_attempted{}, gpu_enabled{};
     /// 实际工作及错误计数。 / Actual work and failure counters.
+    std::uint64_t igpu_hashes{}, igpu_hash_bytes{}, igpu_busy{}, igpu_selections{};
     std::uint64_t cpu_hashes{}, gpu_hashes{}, cpu_routed_hashes{}, hash_bytes{}, compare_bytes{};
     std::uint64_t cpu_hash_bytes{}, gpu_hash_bytes{}, fallbacks{}, gpu_init_failures{};
     /// 后端选择原因。 / Backend selection reasons.
@@ -173,6 +209,14 @@ public:
     /// 注入工厂可能被多个所属线程并发调用，必须线程安全。
     /// Injected factories may be invoked concurrently by owners and must be thread-safe.
     Resources(const Config& config, detail::CudaFactory factory);
+    /// 独立注入两设备工厂。 / Independently inject both device factories.
+    Resources(const Config& config, detail::CudaFactory cuda, detail::CudaFactory igpu,
+              detail::ModelPriorLoader prior = {}, detail::SetupPriorLoader setup = {},
+              detail::IgpuProbe probe = {});
+    /// 只读先验查询在初始化时执行，必须线程安全且不得访问 SQL。
+    /// Read-only prior lookup runs at initialization; thread-safe and SQL-free.
+    Resources(const Config& config, detail::ModelPriorLoader prior,
+              detail::SetupPriorLoader setup = {});
     /// 排空已接收任务并在所属线程销毁设备。 / Drain admitted tasks and destroy devices on owner
     /// threads.
     ~Resources();
@@ -215,6 +259,46 @@ public:
     }
     /// 以下统计只能在 wait_idle 后读取。 / The following statistics require wait_idle.
     bool gpu_service_enabled() const;
+    /// 空闲后读取独立核显状态。 / Read independent iGPU state after idle.
+    bool igpu_service_enabled() const {
+        return igpu_attempted_ && !igpu_retired_ && igpu_compute_ != nullptr;
+    }
+    /// 空闲后合计实际核显尝试。 / Sum actual iGPU attempts after idle.
+    std::uint64_t igpu_hash_attempts() const;
+    /// 核显生命周期诊断，空闲后读取。 / iGPU lifecycle diagnostics, read after idle.
+    bool igpu_attempted() const {
+        return igpu_attempted_;
+    }
+    bool igpu_retired() const {
+        return igpu_retired_;
+    }
+    double igpu_setup_ms() const {
+        return igpu_setup_ms_;
+    }
+    /// 以下冷启动统计在 idle 后读取，时间单位毫秒。 / Cold-start idle-time statistics in
+    /// milliseconds.
+    const DeviceProfile& igpu_profile() const {
+        return igpu_profile_;
+    }
+    double igpu_discovery_ms() const {
+        return igpu_discovery_ms_;
+    }
+    double igpu_setup_estimate_ms() const {
+        return igpu_setup_estimate_ms_;
+    }
+    std::uint64_t igpu_deferred() const {
+        return igpu_deferred_;
+    }
+    double cold_credit_ms() const {
+        return cold_credit_ms_.load(std::memory_order_relaxed);
+    }
+    double cold_spent_ms() const {
+        return cold_spent_ms_.load(std::memory_order_relaxed);
+    }
+    /// 自动 CUDA 冷启动延后次数。 / Deferred automatic CUDA cold starts.
+    std::uint64_t cuda_deferred() const {
+        return cuda_deferred_.load(std::memory_order_relaxed);
+    }
     std::uint64_t exploration_jobs() const;
     std::pair<std::uint64_t, std::uint64_t> read_bytes() const;
     std::pair<std::uint64_t, std::uint64_t> hash_attempts() const;
@@ -262,7 +346,15 @@ private:
     void close();
     /// 本地成本与有界探索，不读取时钟或其他模型。 / Local costs and bounded exploration; no clock
     /// or peer model reads.
-    std::pair<bool, Reason> choose_backend(Worker& worker, std::uint64_t bytes, bool hash);
+    std::pair<BackendKind, Reason> choose_backend(Worker& worker, std::uint64_t bytes, bool hash,
+                                                  const std::array<bool, 3>& candidates);
+    /// 取得配置与实际容量组成的上下文，不查询驱动。 / Context from config/cached capacity, no
+    /// driver query.
+    detail::OnlineModel::Context context(const Worker& worker, BackendKind kind,
+                                         std::uint64_t bytes) const;
+    /// 初始化时只加载对应设备的先验。 / Load only this device prior at initialization.
+    void load_prior(Worker& worker, BackendKind kind, const Compute& compute, std::size_t block);
+    bool activate_cuda(Worker& worker);
     /// 捕获初始化异常但不跳过用户回调。 / Capture setup exceptions without skipping the callback.
     void select_backend(Worker& worker, std::uint64_t bytes, bool hash) noexcept;
     /// 所属线程首次初始化并验证，失败不重新探测。 / Owner-thread one-time
@@ -272,7 +364,39 @@ private:
     /// contexts.
     void finish_task(Worker& worker);
     /// 固定配置及集中预算。 / Frozen configuration and centralized budgets.
-    bool pgo_{}, auto_mode_{}, forced_gpu_{};
+    bool pgo_{}, auto_mode_{}, forced_gpu_{}, forced_igpu_{};
+    /// 单上下文、统一内存配额；原子准入失败立即继续其他后端。
+    /// One context and unified-memory quota; failed atomic admission never waits.
+    bool select_igpu(Worker& worker);
+    bool discover_igpu(Worker& worker);
+    bool admit_cold_igpu(const Worker& worker) const;
+    bool begin_cold(const Worker& worker, double estimate);
+    void end_cold();
+    std::atomic<bool> cold_start_busy_{false};
+    std::atomic<std::uint64_t> cuda_deferred_{0};
+    double igpu_bootstrap_ms_{}, cuda_bootstrap_ms_{};
+    void load_prior(Worker& worker, BackendKind kind, const DeviceProfile& profile,
+                    std::size_t block);
+    detail::SetupPriorLoader setup_loader_;
+    detail::IgpuProbe igpu_probe_;
+    DeviceProfile igpu_profile_;
+    bool igpu_probed_{}, igpu_present_{true};
+    double igpu_discovery_ms_{}, igpu_setup_estimate_ms_{};
+    std::atomic<double> cold_spent_ms_{0};
+    double cold_exploration_fraction_{}, credit_divisor_{};
+    std::uint64_t igpu_deferred_{};
+    std::atomic<double> cold_credit_ms_{0};
+    detail::ModelPriorLoader prior_loader_;
+    /// 实际执行中的后端数量，用于上下文，不是线程调度锁。
+    /// Active backends inform context; these counters are not scheduling locks.
+    std::array<std::atomic<std::size_t>, 3> backend_active_{};
+    std::atomic<bool> igpu_busy_{false};
+    bool igpu_attempted_{}, igpu_retired_{};
+    double igpu_setup_ms_{};
+    std::size_t igpu_block_bytes_{}, igpu_budget_{};
+    detail::CudaFactory igpu_factory_;
+    std::unique_ptr<Compute> igpu_compute_;
+    std::vector<std::byte> igpu_first_, igpu_second_;
     std::size_t capacity_{}, gpu_block_bytes_{}, gpu_device_budget_{};
     detail::CudaFactory cuda_factory_;
     /// 原子量仅统计，不限制 GPU 并发。 / Atomics are statistics only, never GPU concurrency limits.

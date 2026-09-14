@@ -1,0 +1,22 @@
+{"size": 2048, "pattern": "zero", "verified": true}
+{"size": 2048, "pattern": "ff", "verified": true}
+{"size": 2048, "pattern": "random", "verified": true}
+{"size": 4096, "pattern": "zero", "verified": true}
+{"size": 4096, "pattern": "ff", "verified": true}
+{"size": 4096, "pattern": "random", "verified": true}
+{"size": 8192, "pattern": "zero", "verified": true}
+{"size": 8192, "pattern": "ff", "verified": true}
+{"size": 8192, "pattern": "random", "verified": true}
+{"size": 65536, "pattern": "zero", "verified": true}
+{"size": 65536, "pattern": "ff", "verified": true}
+{"size": 65536, "pattern": "random", "verified": true}
+{"size": 1048576, "pattern": "zero", "verified": true}
+{"size": 1048576, "pattern": "ff", "verified": true}
+{"size": 1048576, "pattern": "random", "verified": true}
+{"size": 16777216, "pattern": "zero", "verified": true}
+{"size": 16777216, "pattern": "ff", "verified": true}
+{"size": 16777216, "pattern": "random", "verified": true}
+{"size": 67108864, "pattern": "zero", "verified": true}
+{"size": 67108864, "pattern": "ff", "verified": true}
+{"size": 67108864, "pattern": "random", "verified": true}
+{"checks": 21, "device": "Intel(R) Iris(R) Xe Graphics"}

@@ -83,17 +83,19 @@ void drift() {
 /// Export preserves unknown state, raw coefficients and backend isolation without mutation.
 void parameter_export() {
     using Model = same::detail::OnlineModel;
-    static_assert(Model::band_count == 32 && Model::backend_count == 2);
+    static_assert(Model::band_count == 32 && Model::backend_count == 3);
     static_assert(Model::band_shift == 2 && Model::smoothing_alpha == 0.125);
     Model model;
     const auto empty = model.parameters();
-    require(empty.size() == 64, "parameter export is not bounded to 64 bands");
+    require(empty.size() == 96, "parameter export is not bounded to three backend bands");
     for (unsigned i = 0; i < empty.size(); ++i) {
         const auto& band = empty[i];
         require(!band.known && !band.samples && band.cost_ms_per_byte == 0 &&
                     band.error_ms_per_byte == 0,
                 "unknown export fabricated evidence");
-        require(band.band_index == i % Model::band_count && band.gpu == (i >= Model::band_count),
+        require(band.band_index == i % Model::band_count &&
+                    band.gpu == (i / Model::band_count == 1) &&
+                    band.backend == static_cast<same::BackendKind>(i / Model::band_count),
                 "export band identity wrong");
     }
     require(model.observe(false, 1024, 8), "first sample rejected");
@@ -107,7 +109,7 @@ void parameter_export() {
             "trained coefficients changed during export");
     require(!exported[4].known && !exported[6].known && !exported[Model::band_count + 5].known,
             "export leaked evidence across bands or backends");
-    const auto& maximum = exported.back();
+    const auto& maximum = exported[2 * Model::band_count - 1];
     require(maximum.gpu && maximum.band_index == 31 && maximum.known && maximum.samples == 0,
             "maximum band or seed identity lost");
     require(before.ms == cpu.cost_ms_per_byte * 3072 &&
@@ -121,6 +123,20 @@ void parameter_export() {
     require(empty[5].known == false && model.snapshot().samples == 2,
             "old snapshot mutated or export added samples");
 }
+
+/// 核显观测不污染 CPU/CUDA 槽及旧 GPU 统计。 / iGPU observations never alias CPU/CUDA slots.
+void integrated_identity() {
+    same::detail::OnlineModel model;
+    require(model.observe(same::BackendKind::igpu, 4096, 3), "iGPU observation rejected");
+    require(model.predict(same::BackendKind::igpu, 4096).known &&
+                !model.predict(same::BackendKind::cpu, 4096).known &&
+                !model.predict(same::BackendKind::cuda, 4096).known,
+            "iGPU model leaked across devices");
+    const auto stats = model.snapshot();
+    require(stats.samples == 1 && stats.igpu_samples == 1 && stats.cpu_samples == 0 &&
+                stats.gpu_samples == 0 && stats.igpu_known_bands == 1,
+            "iGPU model counters incorrect");
+}
 } // namespace
 int main() {
     try {
@@ -128,6 +144,7 @@ int main() {
         invalid_and_histograms();
         drift();
         parameter_export();
+        integrated_identity();
         std::cout << "online model tests passed\n";
         return 0;
     } catch (const std::exception& error) {

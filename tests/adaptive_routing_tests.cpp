@@ -37,6 +37,7 @@ private:
 /// 高预算、两个同质工作者。 / Generous budget and two homogeneous workers.
 same::Config config() {
     same::Config c;
+    c.cuda_bootstrap_ms = 0;
     c.backend = "auto";
     c.workers = 2;
     c.queue_capacity = 1;
@@ -167,13 +168,25 @@ void cold_bootstrap() {
     std::promise<void> factory_started, release_factory;
     auto factory_gate = release_factory.get_future().share();
     std::atomic<unsigned> calls{};
-    same::Resources pool(c, [&](std::size_t, std::size_t) {
-        if (calls.fetch_add(1) == 0) {
-            factory_started.set_value();
-            factory_gate.wait();
-        }
-        return std::make_unique<Device>();
-    });
+    same::Resources pool(
+        c,
+        [&](std::size_t, std::size_t) {
+            if (calls.fetch_add(1) == 0) {
+                factory_started.set_value();
+                factory_gate.wait();
+            }
+            return std::make_unique<Device>();
+        },
+        {},
+        [](same::BackendKind kind, const same::DeviceProfile& profile) {
+            // 并发契约独立于探索顺序；使用覆盖零/一个竞争者的确定性先验。
+            // Concurrency contract is independent of exploration order; cover zero/one peer.
+            same::detail::OnlineModel prior;
+            for (double peers : {0.0, 1.0})
+                prior.observe(kind, {128ULL * 1024 * 1024, profile.effective_batch_bytes, peers},
+                              kind == same::BackendKind::cpu ? 100 : 1);
+            return prior.delta();
+        });
     auto first = pool.submit_hash([](same::Worker& w) { return w.index; }, 128ULL * 1024 * 1024);
     const bool initializing =
         factory_started.get_future().wait_for(5s) == std::future_status::ready;

@@ -1,6 +1,7 @@
 #include "same/application.hpp"
 #include "same/detail/completion_jobs.hpp"
 #include "same/files.hpp"
+#include "same/model_store.hpp"
 #include "same/resources.hpp"
 #include "same/run_lock.hpp"
 #include "same/store.hpp"
@@ -9,11 +10,15 @@
 #include "same/walk.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <deque>
 #include <future>
 #include <iomanip>
+#include <limits>
 #include <locale>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <ostream>
@@ -77,9 +82,12 @@ FileRecord hash_file(const fs::path& root, FileRecord record, Worker& worker,
     // 资源工作线程已选择独有后端及匹配缓冲，应用层不二次路由。
     // The worker has selected its private backend and matching buffer; do not reroute here.
     auto& selected = worker.compute;
-    const bool gpu = selected->name() == "cuda";
+    const bool gpu = selected->kind() == BackendKind::cuda;
+    const bool igpu = selected->kind() == BackendKind::igpu;
     if (gpu)
         ++worker.gpu_hashes;
+    else if (igpu)
+        ++worker.igpu_hashes;
     else
         ++worker.cpu_hashes;
     auto hasher = selected->hasher();
@@ -89,6 +97,8 @@ FileRecord hash_file(const fs::path& root, FileRecord record, Worker& worker,
         worker.hash_bytes += count;
         if (gpu)
             worker.gpu_hash_bytes += count;
+        else if (igpu)
+            worker.igpu_hash_bytes += count;
         else
             worker.cpu_hash_bytes += count;
         if (!count)
@@ -162,6 +172,153 @@ void prepare_state(const fs::path& root) {
             throw std::runtime_error("state path must be a regular non-link file: " +
                                      path_key(path));
     }
+}
+/// 运行边界遗忘，不随工作线程数变化。 / Run-boundary forgetting, independent of worker count.
+constexpr double learning_decay = 0.9;
+/// 长度前缀消除字段拼接歧义，超长身份拒绝学习而不截断碰撞。
+/// Length prefixes avoid ambiguous identities; reject oversize keys rather than truncate.
+std::string learning_key(const Config& config, const DeviceProfile& cpu, BackendKind backend,
+                         const DeviceProfile& device) {
+    std::string key;
+    auto add = [&](std::string_view value) {
+        if (value.size() > 4096 || key.size() + value.size() + 24 > 4096)
+            throw std::runtime_error("model identity exceeds 4096 bytes");
+        key += std::to_string(value.size()) + ":";
+        key += value;
+    };
+    auto number = [&](auto value) { add(std::to_string(value)); };
+    auto profile = [&](const DeviceProfile& value) {
+        add(value.device_name);
+        add(value.vendor);
+        add(value.driver_version);
+        add(value.implementation_version);
+        add(value.architecture);
+        number(value.compute_units);
+        number(value.hardware_threads);
+        number(value.global_memory_bytes);
+        number(value.max_allocation_bytes);
+        number(value.effective_batch_bytes);
+        number(value.unified_memory);
+    };
+    add("same-learning-key-v1");
+    number(detail::OnlineModel::feature_version);
+    number(detail::OnlineModel::feature_count);
+    add(backend_name(backend));
+    profile(cpu);
+    profile(device);
+    // 总工作线程数保守隔离未建模的共享存储和 CPU 压力。
+    // Worker count conservatively isolates unmodeled shared storage and CPU pressure.
+    number(config.workers);
+    return key;
+}
+/// 学习诊断：回调仅原子计数，数据库只在主线程打开和保存。
+/// Learning diagnostics: callbacks only count atomically; database open/save stays on main thread.
+struct Learning {
+    /// 主线程数据库与不可变主机身份。 / Main-thread store and immutable host identity.
+    std::unique_ptr<ModelStore> store;
+    DeviceProfile cpu;
+    /// 初始化回调计数，不在每任务热路径更新。 / Initialization counters, not per-task hot-path
+    /// updates.
+    std::atomic<std::uint64_t> loads{}, hits{}, invalid{}, setup_loads{}, setup_hits{};
+    /// 空闲收尾结果与冷路径时间。 / Idle-finalization results and cold-path timings.
+    std::uint64_t saved{}, save_errors{}, setup_saved{};
+    double startup_ms{}, save_ms{};
+    /// 可见存储故障，不改变摘要或分组。 / Visible storage failures never change hashes or groups.
+    std::string diagnostic;
+    /// 持久化安全禁用原因；不关闭线程内学习。 / Persistence safety reason; in-run learning remains
+    /// active.
+    std::string disabled_reason;
+    /// 空闲保存的逐设备历史，供最终遥测导出。 / Per-device saved histories for final telemetry
+    /// export.
+    std::map<std::string, SetupHistory> setup_snapshots;
+};
+/// 每个真实初始化形成一个观测，键相同的历史只加载一次。
+/// Each actual initialization adds one observation; load a keyed history only once.
+void add_setup_history(std::map<std::string, SetupHistory>& histories, Learning& learning,
+                       const Config& config, BackendKind backend, const DeviceProfile& device,
+                       double milliseconds) {
+    if (!std::isfinite(milliseconds) || milliseconds <= 0 || milliseconds > 1e9)
+        return;
+    const auto key = learning_key(config, learning.cpu, backend, device);
+    auto [entry, inserted] = histories.try_emplace(key);
+    if (inserted)
+        entry->second = learning.store->load_setup(key).value_or(SetupHistory{});
+    auto& history = entry->second;
+    if (history.samples == std::numeric_limits<std::uint64_t>::max())
+        return;
+    ++history.samples;
+    history.last_ms = milliseconds;
+    history.mean_ms += (milliseconds - history.mean_ms) / static_cast<double>(history.samples);
+    history.max_ms = std::max(history.max_ms, milliseconds);
+}
+/// 相同键只合并一次先验，再添加每线程本轮增量；失败扫描不调用。
+/// Merge each keyed prior once, then per-worker run deltas; never called for failed scans.
+void save_learning(Learning& learning, const Config& config, const Resources& resources) {
+    if (!learning.store)
+        return;
+    const auto start = Clock::now();
+    try {
+        std::map<std::string, detail::OnlineModel::State> merged;
+        std::map<std::string, SetupHistory> setups;
+        for (const auto& worker : resources.worker_profiles()) {
+            if (worker.gpu_enabled)
+                add_setup_history(setups, learning, config, BackendKind::cuda, worker.devices[1],
+                                  worker.setup_ms);
+            for (unsigned i = 0; i < 3; ++i) {
+                if (!worker.delta[i].samples)
+                    continue;
+                const auto key = learning_key(config, learning.cpu, static_cast<BackendKind>(i),
+                                              worker.devices[i]);
+                detail::OnlineModel::State prior{}, delta{};
+                prior[i] = worker.prior[i];
+                delta[i] = worker.delta[i];
+                auto entry = merged.try_emplace(key, prior).first;
+                if (!detail::OnlineModel::merge(entry->second, delta))
+                    throw std::runtime_error("model aggregate rejected");
+            }
+        }
+        if (resources.igpu_attempted())
+            add_setup_history(setups, learning, config, BackendKind::igpu, resources.igpu_profile(),
+                              resources.igpu_setup_ms());
+        for (const auto& [key, history] : setups) {
+            if (learning.store->save_setup(key, history)) {
+                ++learning.setup_saved;
+                learning.setup_snapshots.emplace(key, history);
+            } else {
+                ++learning.save_errors;
+                learning.diagnostic = learning.store->diagnostic();
+            }
+        }
+        for (const auto& [key, state] : merged) {
+            if (learning.store->save(key, state))
+                ++learning.saved;
+            else {
+                ++learning.save_errors;
+                learning.diagnostic = learning.store->diagnostic();
+            }
+        }
+    } catch (const std::exception& error) {
+        ++learning.save_errors;
+        learning.diagnostic = error.what();
+    }
+    learning.save_ms = milliseconds(start, Clock::now());
+}
+/// 独立于遥测开关报告学习健康。 / Report learning health independently of telemetry.
+void render_learning(const Learning& learning, bool enabled, std::ostream& out) {
+    out << "model_learning_enabled=" << enabled
+        << " model_persistence_enabled=" << bool(learning.store)
+        << " model_persistence_disabled_reason="
+        << (learning.disabled_reason.empty() ? "none" : learning.disabled_reason)
+        << " model_db=.same/model.db"
+        << " model_load_attempts=" << learning.loads.load()
+        << " model_prior_hits=" << learning.hits.load()
+        << " model_invalid=" << learning.invalid.load() << " model_saved_keys=" << learning.saved
+        << " model_save_errors=" << learning.save_errors
+        << " model_startup_ms=" << learning.startup_ms << " model_save_ms=" << learning.save_ms
+        << " model_setup_load_attempts=" << learning.setup_loads.load()
+        << " model_setup_prior_hits=" << learning.setup_hits.load()
+        << " model_setup_saved_keys=" << learning.setup_saved
+        << " model_run_decay=" << learning_decay << '\n';
 }
 /// Main-thread-only diagnostic totals. 仅由主线程维护的诊断统计。
 struct Counters {
@@ -250,6 +407,7 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
                                   (detail::RoutingParameters::small_sample_period - 1)) == 0);
             const auto cpu_before = worker.cpu_hashes;
             const auto gpu_before = worker.gpu_hashes;
+            const auto igpu_before = worker.igpu_hashes;
             const auto start = Clock::now();
             // 固定事件只复用已有采样和时钟；不进入调度器锁，不读取文件内容。
             // Fixed events reuse sampling and clocks; no scheduler lock or file contents.
@@ -258,14 +416,18 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
                     return;
                 const auto gpu_attempts = worker.gpu_hashes - gpu_before;
                 const auto cpu_attempts = worker.cpu_hashes - cpu_before;
-                const bool retry = gpu_attempts + cpu_attempts > 1;
+                const auto igpu_attempts = worker.igpu_hashes - igpu_before;
+                const bool retry = gpu_attempts + cpu_attempts + igpu_attempts > 1;
                 if (!sample && !retry && success)
                     return;
                 telemetry::Event event;
                 event.type = sample ? "span" : "log";
                 event.name = sample ? "hash" : (success ? "hash.fallback" : "hash.error");
                 event.severity = success ? (retry ? "warn" : "info") : "error";
-                event.backend = retry ? "gpu+cpu" : (gpu_attempts ? "gpu" : "cpu");
+                event.backend = retry ? (igpu_attempts ? "igpu+cpu" : "gpu+cpu")
+                                      : (igpu_attempts  ? "igpu"
+                                         : gpu_attempts ? "gpu"
+                                                        : "cpu");
                 event.message = record.path;
                 event.span_id = span_id;
                 event.parent_span_id = 3;
@@ -299,8 +461,11 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
             report(ended, true);
             // 复用已有计时；仅完整成功且没有重试的实际后端样本进入模型。
             // Reuse existing timing; only successful single-attempt samples train the model.
-            if (sample && worker.cpu_hashes - cpu_before + worker.gpu_hashes - gpu_before == 1)
-                worker.sample = {hashed.stamp.size, elapsed, worker.gpu_hashes != gpu_before, true};
+            if (sample && worker.cpu_hashes - cpu_before + worker.gpu_hashes - gpu_before +
+                                  worker.igpu_hashes - igpu_before ==
+                              1)
+                worker.sample = {hashed.stamp.size, elapsed, worker.gpu_hashes != gpu_before, true,
+                                 worker.compute->kind()};
             return HashResult{std::move(hashed), elapsed};
         };
         // 统一队列只携带载荷；工作线程在锁外选择并学习自己的后端。
@@ -520,22 +685,31 @@ void render_online_profile(const Resources& resources, std::ostream& out, bool p
     if (pretty) {
         out << "  Online PGO      " << (enabled ? "enabled" : "disabled") << " | "
             << profile.samples << " samples (" << profile.cpu_samples << " CPU | "
-            << profile.gpu_samples << " GPU) | " << resources.exploration_jobs()
-            << " exploration jobs\n"
+            << profile.gpu_samples << " CUDA | " << profile.igpu_samples << " iGPU) | "
+            << resources.exploration_jobs() << " exploration jobs\n"
             << "  Model coverage  " << profile.cpu_known_bands << " CPU | "
-            << profile.gpu_known_bands << " GPU observed worker-band pairs\n"
+            << profile.gpu_known_bands << " CUDA | " << profile.igpu_known_bands
+            << " iGPU observed worker-band pairs (run-only diagnostics)\n"
             << "  Model residual  " << profile.predicted_samples
             << " predictions checked | p95 residual " << residual95 << " us\n"
+            << "  Prediction error  |sum| " << profile.absolute_error_sum_ms << " ms | squared sum "
+            << profile.squared_error_sum_ms2 << " ms2\n"
+            << "  Learning scope  decayed cross-run prior + thread-local run delta\n"
             << "  Sample latency  p50 " << p50 << " us | p95 " << p95
             << " us (bucket ranges; service incl. I/O)\n";
         return;
     }
     out << "pgo_enabled=" << enabled << " pgo_samples=" << profile.samples
         << " pgo_exploration_jobs=" << resources.exploration_jobs()
+        << " pgo_igpu_samples=" << profile.igpu_samples
         << " pgo_cpu_samples=" << profile.cpu_samples << " pgo_gpu_samples=" << profile.gpu_samples
         << " pgo_cpu_known_bands=" << profile.cpu_known_bands
         << " pgo_gpu_known_bands=" << profile.gpu_known_bands
         << " pgo_rejected_samples=" << profile.rejected_samples
+        << " pgo_absolute_error_sum_ms=" << profile.absolute_error_sum_ms
+        << " pgo_squared_error_sum_ms2=" << profile.squared_error_sum_ms2
+        << " pgo_out_of_domain_samples=" << profile.out_of_domain_samples
+        << " pgo_numerical_rejections=" << profile.numerical_rejections
         << " pgo_predicted_samples=" << profile.predicted_samples
         << " pgo_residual_p95_bucket_us=" << residual95 << " pgo_latency_p50_bucket_us=" << p50
         << " pgo_latency_p95_bucket_us=" << p95 << '\n';
@@ -545,22 +719,24 @@ void render_online_profile(const Resources& resources, std::ostream& out, bool p
 void render_worker_profiles(const Resources& resources, std::ostream& out, bool pretty) {
     const auto workers = resources.worker_profiles();
     out << (pretty ? "  Worker count    " : "worker_count=") << workers.size() << '\n';
-    std::uint64_t cpu_bytes = 0, gpu_bytes = 0;
+    std::uint64_t cpu_bytes = 0, gpu_bytes = 0, igpu_bytes = 0;
     std::size_t gpu_peak = 0, gpu_available = 0;
     for (const auto& worker : workers) {
         cpu_bytes += worker.cpu_hash_bytes;
         gpu_bytes += worker.gpu_hash_bytes;
+        igpu_bytes += worker.igpu_hash_bytes;
         gpu_peak = std::max(gpu_peak, worker.gpu_peak_concurrency);
         gpu_available += worker.gpu_enabled ? 1 : 0;
     }
     if (pretty)
         out << "  Backend reads   " << human_bytes(static_cast<double>(cpu_bytes)) << " CPU | "
-            << human_bytes(static_cast<double>(gpu_bytes)) << " GPU | peak " << gpu_peak
+            << human_bytes(static_cast<double>(gpu_bytes)) << " CUDA | "
+            << human_bytes(static_cast<double>(igpu_bytes)) << " iGPU | peak " << gpu_peak
             << " concurrent GPU tasks\n";
     else
         out << "cpu_hash_read_bytes=" << cpu_bytes << " gpu_hash_read_bytes=" << gpu_bytes
-            << " gpu_peak_concurrency=" << gpu_peak << " gpu_available_workers=" << gpu_available
-            << '\n';
+            << " igpu_hash_read_bytes=" << igpu_bytes << " gpu_peak_concurrency=" << gpu_peak
+            << " gpu_available_workers=" << gpu_available << '\n';
     for (const auto& worker : workers) {
         const auto& profile = worker.snapshot;
         const auto error =
@@ -568,7 +744,8 @@ void render_worker_profiles(const Resources& resources, std::ostream& out, bool 
         if (pretty) {
             out << "  Worker " << worker.index << "        " << worker.cpu_hashes << " CPU | "
                 << worker.gpu_hashes << " GPU attempts | " << worker.cpu_hash_bytes << " CPU B | "
-                << worker.gpu_hash_bytes << " GPU B\n"
+                << worker.gpu_hash_bytes << " CUDA B | " << worker.igpu_hashes
+                << " iGPU attempts | " << worker.igpu_hash_bytes << " iGPU B\n"
                 << "                  " << profile.samples << " samples | local error EWMA "
                 << error << " ms | GPU setup " << human_duration(worker.setup_ms) << " | init "
                 << (worker.gpu_attempted ? "attempted" : "not-needed") << " | GPU "
@@ -581,6 +758,9 @@ void render_worker_profiles(const Resources& resources, std::ostream& out, bool 
 #define WORKER_VALUE(field) out << prefix << #field << '=' << worker.field << ' '
         WORKER_VALUE(cpu_hashes);
         WORKER_VALUE(gpu_hashes);
+        WORKER_VALUE(igpu_hashes);
+        WORKER_VALUE(igpu_hash_bytes);
+        WORKER_VALUE(igpu_busy);
         WORKER_VALUE(cpu_hash_bytes);
         WORKER_VALUE(gpu_hash_bytes);
         WORKER_VALUE(hash_bytes);
@@ -669,12 +849,24 @@ void render_pretty_profile(const Counters& counters, const Resources& resources,
     row("Read rate", human_bytes(rate) + "/s");
     row("Backend", std::to_string(resources.gpu_workers()) + " workers initialized CUDA | " +
                        std::to_string(resources.fallbacks()) + " CPU fallbacks");
+    row("iGPU", std::string(resources.igpu_service_enabled() ? "available"
+                            : resources.igpu_retired()       ? "retired"
+                            : resources.igpu_attempted()     ? "unavailable"
+                            : resources.igpu_deferred()      ? "activation deferred"
+                                                             : "not probed") +
+                    " | discovery " + human_duration(resources.igpu_discovery_ms()) +
+                    " | activation " + human_duration(resources.igpu_setup_ms()));
+    row("Cold-start budget", "credit " + human_duration(resources.cold_credit_ms()) + " | spent " +
+                                 human_duration(resources.cold_spent_ms()) +
+                                 " | iGPU setup estimate " +
+                                 human_duration(resources.igpu_setup_estimate_ms()));
     row("CPU size route",
         std::to_string(resources.cpu_routed_hashes()) + " hash attempts (policy, not failure)");
     const auto [cpu_attempts, gpu_attempts] = resources.hash_attempts();
-    row("Hash backends",
-        std::to_string(cpu_attempts) + " CPU | " + std::to_string(gpu_attempts) + " GPU attempts");
-    row("Scheduling", "one queue | worker-local CPU/GPU selection and models");
+    row("Hash backends", std::to_string(cpu_attempts) + " CPU | " + std::to_string(gpu_attempts) +
+                             " CUDA | " + std::to_string(resources.igpu_hash_attempts()) +
+                             " iGPU attempts");
+    row("Scheduling", "one queue | worker-local CPU/CUDA/iGPU selection and models");
     row("GPU input", human_bytes(static_cast<double>(resources.gpu_block_bytes())));
     render_online_profile(resources, out, true);
     render_worker_profiles(resources, out, true);
@@ -727,8 +919,24 @@ void render_profile(const Counters& counters, const Resources& resources,
             << " walk_result_peak=" << counters.walk_result_peak << '\n';
     profile << "cpu_routed_hashes=" << resources.cpu_routed_hashes() << '\n';
     const auto [cpu_attempts, gpu_attempts] = resources.hash_attempts();
-    profile << "cpu_hashes=" << cpu_attempts << " gpu_hashes=" << gpu_attempts
-            << " gpu_block_bytes=" << resources.gpu_block_bytes()
+    std::uint64_t igpu_attempts = 0;
+    for (const auto& worker : resources.worker_profiles())
+        igpu_attempts += worker.igpu_hashes;
+    profile << "igpu_attempted=" << resources.igpu_attempted()
+            << " igpu_available=" << resources.igpu_service_enabled()
+            << " igpu_retired=" << resources.igpu_retired()
+            << " igpu_setup_ms=" << resources.igpu_setup_ms()
+            << " igpu_discovery_ms=" << resources.igpu_discovery_ms()
+            << " igpu_deferred=" << resources.igpu_deferred()
+            << " igpu_setup_estimate_ms=" << resources.igpu_setup_estimate_ms()
+            << " igpu_cold_credit_ms=" << resources.cold_credit_ms()
+            << " igpu_cold_spent_ms=" << resources.cold_spent_ms()
+            << " cold_start_credit_ms=" << resources.cold_credit_ms()
+            << " cold_start_spent_ms=" << resources.cold_spent_ms()
+            << " cold_start_scope=aggregate_discovery_and_activation"
+            << " cuda_deferred=" << resources.cuda_deferred() << " ";
+    profile << "igpu_hashes=" << igpu_attempts << " cpu_hashes=" << cpu_attempts
+            << " gpu_hashes=" << gpu_attempts << " gpu_block_bytes=" << resources.gpu_block_bytes()
             << " scheduler=worker-local single_queue=1" << '\n';
     render_online_profile(resources, profile, false);
     render_worker_profiles(resources, profile, false);
@@ -748,6 +956,9 @@ std::string telemetry_config(const Config& config, OutputOptions options) {
     CONFIG_NUMBER(block_bytes);
     CONFIG_NUMBER(memory_bytes);
     CONFIG_NUMBER(device_memory_bytes);
+    CONFIG_NUMBER(igpu_bootstrap_ms);
+    CONFIG_NUMBER(cuda_bootstrap_ms);
+    CONFIG_NUMBER(cold_exploration_fraction);
     CONFIG_NUMBER(queue_capacity);
     CONFIG_NUMBER(rehash);
     CONFIG_NUMBER(pgo);
@@ -765,7 +976,8 @@ std::string telemetry_config(const Config& config, OutputOptions options) {
 /// Preserve raw counter/model state, rather than reparsing a human report.
 /// 保存原始计数和模型状态，不反向解析展示文本；调用者必须已经等待工作线程空闲。
 void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
-                       const Resources* resources, const std::array<double, 5>& phases) {
+                       const Resources* resources, const std::array<double, 5>& phases,
+                       const Config& config) {
     auto metric = [&](std::string name, double value, std::string unit = "count") {
         final.metrics.push_back({std::move(name), value, std::move(unit)});
     };
@@ -809,11 +1021,16 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
     ROUTING(static_gpu_floor_bytes);
     ROUTING(gpu_block_bytes);
 #undef ROUTING
+    parameter("routing", "igpu_bootstrap_ms", config.igpu_bootstrap_ms);
+    parameter("routing", "cuda_bootstrap_ms", config.cuda_bootstrap_ms);
+    parameter("routing", "cold_exploration_fraction", config.cold_exploration_fraction);
+    parameter("routing", "cold_spent_scope", "aggregate-discovery-and-activation-CUDA-iGPU");
+    parameter("routing", "legacy_igpu_cold_metrics", "aliases-of-aggregate-cold-start-metrics");
     parameter("model", "smoothing_alpha", detail::OnlineModel::smoothing_alpha);
     parameter("model", "band_shift", detail::OnlineModel::band_shift);
     parameter("model", "band_count", detail::OnlineModel::band_count);
     parameter("model", "backend_count", detail::OnlineModel::backend_count);
-    parameter("model", "training_scope", "worker-local-current-run-only");
+    parameter("model", "training_scope", "worker-local-decayed-cross-run-prior-plus-run-delta");
     if (!resources)
         return;
     metric("gpu_workers", static_cast<double>(resources->gpu_workers()));
@@ -839,16 +1056,34 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
     const auto [cpu, gpu] = resources->hash_attempts();
     metric("cpu_hashes", static_cast<double>(cpu));
     metric("gpu_hashes", static_cast<double>(gpu));
-    parameter("routing", "model_scope", "worker-local-current-run");
+    metric("igpu_hashes", static_cast<double>(resources->igpu_hash_attempts()));
+    metric("igpu_available", resources->igpu_service_enabled() ? 1 : 0);
+    metric("igpu_attempted", resources->igpu_attempted() ? 1 : 0);
+    metric("igpu_retired", resources->igpu_retired() ? 1 : 0);
+    metric("igpu_setup_ms", resources->igpu_setup_ms(), "ms");
+    metric("igpu_discovery_ms", resources->igpu_discovery_ms(), "ms");
+    metric("igpu_deferred", static_cast<double>(resources->igpu_deferred()));
+    metric("igpu_setup_estimate_ms", resources->igpu_setup_estimate_ms(), "ms");
+    metric("igpu_cold_credit_ms", resources->cold_credit_ms(), "ms");
+    metric("igpu_cold_spent_ms", resources->cold_spent_ms(), "ms");
+    metric("cold_start_credit_ms", resources->cold_credit_ms(), "ms");
+    metric("cold_start_spent_ms", resources->cold_spent_ms(), "ms");
+    metric("cuda_deferred", static_cast<double>(resources->cuda_deferred()));
+    parameter("routing", "model_scope", "worker-local-cross-run");
     const auto profile = resources->profile_snapshot();
 #define PROFILE(field, unit) metric("pgo." #field, static_cast<double>(profile.field), unit)
     PROFILE(samples, "count");
     PROFILE(cpu_samples, "count");
     PROFILE(gpu_samples, "count");
+    PROFILE(igpu_samples, "count");
     PROFILE(rejected_samples, "count");
     PROFILE(predicted_samples, "count");
     PROFILE(cpu_known_bands, "count");
     PROFILE(gpu_known_bands, "count");
+    PROFILE(absolute_error_sum_ms, "ms");
+    PROFILE(squared_error_sum_ms2, "ms2");
+    PROFILE(out_of_domain_samples, "count");
+    PROFILE(numerical_rejections, "count");
 #undef PROFILE
     for (std::size_t i = 0; i < profile.latency_histogram.size(); ++i) {
         metric("pgo.latency_bucket_us." + std::to_string(i),
@@ -862,6 +1097,9 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
     metric(scope + "." #field, static_cast<double>(worker.field), unit)
         WORKER_METRIC(cpu_hashes, "count");
         WORKER_METRIC(gpu_hashes, "count");
+        WORKER_METRIC(igpu_hashes, "count");
+        WORKER_METRIC(igpu_hash_bytes, "bytes");
+        WORKER_METRIC(igpu_busy, "count");
         WORKER_METRIC(cpu_hash_bytes, "bytes");
         WORKER_METRIC(gpu_hash_bytes, "bytes");
         WORKER_METRIC(hash_bytes, "bytes");
@@ -893,11 +1131,16 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
         LOCAL_PROFILE(samples, "count");
         LOCAL_PROFILE(cpu_samples, "count");
         LOCAL_PROFILE(gpu_samples, "count");
+        LOCAL_PROFILE(igpu_samples, "count");
         LOCAL_PROFILE(rejected_samples, "count");
         LOCAL_PROFILE(predicted_samples, "count");
         LOCAL_PROFILE(cpu_known_bands, "count");
         LOCAL_PROFILE(gpu_known_bands, "count");
         LOCAL_PROFILE(mean_absolute_error_ms, "ms");
+        LOCAL_PROFILE(absolute_error_sum_ms, "ms");
+        LOCAL_PROFILE(squared_error_sum_ms2, "ms2");
+        LOCAL_PROFILE(out_of_domain_samples, "count");
+        LOCAL_PROFILE(numerical_rejections, "count");
 #undef LOCAL_PROFILE
         for (std::size_t i = 0; i < local.latency_histogram.size(); ++i) {
             metric(scope + ".pgo.latency_bucket_us." + std::to_string(i),
@@ -905,9 +1148,58 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
             metric(scope + ".pgo.residual_bucket_us." + std::to_string(i),
                    static_cast<double>(local.residual_histogram[i]));
         }
-        for (const auto& band : worker.parameters) {
+        parameter(scope, "last_payload_bytes", worker.decision_context.bytes);
+        parameter(scope, "last_effective_batch_bytes",
+                  worker.decision_context.effective_batch_bytes);
+        parameter(scope, "last_contention", worker.decision_context.contention);
+        parameter(scope, "last_backend", backend_name(worker.decision_backend));
+        parameter(scope, "last_prediction_ms", worker.decision_prediction.ms);
+        parameter(scope, "last_prediction_error_ms", worker.decision_prediction.error_ms);
+        parameter(scope, "last_prediction_known", worker.decision_prediction.known);
+        parameter(scope, "last_prediction_out_of_domain", worker.decision_prediction.out_of_domain);
+        parameter(scope, "last_prediction_samples", worker.decision_prediction.samples);
+        for (unsigned backend = 0; backend < 3; ++backend) {
             const auto category =
-                scope + ".model." + (band.gpu ? "gpu." : "cpu.") + std::to_string(band.band_index);
+                scope + ".context." + backend_name(static_cast<BackendKind>(backend));
+            const auto& device = worker.devices[backend];
+            parameter(category, "device_name", device.device_name);
+            parameter(category, "vendor", device.vendor);
+            parameter(category, "driver_version", device.driver_version);
+            parameter(category, "implementation_version", device.implementation_version);
+            parameter(category, "architecture", device.architecture);
+            parameter(category, "compute_units", device.compute_units);
+            parameter(category, "hardware_threads", device.hardware_threads);
+            parameter(category, "global_memory_bytes", device.global_memory_bytes);
+            parameter(category, "max_allocation_bytes", device.max_allocation_bytes);
+            parameter(category, "effective_batch_bytes", device.effective_batch_bytes);
+            parameter(category, "unified_memory", device.unified_memory);
+            for (unsigned reason = 0; reason < 3; ++reason)
+                parameter(category, "decision." + std::to_string(reason),
+                          worker.decisions[backend][reason]);
+            parameter(category, "excluded", worker.excluded[backend]);
+            auto statistics = [&](std::string_view name,
+                                  const detail::OnlineModel::Statistics& value) {
+                const auto group = category + "." + std::string(name);
+                parameter(group, "samples", value.samples);
+                parameter(group, "weight", value.weight);
+                parameter(group, "yty", value.yty);
+                for (unsigned i = 0; i < 16; ++i)
+                    parameter(group, "xtx." + std::to_string(i), value.xtx[i]);
+                for (unsigned i = 0; i < 4; ++i) {
+                    parameter(group, "xty." + std::to_string(i), value.xty[i]);
+                    parameter(group, "minimum." + std::to_string(i), value.minimum[i]);
+                    parameter(group, "maximum." + std::to_string(i), value.maximum[i]);
+                }
+            };
+            statistics("prior", worker.prior[backend]);
+            statistics("delta", worker.delta[backend]);
+        }
+        for (const auto& band : worker.parameters) {
+            const auto category = scope + ".model." +
+                                  (band.backend == BackendKind::igpu ? "igpu."
+                                   : band.gpu                        ? "gpu."
+                                                                     : "cpu.") +
+                                  std::to_string(band.band_index);
             parameter(category, "known", band.known);
             parameter(category, "samples", band.samples);
             parameter(category, "cost_ms_per_byte", band.cost_ms_per_byte);
@@ -985,6 +1277,7 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
     std::array<double, 5> phases{};
     std::ostringstream summary;
     std::exception_ptr failure;
+    Learning learning;
     std::unique_ptr<Store> store;
     std::unique_ptr<Resources> resources;
     constexpr std::array<const char*, 5> stage_names{"initialize", "scan", "compare", "validate",
@@ -1024,7 +1317,70 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
     event("log", "run.start", start, start, 1, 0);
     try {
         store = std::make_unique<Store>(root / ".same" / "state.db");
-        resources = std::make_unique<Resources>(config);
+        if (config.pgo) {
+            const auto learning_start = Clock::now();
+            try {
+                for (const auto* name :
+                     {"model.db", "model.db-wal", "model.db-shm", "model.db-journal"}) {
+                    const auto path = root / ".same" / name;
+                    const auto status = fs::symlink_status(path);
+                    if (fs::exists(status) &&
+                        (!fs::is_regular_file(status) || is_reparse_point(path)))
+                        throw std::runtime_error("model path must be a regular non-link file");
+                }
+                learning.cpu = make_cpu_compute()->profile();
+                if (learning.cpu.device_name.empty())
+                    learning.disabled_reason = "cpu_identity_unknown";
+                else {
+                    learning.store = std::make_unique<ModelStore>(root / ".same" / "model.db");
+                    learning.diagnostic = learning.store->diagnostic();
+                }
+                if (!learning.diagnostic.empty())
+                    ++learning.invalid;
+            } catch (const std::exception& error) {
+                ++learning.invalid;
+                learning.diagnostic = error.what();
+            }
+            learning.startup_ms = milliseconds(learning_start, Clock::now());
+        }
+        detail::ModelPriorLoader loader;
+        if (learning.store)
+            loader = [&](BackendKind backend, const DeviceProfile& device) {
+                ++learning.loads;
+                try {
+                    const auto state =
+                        learning.store->load(learning_key(config, learning.cpu, backend, device));
+                    if (!state)
+                        return detail::OnlineModel::State{};
+                    detail::OnlineModel model;
+                    if (!model.initialize(*state, learning_decay)) {
+                        ++learning.invalid;
+                        return detail::OnlineModel::State{};
+                    }
+                    ++learning.hits;
+                    return model.prior();
+                } catch (...) {
+                    ++learning.invalid;
+                    return detail::OnlineModel::State{};
+                }
+            };
+        detail::SetupPriorLoader setup_loader;
+        if (learning.store)
+            setup_loader = [&](BackendKind backend, const DeviceProfile& device) {
+                ++learning.setup_loads;
+                try {
+                    const auto history = learning.store->load_setup(
+                        learning_key(config, learning.cpu, backend, device));
+                    if (!history)
+                        return 0.0;
+                    ++learning.setup_hits;
+                    return history->max_ms;
+                } catch (...) {
+                    ++learning.invalid;
+                    return 0.0;
+                }
+            };
+        resources = std::make_unique<Resources>(config, std::move(loader), std::move(setup_loader));
         end_stage(Clock::now());
         stage = 1;
         event("log", "scan.start", stage_start, stage_start, 3, 1);
@@ -1066,9 +1422,50 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
             }
         }
     }
+    if (resources && !failure)
+        save_learning(learning, config, *resources);
+    if (!learning.diagnostic.empty())
+        diagnostics << "Model learning warning: " << learning.diagnostic << '\n';
     if (trace) {
         try {
-            capture_telemetry(final, counters, resources.get(), phases);
+            capture_telemetry(final, counters, resources.get(), phases, config);
+            final.parameters.push_back({"model", "run_decay", std::to_string(learning_decay)});
+            final.parameters.push_back({"model", "database", ".same/model.db"});
+            final.parameters.push_back(
+                {"model", "feature_version", std::to_string(detail::OnlineModel::feature_version)});
+            final.parameters.push_back({"model", "diagnostic", learning.diagnostic});
+            final.parameters.push_back(
+                {"model", "persistence_disabled_reason", learning.disabled_reason});
+            final.parameters.push_back({"model", "durability", "advisory-WAL-NORMAL"});
+            std::size_t setup_index = 0;
+            for (const auto& [key, history] : learning.setup_snapshots) {
+                const auto category = "model.setup." + std::to_string(setup_index++);
+                final.parameters.push_back({category, "identity_key", key});
+                final.parameters.push_back({category, "samples", std::to_string(history.samples)});
+                final.metrics.push_back({category + ".last_ms", history.last_ms, "ms"});
+                final.metrics.push_back({category + ".mean_ms", history.mean_ms, "ms"});
+                final.metrics.push_back({category + ".max_ms", history.max_ms, "ms"});
+            }
+            final.metrics.push_back(
+                {"model.persistence_enabled", double(bool(learning.store)), "bool"});
+            final.metrics.push_back({"model.setup_load_attempts",
+                                     static_cast<double>(learning.setup_loads.load()), "count"});
+            final.metrics.push_back({"model.setup_prior_hits",
+                                     static_cast<double>(learning.setup_hits.load()), "count"});
+            final.metrics.push_back(
+                {"model.setup_saved_keys", static_cast<double>(learning.setup_saved), "count"});
+            final.metrics.push_back(
+                {"model.load_attempts", static_cast<double>(learning.loads.load()), "count"});
+            final.metrics.push_back(
+                {"model.prior_hits", static_cast<double>(learning.hits.load()), "count"});
+            final.metrics.push_back(
+                {"model.invalid", static_cast<double>(learning.invalid.load()), "count"});
+            final.metrics.push_back(
+                {"model.saved_keys", static_cast<double>(learning.saved), "count"});
+            final.metrics.push_back(
+                {"model.save_errors", static_cast<double>(learning.save_errors), "count"});
+            final.metrics.push_back({"model.startup_ms", learning.startup_ms, "ms"});
+            final.metrics.push_back({"model.save_ms", learning.save_ms, "ms"});
         } catch (...) {
             incomplete_telemetry = true;
         }
@@ -1103,6 +1500,7 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
     const auto total_ms = milliseconds(start, Clock::now());
     if (options.summary) {
         diagnostics << summary.str();
+        render_learning(learning, config.pgo, diagnostics);
         render_telemetry(trace.get(), stats, total_ms, diagnostics, options.diagnostics_pretty);
     }
     // 写入失败不依赖 --summary，避免静默失去整个运行历史。 / Surface writer failure even

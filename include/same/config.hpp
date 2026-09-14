@@ -27,14 +27,22 @@ struct Config {
     std::size_t device_memory_bytes{64 * 1024 * 1024};
     /// Bound both queued work and retained futures. 同时限制排队任务与保留的 future 数量。
     std::size_t queue_capacity;
-    /// auto lets each unified worker choose CPU/GPU using its private online model.
-    /// auto 由同质工作线程的私有在线模型选择 CPU/GPU；cuda 显式卸载，cpu 不探测。
+    /// auto lets each worker choose CPU/CUDA/iGPU using its private online model.
+    /// auto 使用线程私有三设备模型；cuda/igpu 显式卸载，cpu 不探测。
     std::string backend{"auto"};
     /// Ignore stored hashes even when file stamps match. 即使文件戳匹配也重新计算哈希。
     bool rehash{false};
     /// Enable runtime profile-guided routing; unrelated to compiler PGO or summary output.
     /// 启用运行时剖析引导路由；与编译器 PGO 和汇总输出开关无关。
     bool pgo{true};
+    /// 未知核显冷启动估计（毫秒）；零允许显式实验，不是测量值。
+    /// Unknown iGPU cold-start estimate in ms; zero enables experiments, not a measurement.
+    double igpu_bootstrap_ms{100.0};
+    /// 自动 CUDA 冷启动潜在成本估计（毫秒）。 / Auto CUDA cold-start potential-cost estimate in ms.
+    double cuda_bootstrap_ms{100.0};
+    /// 已完成合格 CPU 工作/线程数中可用于冷探索的比例；不是墙钟保证。
+    /// Fraction of completed eligible CPU work/workers for cold exploration, not a wall-time bound.
+    double cold_exploration_fraction{0.05};
     /// Persist local diagnostics independently of runtime PGO and summary output.
     /// 本地持久化诊断信息，与运行时 PGO 及汇总输出独立；可能包含敏感元数据。
     bool telemetry{true};

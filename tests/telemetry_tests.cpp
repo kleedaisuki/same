@@ -69,7 +69,9 @@ same::telemetry::FinalRecord final_record() {
 /// APIs.
 int main() {
     using namespace same::telemetry;
-    const auto root = std::filesystem::temp_directory_path() /
+    // macOS 的 /var 临时目录祖先可能是链接；不削弱产品的 NOFOLLOW 策略。
+    // macOS temporary ancestors may be symlinks; preserve production NOFOLLOW protection.
+    const auto root = std::filesystem::canonical(std::filesystem::temp_directory_path()) /
                       ("same-telemetry-test-" +
                        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directories(root);
@@ -121,7 +123,8 @@ int main() {
             for (int i = 0; i < 100; ++i)
                 t.emit(event);
             auto result = t.finish(final_record());
-            check(std::string_view(result.status) == "completed", "final status");
+            if (std::string_view(result.status) != "completed")
+                throw std::runtime_error(std::string("final status: ") + result.error.c_str());
             check(result.accepted <= 4 && result.persisted == result.accepted,
                   "cap and persistence");
             check(result.accepted + result.dropped == 100, "loss accounted");

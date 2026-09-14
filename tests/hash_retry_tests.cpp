@@ -188,6 +188,7 @@ void routed_file_hash(bool inject_failure, bool profiling = true) {
     const auto expected = reference->finish();
     same::FileRecord record{"file", same::stamp_path(fixture.root / "file"), {}};
     same::Config cfg;
+    cfg.cuda_bootstrap_ms = 0;
     cfg.backend = profiling ? "auto" : "cuda";
     cfg.workers = 1;
     cfg.queue_capacity = 8;
@@ -205,8 +206,10 @@ void routed_file_hash(bool inject_failure, bool profiling = true) {
         pool.submit([bytes = content.size()](same::Worker& worker) {
                 // 确定性局部模型先验，只验证选择契约，不把墙钟噪声当作测试条件。
                 // Deterministic local priors verify selection without wall-clock noise.
-                worker.model.seed(false, bytes, 100.0);
-                worker.model.seed(true, bytes, 1.0);
+                same::detail::OnlineModel prior;
+                prior.observe(same::BackendKind::cpu, {bytes, worker.cpu_block_bytes, 0}, 100.0);
+                prior.observe(same::BackendKind::cuda, {bytes, worker.gpu_block_bytes, 0}, 1.0);
+                require(worker.model.initialize(prior.delta()), "contextual prior rejected");
             })
             .get();
     }
