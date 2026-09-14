@@ -44,7 +44,7 @@ def cache(build):
 
 def smoke(binary, expected_version):
     """检查发布二进制的版本和精确分组；无需 GPU。 / Check packaged version and exact groups without a GPU."""
-    if expected_version not in run([str(binary), "--version"]):
+    if run([str(binary), "--version"]).strip() != "same " + expected_version:
         raise RuntimeError("binary/version mismatch")
     with tempfile.TemporaryDirectory(prefix="same-package-smoke-") as directory:
         root = Path(directory).resolve()
@@ -101,11 +101,12 @@ def package(args):
         (licenses / "SQLite.txt").write_text("SQLite is in the public domain. https://www.sqlite.org/copyright.html\n", encoding="utf-8")
         if cuda:
             compiler = Path(settings["CMAKE_CUDA_COMPILER"])
-            eula = compiler.parent.parent / "EULA.txt"
-            if eula.exists():
-                shutil.copy2(eula, licenses / "NVIDIA-CUDA-EULA.txt")
-            else:
-                raise RuntimeError("CUDA redistributable license missing")
+            if "release 12.8," not in run([str(compiler), "--version"]):
+                raise RuntimeError("review bundled CUDA license before changing toolkit series")
+            eula = ROOT / "third_party/licenses/NVIDIA-CUDA-12.8-LICENSE.txt"
+            if hashlib.sha256(eula.read_bytes()).hexdigest() != "e2c71babfd18a8e69542dd7e9ca018f9caa438094001a58e6bc4d8c999bf0d07":
+                raise RuntimeError("CUDA license checksum mismatch")
+            shutil.copy2(eula, licenses / "NVIDIA-CUDA-EULA.txt")
         manifest = {"version": version(), "commit": revision, "source_dirty": dirty, "platform": args.platform,
                     "flavor": args.flavor, "cuda": cuda, "opencl": True,
                     "cuda_architectures": settings.get("CMAKE_CUDA_ARCHITECTURES") if cuda else None,
