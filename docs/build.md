@@ -25,9 +25,9 @@ Put all `-D` options before `-P`. CUDA mode defaults to auto; on requires CUDA a
 | 2 | Visual Studio 生成器 + CUDA Build Customizations | 对应 VS 实例安装扩展，且有匹配 Toolkit / installed integration and matching Toolkit |
 | 3 | CPU + Ninja（无 Ninja 时 MSBuild） | 可工作的 C/C++ 工具链 / working host toolchain |
 
-自动入口使用 `vswhere` 发现最新 C++ Build Tools，并在本进程导入 x64 `VsDevCmd` 环境。每条 CUDA 路线在隔离目录配置微型原生 CUDA 工程、验证 C++20 编译链接，不下载项目依赖也不运行 GPU。失败日志保留在 `build/probes/`。SDK 不可用后才探测扩展，最后才 CPU；严格 on 模式不含 CPU。实际项目配置/构建失败立即报错，不掩盖为回退。
+自动入口使用 `vswhere` 按版本从新到旧枚举带 x64 C++ 工具的 Visual Studio 实例。启用 CUDA 时，每个候选都先进入自己的 x64 `VsDevCmd` 环境，再用所选 `nvcc` 配置微型原生 CUDA 工程并验证 C++20 编译链接；首个真实通过的实例才会导入主构建进程。它不复制一份容易过期的 CUDA/Visual Studio 版本表：实际编译器能力是最终判据。所有候选都失败时，`auto` 明确报告并回退最新可用的 CPU 环境，严格 `on` 则拒绝构建。CUDA 探针不下载项目依赖也不运行 GPU，候选及路线失败日志保留在 `build/probes/vs-host-*` 和 `build/probes/*-cuda-*`。实际项目配置/构建失败仍立即报错，不掩盖为回退。
 
-The launcher imports an x64 MSVC environment discovered with vswhere. Isolated CUDA probes compile/link C++20 without dependencies or GPU execution. Probe logs remain under `build/probes/`. SDK failure precedes extension probing, then CPU; strict mode excludes CPU. Actual project errors never trigger a silent fallback.
+The launcher uses `vswhere` to enumerate x64-capable Visual Studio instances from newest to oldest. With CUDA enabled, each candidate enters its own x64 `VsDevCmd` environment and must compile/link the native C++20 CUDA probe with the selected `nvcc`; only the first proven-compatible environment is imported into the real build. This deliberately avoids a duplicated CUDA/Visual Studio version table that would become stale. If every candidate fails, `auto` reports the decision and uses the newest CPU environment, while strict `on` rejects the build. Probes neither download project dependencies nor execute a GPU. Candidate and route logs remain under `build/probes/vs-host-*` and `build/probes/*-cuda-*`. Real project failures never trigger a silent fallback.
 
 **扩展不是独立 CUDA 编译器。** NVIDIA Build Customizations 仍需要匹配的 Toolkit、nvcc 和主机编译器，只有扩展文件而无 Toolkit 不能构建 CUDA。自动入口不安装软件、不绕过 NVIDIA 编译器版本检查、不穷举所有 MSVC/Toolkit 组合。
 

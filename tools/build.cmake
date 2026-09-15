@@ -43,39 +43,111 @@ endforeach()
 if(DEFINED ENV{CC} OR DEFINED ENV{CXX})
   set(_explicit ON)
 endif()
-if(WIN32 AND NOT _explicit AND NOT SAME_USE_ENVIRONMENT)
-  if(NOT DEFINED ENV{VSCMD_VER})
-    find_program(_vswhere vswhere HINTS "$ENV{ProgramFiles\(x86\)}/Microsoft Visual Studio/Installer")
-    if(_vswhere)
-      execute_process(COMMAND "${_vswhere}" -latest -products * -requires
-        Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-        OUTPUT_VARIABLE _vs OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
-      if(_vs)
-        # Import only this process' environment; no global PATH/IDE mutations.
-        # 仅导入当前进程环境，不修改全局 PATH 或 IDE 设置。
-        string(RANDOM LENGTH 12 _nonce)
-        set(_env_dir "$ENV{TEMP}/same-env-${_nonce}")
-        file(MAKE_DIRECTORY "${_env_dir}")
-        set(ENV{SAME_VS_SETUP} "${_vs}/Common7/Tools/VsDevCmd.bat")
-        set(ENV{SAME_ENV_OUTPUT} "${_env_dir}/env.txt")
-        file(WRITE "${_env_dir}/env.cmd"
-          "@echo off\r\ncall \"%SAME_VS_SETUP%\" -no_logo -arch=x64 -host_arch=x64\r\nif errorlevel 1 exit /b 1\r\nset > \"%SAME_ENV_OUTPUT%\"\r\n")
-        execute_process(COMMAND "$ENV{COMSPEC}" /d /u /c "${_env_dir}/env.cmd"
-          COMMAND_ERROR_IS_FATAL ANY)
-        file(STRINGS "${_env_dir}/env.txt" _environment ENCODING UTF-16LE)
-        foreach(_entry IN LISTS _environment)
-          if(_entry MATCHES "^([^=]+)=(.*)$")
-            set(ENV{${CMAKE_MATCH_1}} "${CMAKE_MATCH_2}")
-          endif()
-        endforeach()
-        file(REMOVE "${_env_dir}/env.cmd" "${_env_dir}/env.txt")
+# Import a captured VsDevCmd environment into this process only.
+# 将捕获的 VsDevCmd 环境仅导入当前进程。
+function(same_import_vs_environment path)
+  file(STRINGS "${path}" _environment ENCODING UTF-16LE)
+  foreach(_entry IN LISTS _environment)
+    if(_entry MATCHES "^([^=]+)=(.*)$")
+      set(ENV{${CMAKE_MATCH_1}} "${CMAKE_MATCH_2}")
+    endif()
+  endforeach()
+endfunction()
+
+# Capture one x64 environment without probing CUDA; used for CPU fallback.
+# 捕获一个不探测 CUDA 的 x64 环境，供 CPU 回退使用。
+function(same_capture_vs_environment installation output)
+  string(RANDOM LENGTH 12 _nonce)
+  set(_directory "$ENV{TEMP}/same-env-${_nonce}")
+  file(MAKE_DIRECTORY "${_directory}")
+  file(TO_NATIVE_PATH "${installation}/Common7/Tools/VsDevCmd.bat" _setup)
+  file(TO_NATIVE_PATH "${_directory}/env.txt" _environment)
+  file(WRITE "${_directory}/env.cmd"
+    "@echo off\r\ncall \"${_setup}\" -no_logo -arch=x64 -host_arch=x64\r\nif errorlevel 1 exit /b 1\r\nset > \"${_environment}\"\r\n")
+  execute_process(COMMAND "$ENV{COMSPEC}" /d /u /c "${_directory}/env.cmd"
+    COMMAND_ERROR_IS_FATAL ANY)
+  set(${output} "${_directory}/env.txt" PARENT_SCOPE)
+endfunction()
+
+# Probe every installed VS instance with the selected nvcc before importing one. A real C++20
+# compile/link is authoritative and remains correct when NVIDIA changes its support matrix.
+# 导入前用所选 nvcc 探测每个 VS 实例；真实 C++20 编译链接可随 NVIDIA 支持矩阵演进。
+if(WIN32 AND NOT _explicit AND NOT SAME_USE_ENVIRONMENT AND NOT DEFINED ENV{VSCMD_VER})
+  find_program(_vswhere vswhere
+    HINTS "$ENV{ProgramFiles\(x86\)}/Microsoft Visual Studio/Installer")
+  if(NOT _vswhere)
+    message(FATAL_ERROR "vswhere not found; select an x64 compiler environment explicitly")
+  endif()
+  execute_process(COMMAND "${_vswhere}" -sort -products * -requires
+    Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json -utf8
+    OUTPUT_VARIABLE _vs_json OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+  same_visual_studio_installations(_vs_installations "${_vs_json}")
+  if(NOT _vs_installations)
+    message(FATAL_ERROR "No Visual Studio instance with x64 C++ tools was found")
+  endif()
+
+  set(_vs_selected "")
+  if(NOT SAME_CUDA_MODE STREQUAL off)
+    foreach(_vs IN LISTS _vs_installations)
+      string(RANDOM LENGTH 12 _nonce)
+      set(_candidate "${SAME_SOURCE_DIR}/build/probes/vs-host-${_nonce}")
+      file(MAKE_DIRECTORY "${_candidate}")
+      set(_wrapper "set(SAME_CUDA_MODE on)\nset(SAME_TOOLCHAIN_PROBE_ONLY ON)\n")
+      string(APPEND _wrapper
+        "set(SAME_TOOLCHAIN_PROBE_RESULT [==[${_candidate}/route.txt]==])\n")
+      foreach(_key CMAKE_BUILD_TYPE SAME_CMAKE_ARGS CMAKE_CUDA_COMPILER
+          CMAKE_CUDA_HOST_COMPILER CMAKE_CUDA_ARCHITECTURES CUDAToolkit_ROOT CMAKE_MAKE_PROGRAM)
+        if(DEFINED ${_key})
+          string(APPEND _wrapper "set(${_key} [==[${${_key}}]==])\n")
+        endif()
+      endforeach()
+      string(APPEND _wrapper "include([==[${CMAKE_CURRENT_LIST_FILE}]==])\n")
+      file(WRITE "${_candidate}/probe.cmake" "${_wrapper}")
+      file(TO_NATIVE_PATH "${_vs}/Common7/Tools/VsDevCmd.bat" _setup)
+      file(TO_NATIVE_PATH "${CMAKE_COMMAND}" _cmake)
+      file(TO_NATIVE_PATH "${_candidate}/probe.cmake" _probe_script)
+      file(TO_NATIVE_PATH "${_candidate}/env.txt" _environment)
+      file(WRITE "${_candidate}/probe.cmd"
+        "@echo off\r\ncall \"${_setup}\" -no_logo -arch=x64 -host_arch=x64\r\nif errorlevel 1 exit /b 1\r\n\"${_cmake}\" -P \"${_probe_script}\"\r\nif errorlevel 1 exit /b 1\r\nset > \"${_environment}\"\r\n")
+      execute_process(COMMAND "$ENV{COMSPEC}" /d /u /c "${_candidate}/probe.cmd"
+        RESULT_VARIABLE _result OUTPUT_VARIABLE _output ERROR_VARIABLE _error)
+      file(WRITE "${_candidate}/probe.log" "${_output}\n${_error}")
+      file(REMOVE "${_candidate}/probe.cmd" "${_candidate}/probe.cmake")
+      if(_result EQUAL 0 AND EXISTS "${_candidate}/env.txt"
+          AND EXISTS "${_candidate}/route.txt")
+        same_import_vs_environment("${_candidate}/env.txt")
+        file(READ "${_candidate}/route.txt" _candidate_route)
+        set(_vs_selected "${_vs}")
+        message(STATUS
+          "same: selected CUDA-compatible x64 environment ${_vs} (${_candidate_route})")
+        file(REMOVE "${_candidate}/env.txt")
+        break()
       endif()
+      message(STATUS
+        "same: Visual Studio instance is incompatible with selected CUDA: ${_vs}; inspect ${_candidate}/probe.log")
+      file(REMOVE "${_candidate}/env.txt")
+    endforeach()
+  endif()
+
+  if(NOT _vs_selected)
+    if(SAME_CUDA_MODE STREQUAL on)
+      message(FATAL_ERROR
+        "No installed x64 Visual Studio environment can compile/link with the selected CUDA toolkit")
+    endif()
+    list(GET _vs_installations 0 _vs_selected)
+    same_capture_vs_environment("${_vs_selected}" _cpu_environment)
+    same_import_vs_environment("${_cpu_environment}")
+    get_filename_component(_cpu_environment_directory "${_cpu_environment}" DIRECTORY)
+    file(REMOVE "${_cpu_environment_directory}/env.cmd" "${_cpu_environment}")
+    if(NOT SAME_CUDA_MODE STREQUAL off)
+      set(_cuda_host_unavailable ON)
+      message(STATUS "same: no compatible CUDA host compiler; using CPU route")
     endif()
   endif()
-  if(DEFINED ENV{VSCMD_VER})
-    set(CMAKE_C_COMPILER cl)
-    set(CMAKE_CXX_COMPILER cl)
-  endif()
+endif()
+if(WIN32 AND NOT _explicit AND NOT SAME_USE_ENVIRONMENT AND DEFINED ENV{VSCMD_VER})
+  set(CMAKE_C_COMPILER cl)
+  set(CMAKE_CXX_COMPILER cl)
 endif()
 
 # Resolve caller-relative toolchain paths before changing probe source directories.
@@ -112,7 +184,11 @@ if(WIN32 AND NOT _explicit AND NOT _explicit_cuda AND NOT SAME_USE_ENVIRONMENT A
     COMMAND_ERROR_IS_FATAL ANY)
   string(REGEX MATCH "Visual Studio ${_vs_major} [0-9]+" _vs_generator "${_capabilities}")
 endif()
-same_build_routes(_routes "${SAME_CUDA_MODE}" "${_vs_generator}")
+if(_cuda_host_unavailable)
+  set(_routes cpu)
+else()
+  same_build_routes(_routes "${SAME_CUDA_MODE}" "${_vs_generator}")
+endif()
 find_program(_ninja NAMES ninja ninja-build NO_CACHE)
 if(DEFINED CMAKE_MAKE_PROGRAM AND EXISTS "${CMAKE_MAKE_PROGRAM}")
   set(_ninja "${CMAKE_MAKE_PROGRAM}")
@@ -148,6 +224,13 @@ foreach(_route IN LISTS _routes)
 endforeach()
 if(NOT _selected)
   message(FATAL_ERROR "CUDA required, but SDK and available MSVC CUDA routes failed")
+endif()
+if(SAME_TOOLCHAIN_PROBE_ONLY)
+  if(NOT DEFINED SAME_TOOLCHAIN_PROBE_RESULT)
+    message(FATAL_ERROR "SAME_TOOLCHAIN_PROBE_RESULT is required for a toolchain-only probe")
+  endif()
+  file(WRITE "${SAME_TOOLCHAIN_PROBE_RESULT}" "${_selected}|${_generator}")
+  return()
 endif()
 if(NOT DEFINED SAME_BUILD_DIR)
   string(TOLOWER "${CMAKE_BUILD_TYPE}" _config)
