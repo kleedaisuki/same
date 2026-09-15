@@ -20,8 +20,8 @@ struct OutputOptions {
     /// Descend into subdirectories; CLI explicitly opts out unless -r is supplied.
     /// 下降进入子目录；CLI 仅在提供 -r 时显式开启。
     bool recursive{true};
-    /// Emit summary, database and profiling panels; warnings remain independent.
-    /// 输出汇总、数据库与性能面板；警告不受此选项影响。
+    /// Emit the full current-run diagnostic report; warnings remain independent.
+    /// 输出完整的本轮诊断报告；警告不受此选项影响。
     bool summary{true};
 };
 /// Run with explicit presentation; e.g. run(root, config, out, err, {true, false}).

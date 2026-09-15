@@ -48,6 +48,95 @@ std::uint64_t counter(const std::string& text, const std::string& key) {
     check(pos != std::string::npos, "missing profile field");
     return std::stoull(text.substr(pos + key.size() + 1));
 }
+/// Remove ANSI SGR sequences so color can be verified as a redundant presentation channel.
+/// 移除 ANSI SGR 序列，验证颜色只是冗余展示通道。
+std::string strip_sgr(std::string_view text) {
+    std::string plain;
+    plain.reserve(text.size());
+    for (std::size_t i = 0; i < text.size();) {
+        if (text[i] != '\033' || i + 1 >= text.size() || text[i + 1] != '[') {
+            plain += text[i++];
+            continue;
+        }
+        const auto end = text.find('m', i + 2);
+        check(end != std::string_view::npos, "unterminated ANSI SGR sequence");
+        i = end + 1;
+    }
+    return plain;
+}
+/// Require report sections to appear once in decision-first reading order.
+/// 要求报告分区按决策优先的阅读顺序各出现一次。
+void check_section_order(const std::string& text) {
+    std::size_t previous = 0;
+    for (auto section :
+         {"[ Results ]", "[ Storage and I/O ]", "[ Performance ]", "[ Compute and routing ]",
+          "[ Online routing model ]", "[ Workers ]", "[ Model persistence ]", "[ Telemetry ]"}) {
+        const auto position = text.find(section, previous);
+        check(position != std::string::npos, "pretty summary section missing or reordered");
+        check(text.find(section, position + 1) == std::string::npos,
+              "pretty summary section duplicated");
+        previous = position + 1;
+    }
+}
+/// Pin the complete human-facing field inventory while allowing layout and values to evolve.
+/// 固定完整的人类可读字段清单，同时允许布局和值继续演进。
+void check_pretty_fields(const std::string& text) {
+    for (auto field : {
+             "Groups",
+             "Matching files",
+             "Unique files",
+             "Database",
+             "Files",
+             "Data",
+             "Read",
+             "Initialize",
+             "Scan",
+             "Hash wait",
+             "Hash work",
+             "Walk wait",
+             "Enumerate work",
+             "Metadata work",
+             "Database work",
+             "Pipeline",
+             "Compare",
+             "Validate",
+             "Output",
+             "Elapsed",
+             "Read rate",
+             "Backend",
+             "iGPU",
+             "Cold-start budget",
+             "CPU size route",
+             "Hash backends",
+             "Scheduling",
+             "GPU input",
+             "Online PGO",
+             "Model coverage",
+             "Model residual",
+             "Prediction error",
+             "Learning scope",
+             "Sample latency",
+             "Worker count",
+             "Backend reads",
+             "Worker 0",
+             "local error EWMA",
+             "Runtime learning",
+             "Persistence",
+             "Model database",
+             "Disabled reason",
+             "Model loads",
+             "Model saves",
+             "Setup history",
+             "Persistence I/O",
+             "Run decay",
+             "Run ID",
+             "Trace records",
+             "Trace pressure",
+             "Telemetry drain",
+             "Total incl. I/O",
+         })
+        check(text.find(field) != std::string::npos, "pretty summary field omitted");
+}
 /// Parse fractional timings by complete key and check the pipeline accounting invariant.
 /// 按完整键解析小数耗时，并验证流水线计时恒等关系。
 void check_scan_timing(const std::string& text, bool warm) {
@@ -117,25 +206,43 @@ void reports() {
     err.str("");
     same::run(f.root, config, out, err, {true, true, true, true, true});
     auto colored = out.str();
+    const auto colored_summary = err.str();
+    const auto plain_summary = strip_sgr(colored_summary);
     check(colored.find("Summary") == std::string::npos, "summary leaked to results");
-    check(err.str().find("\033[1;36mSummary\033[0m\n") != std::string::npos, "summary heading");
-    check(err.str().find("Database") != std::string::npos &&
-              err.str().find("3 records | committed") != std::string::npos,
+    check(colored_summary.find("\033[1;36mSummary\033[0m\n") != std::string::npos,
+          "summary heading");
+    check(colored_summary.find("\033[1;34m[ Results ]\033[0m") != std::string::npos &&
+              colored_summary.find("\033[1;32m") != std::string::npos &&
+              colored_summary.find("\033[35m") != std::string::npos &&
+              colored_summary.find("\033[36m") != std::string::npos &&
+              colored_summary.find("\033[2m") != std::string::npos,
+          "core semantic summary palette incomplete");
+    check(plain_summary.find('\033') == std::string::npos, "summary color cannot be stripped");
+    check_section_order(plain_summary);
+    check_pretty_fields(plain_summary);
+    check(plain_summary.find("Database") != std::string::npos &&
+              plain_summary.find("3 records | committed") != std::string::npos,
           "database table row");
-    check(err.str().find("Matching files") != std::string::npos &&
-              err.str().find("Unique files") != std::string::npos &&
-              err.str().find("Groups") != std::string::npos,
+    check(plain_summary.find("Matching files") != std::string::npos &&
+              plain_summary.find("Unique files") != std::string::npos &&
+              plain_summary.find("Groups") != std::string::npos,
           "result table rows");
-    check(err.str().find("wall time / logical reads") == std::string::npos &&
-              err.str().find("Profile") == std::string::npos,
+    check(plain_summary.find("wall time / logical reads") == std::string::npos &&
+              plain_summary.find("Profile") == std::string::npos,
           "removed profile title");
-    check(err.str().find(" B") != std::string::npos && err.str().find("/s") != std::string::npos,
+    check(plain_summary.find(" B") != std::string::npos &&
+              plain_summary.find("/s") != std::string::npos,
           "human profile units");
-    check(err.str().find("Hash work") != std::string::npos &&
-              err.str().find("Hash wait") != std::string::npos &&
-              err.str().find("Scan + hash") == std::string::npos,
+    check(plain_summary.find("Hash work") != std::string::npos &&
+              plain_summary.find("Hash wait") != std::string::npos &&
+              plain_summary.find("Scan + hash") == std::string::npos,
           "split scan/hash display");
-    check(err.str().find("elapsed_ms=") == std::string::npos, "raw metrics in pretty profile");
+    check(plain_summary.find("Runtime learning") != std::string::npos &&
+              plain_summary.find("Model loads") != std::string::npos &&
+              plain_summary.find("Setup history") != std::string::npos &&
+              plain_summary.find("Trace records") != std::string::npos,
+          "pretty summary lost persistence diagnostics");
+    check(plain_summary.find("elapsed_ms=") == std::string::npos, "raw metrics in pretty profile");
     check(colored.find("\033[32m") != std::string::npos &&
               colored.find("\033[33m") != std::string::npos,
           "color labels");
@@ -158,7 +265,9 @@ void reports() {
     out.str("");
     err.str("");
     same::run(f.root, config, out, err, {false, false, false, true, true});
-    check(out.str() == "1\t\"a\"\n1\t\"b\"\n" && err.str().find('\033') != std::string::npos,
+    check(out.str() == "1\t\"a\"\n1\t\"b\"\n" && err.str().find('\033') != std::string::npos &&
+              err.str().find("\033[1;33m1 (hidden; --unique-files to show)\033[0m") !=
+                  std::string::npos,
           "independent colored diagnostic stream");
     out.str("");
     err.str("");
