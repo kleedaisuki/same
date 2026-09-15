@@ -14,6 +14,17 @@ expect_routes(auto "" "sdk-cuda;cpu")
 expect_routes(on "" "sdk-cuda")
 expect_routes(off "" "cpu")
 
+# A newer incompatible VS must not erase older candidates before the real compiler probe.
+# 较新的不兼容 VS 不得在真实编译探针前抹掉旧候选。
+set(_vs_json [=[[
+  {"installationPath":"C:/VS/18"},
+  {"installationPath":"C:/VS/17"}
+]]=])
+same_visual_studio_installations(_vs_installations "${_vs_json}")
+if(NOT _vs_installations STREQUAL "C:/VS/18;C:/VS/17")
+  message(FATAL_ERROR "Visual Studio candidate order was not preserved: ${_vs_installations}")
+endif()
+
 # Disabled CUDA must not inspect or reject a generator; conflicting flags fail.
 # 禁用 CUDA 时不可探测或拒绝生成器；冲突选项必须失败。
 set(SAME_ENABLE_CUDA OFF)

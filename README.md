@@ -112,9 +112,9 @@ Columns above are separated by actual tabs. Statistics require `--summary` and g
 
 ### 终端展示与着色 / Terminal presentation and color
 
-交互终端默认只按组展示绿色 `[SAME]` 文件；仅 `--summary` 显示 Summary、Database 与 Profile。未找到副本的文件默认折叠，只有加上 `--unique-files` 才展开黄色 `[UNIQUE]` 列表；开启 Summary 时显示其数量和展开提示。`UNIQUE` 仅表示**本次扫描范围内未找到副本**，不是错误，也不是与某个指定文件的差异报告。忽略规则排除的文件不参与判断；摘要缓存仍遵循下文的信任边界。所有路径沿用 TSV 的转义规则，文件名中的控制字符不会变成终端指令。
+交互终端默认只按组展示绿色 `[SAME]` 文件；仅 `--summary` 显示完整的本轮分区诊断报告。未找到副本的文件默认折叠，只有加上 `--unique-files` 才展开黄色 `[UNIQUE]` 列表；开启 Summary 时显示其数量和展开提示。`UNIQUE` 仅表示**本次扫描范围内未找到副本**，不是错误，也不是与某个指定文件的差异报告。忽略规则排除的文件不参与判断；摘要缓存仍遵循下文的信任边界。所有路径沿用 TSV 的转义规则，文件名中的控制字符不会变成终端指令。
 
-Interactive terminals show green `[SAME]` groups; `--summary` opts into Summary, Database and Profile sections. Unmatched paths are hidden by default; `--unique-files` expands the yellow `[UNIQUE]` list. When enabled, Summary retains the unmatched count and expansion hint. UNIQUE means **no duplicate found within this scan**, not an error or a pairwise diff. Ignored files are outside the comparison scope; the cache trust boundary below still applies. Paths use the same escaping as TSV, including terminal control characters.
+Interactive terminals show green `[SAME]` groups; `--summary` opts into the complete sectioned diagnostic report for the current run. Unmatched paths are hidden by default; `--unique-files` expands the yellow `[UNIQUE]` list. When enabled, Summary retains the unmatched count and expansion hint. UNIQUE means **no duplicate found within this scan**, not an error or a pairwise diff. Ignored files are outside the comparison scope; the cache trust boundary below still applies. Paths use the same escaping as TSV, including terminal control characters.
 
 ```sh
 same --unique-files               # 展开未找到副本的文件 / expand unmatched paths
@@ -126,7 +126,7 @@ same --color=always               # 显式强制 ANSI / explicitly force ANSI
 same --summary > matches.tsv 2> profile.log # 结果与统计分离 / separate results and statistics
 ```
 
-Summary、Database、Profile 以及下文所有性能字段均须 `--summary` 才输出；该开关不隐藏警告或错误。 / All statistics below require `--summary`; warnings and errors remain independent.
+Summary 分区报告及下文所有性能字段均须 `--summary` 才输出；该开关不隐藏警告或错误。 / The sectioned Summary report and all statistics below require `--summary`; warnings and errors remain independent.
 
 `--format=auto|pretty|tsv` 与 `--color=auto|always|never` 相互独立，均为命令行选项，不写入 TOML。自动颜色遵循非空 `NO_COLOR`、`TERM=dumb` 和各标准流是否连接终端；重定向默认无色并保留原 TSV。Windows 自动尝试启用虚拟终端（Virtual Terminal, VT）处理，不支持时降级无色，退出时恢复控制台模式。显式 `always` 会覆盖环境提示，即使重定向也输出 ANSI 控制码；`never` 始终无色。stdout 与 stderr 独立检测：自动模式下，重定向结果不影响终端中的 Profile，重定向统计也不会带入颜色。`--format=tsv` 始终保留原始统计字段；`--format=pretty` 显式选择可读报告与智能单位，重定向时默认仍无色。
 
@@ -143,12 +143,16 @@ Format and color are independent CLI-only options. Auto color honors nonempty `N
   "notes.txt"
 
 Summary
------------------------------------------
-  Groups          1
-  Matching files  2
-  Unique files    1
-  Database        .same/state.db | 32.00 KiB | 3 records | committed
-  Files           3 scanned | 3 hashed | 0 cached
+========================================================================
+
+[ Results ]
+  Groups              1
+  Matching files      2
+  Unique files        1
+
+[ Storage and I/O ]
+  Database            .same/state.db | 32.00 KiB | 3 records | committed
+  Files               3 scanned | 3 hashed | 0 cached
   ...
 ```
 
@@ -162,9 +166,9 @@ With explicit `--unique-files` in TSV mode, unmatched paths follow the duplicate
 
 ### 汇总与性能统计 / Summary
 
-只有添加 `--summary` 的成功扫描才在 stderr 输出统计；重定向到扫描根目录之外即可保存。机器模式的旧计数行保持不变，新增 `key=value` 字段另起一行；可读模式使用对齐的标签、彩色标题/数值与自适应单位，不再混排原始字段。字节与速率自动使用 B、KiB、MiB、GiB 等二进制单位，耗时自动使用 ns、us、ms、s、min 或 h；机器字段仍是精确字节数和固定毫秒。无需高频计时或每块原子操作：读取量由各工作线程独占累计，所有任务完成后求和。
+只有添加 `--summary` 的成功扫描才在 stderr 输出统计；重定向到扫描根目录之外即可保存。机器模式的旧计数行保持不变，新增 `key=value` 字段另起一行；可读模式按 Results、Storage and I/O、Performance、Compute and routing、Online routing model、Workers、Model persistence 与 Telemetry 分区，保留完整的本轮统计。标题、状态与数值使用冗余彩色强调，但纯文本中的分区、标签和状态词仍承载完整语义。字节与速率自动使用 B、KiB、MiB、GiB 等二进制单位，耗时自动使用 ns、us、ms、s、min 或 h；机器字段仍是精确字节数和固定毫秒。无需高频计时或每块原子操作：读取量由各工作线程独占累计，所有任务完成后求和。
 
-Successful scans emit statistics to stderr only with `--summary`; redirect outside the scan root to retain a log. Machine mode retains the legacy counter line and new `key=value` metrics on a separate line. Pretty mode uses aligned labels, colored headings/values and adaptive units instead of raw fields: B/KiB/MiB/GiB and higher binary units for data/rates, ns/us/ms/s/min/h for durations. Machine metrics retain exact byte counts and milliseconds. Workers accumulate read bytes locally, then totals are collected after all jobs finish; there are no per-block atomic operations or timers.
+Successful scans emit statistics to stderr only with `--summary`; redirect outside the scan root to retain a log. Machine mode retains the legacy counter line and new `key=value` metrics on a separate line. Pretty mode groups the complete current-run statistics into Results, Storage and I/O, Performance, Compute and routing, Online routing model, Workers, Model persistence, and Telemetry. Headings, states, and values receive redundant color emphasis, while plain-text sections, labels, and status words retain the full semantics. Adaptive units use B/KiB/MiB/GiB and higher binary units for data/rates and ns/us/ms/s/min/h for durations. Machine metrics retain exact byte counts and milliseconds. Workers accumulate read bytes locally, then totals are collected after all jobs finish; there are no per-block atomic operations or timers.
 
 | 字段 / Field | 口径 / Meaning |
 |---|---|
@@ -189,7 +193,7 @@ Successful scans emit statistics to stderr only with `--summary`; redirect outsi
 
 Timings use a monotonic clock, with three decimal places in milliseconds for machine mode and two decimal places in adaptive units for human mode (except zero), not CPU time, GPU kernel time, or physical disk bandwidth. Warm digest caches can eliminate hashing reads but duplicate candidates are still reread. OS page caching affects elapsed time. For benchmarks, control input, backend and cache state and repeat measurements.
 
-设计依据 / Design references: [NO_COLOR convention](https://no-color.org/), [Microsoft VT console processing](https://learn.microsoft.com/en-us/windows/console/console-virtual-terminal-sequences), [USENIX: Auto-pilot benchmarking methodology](https://www.usenix.org/legacy/event/usenix05/tech/freenix/full_papers/wright/wright_html/)（基准测试链接仅作为方法背景，不代表本工具已通过性能认证 / methodological context, not a performance certification）。
+设计依据 / Design references: [human-readable summary layout](docs/summary-output-design.md), [NO_COLOR convention](https://no-color.org/), [Microsoft VT console processing](https://learn.microsoft.com/en-us/windows/console/console-virtual-terminal-sequences), [USENIX: Auto-pilot benchmarking methodology](https://www.usenix.org/legacy/event/usenix05/tech/freenix/full_papers/wright/wright_html/)（基准测试链接仅作为方法背景，不代表本工具已通过性能认证 / methodological context, not a performance certification）。
 
 ### 跨运行遥测 / Cross-run telemetry
 

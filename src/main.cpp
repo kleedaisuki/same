@@ -18,7 +18,7 @@ void help() {
            "existing files\n"
            "  clean          remove current .same; -r also removes descendant .same directories\n"
            "Scan options:\n"
-           "  --summary  show Summary, Database and profiling (off by default)\n"
+           "  --summary  show the full current-run diagnostic report (off by default)\n"
            "  --rehash       ignore cached hashes for this scan\n"
            "  --cpu          force the CPU backend\n"
            "  --cuda         select CUDA (CPU fallback when unavailable)\n"

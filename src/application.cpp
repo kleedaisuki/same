@@ -303,8 +303,126 @@ void save_learning(Learning& learning, const Config& config, const Resources& re
     }
     learning.save_ms = milliseconds(start, Clock::now());
 }
+/// Semantic emphasis for the human report; text labels remain the primary encoding.
+/// 人类可读报告的语义强调；文本标签始终是主要编码，不依赖颜色传意。
+enum class ReportTone { normal, good, info, warning, danger, accent, muted };
+/// Render one consistently aligned report without leaking formatting state to its caller.
+/// 以一致对齐方式渲染报告，不向调用方泄漏格式状态。
+class PrettyReport {
+public:
+    /// Bind a report stream and an already-resolved ANSI color policy.
+    /// 绑定报告流及已解析的 ANSI 颜色策略。
+    PrettyReport(std::ostream& out, bool color) : out_(out), color_(color) {}
+    /// Start the opt-in page; the rule also separates it from preceding diagnostics.
+    /// 开始显式启用的报告页；分隔线同时将其与先前诊断隔开。
+    void heading(std::string_view title) const {
+        out_ << '\n'
+             << code("\033[1;36m") << title << reset() << '\n'
+             << code("\033[2;36m") << std::string(72, '=') << reset() << '\n';
+    }
+    /// Open a named information group. Color is redundant with brackets and whitespace.
+    /// 开启具名信息分区；颜色与方括号、空行形成冗余编码。
+    void section(std::string_view title) const {
+        out_ << '\n' << code("\033[1;34m") << "[ " << title << " ]" << reset() << '\n';
+    }
+    /// Emit a label/value row with stable alignment in both colored and plain output.
+    /// 输出标签/值行，在彩色与纯文本模式下均保持稳定对齐。
+    void row(std::string_view label, std::string_view text,
+             ReportTone tone = ReportTone::normal) const {
+        out_ << "  ";
+        padded_label(label, 20);
+        out_ << color(tone) << text << reset() << '\n';
+    }
+    /// Emit a subordinate row, used to keep dense worker details scannable.
+    /// 输出次级行，使密集的工作线程细节仍易于浏览。
+    void detail(std::string_view label, std::string_view text,
+                ReportTone tone = ReportTone::muted) const {
+        out_ << "    ";
+        padded_label(label, 18);
+        out_ << color(tone) << text << reset() << '\n';
+    }
+
+private:
+    /// Write bold label text and plain padding without changing stream format flags.
+    /// 写入粗体标签及普通填充，不修改输出流的格式标志。
+    void padded_label(std::string_view label, std::size_t width) const {
+        out_ << code("\033[1m") << label << reset();
+        if (label.size() < width)
+            out_ << std::string(width - label.size(), ' ');
+    }
+    /// Return an escape only when color was explicitly enabled for diagnostics.
+    /// 仅在诊断流已显式启用颜色时返回转义序列。
+    std::string_view code(std::string_view escape) const {
+        return color_ ? escape : std::string_view{};
+    }
+    /// Map semantic roles onto the portable 16-color ANSI palette.
+    /// 将语义角色映射到可移植的 ANSI 16 色调色板。
+    std::string_view color(ReportTone tone) const {
+        if (!color_)
+            return {};
+        switch (tone) {
+        case ReportTone::good:
+            return "\033[1;32m";
+        case ReportTone::info:
+            return "\033[36m";
+        case ReportTone::warning:
+            return "\033[1;33m";
+        case ReportTone::danger:
+            return "\033[1;31m";
+        case ReportTone::accent:
+            return "\033[35m";
+        case ReportTone::muted:
+            return "\033[2m";
+        case ReportTone::normal:
+            return "\033[0m";
+        }
+        return "\033[0m";
+    }
+    /// Reset styling after each independently rendered cell.
+    /// 每个独立单元格结束后恢复样式。
+    std::string_view reset() const {
+        return color_ ? "\033[0m" : std::string_view{};
+    }
+    /// Borrowed diagnostic stream. 借用的诊断输出流。
+    std::ostream& out_;
+    /// Whether ANSI styling is allowed for this stream. 此输出流是否允许 ANSI 样式。
+    bool color_;
+};
 /// 独立于遥测开关报告学习健康。 / Report learning health independently of telemetry.
-void render_learning(const Learning& learning, bool enabled, std::ostream& out) {
+void render_learning(const Learning& learning, bool enabled, std::ostream& out, bool pretty,
+                     bool color) {
+    if (pretty) {
+        PrettyReport report(out, color);
+        report.section("Model persistence");
+        report.row("Runtime learning", enabled ? "enabled" : "disabled",
+                   enabled ? ReportTone::good : ReportTone::warning);
+        report.row("Persistence", learning.store ? "enabled" : "disabled",
+                   learning.store ? ReportTone::good : ReportTone::warning);
+        report.row("Model database", ".same/model.db", ReportTone::info);
+        report.row("Disabled reason",
+                   learning.disabled_reason.empty() ? "none" : learning.disabled_reason,
+                   learning.disabled_reason.empty() ? ReportTone::muted : ReportTone::warning);
+        report.row("Model loads",
+                   std::to_string(learning.loads.load()) + " attempts | " +
+                       std::to_string(learning.hits.load()) + " prior hits | " +
+                       std::to_string(learning.invalid.load()) + " invalid",
+                   learning.invalid.load() ? ReportTone::warning : ReportTone::accent);
+        report.row("Model saves",
+                   std::to_string(learning.saved) + " keys | " +
+                       std::to_string(learning.save_errors) + " errors",
+                   learning.save_errors ? ReportTone::danger : ReportTone::accent);
+        report.row("Setup history",
+                   std::to_string(learning.setup_loads.load()) + " load attempts | " +
+                       std::to_string(learning.setup_hits.load()) + " prior hits | " +
+                       std::to_string(learning.setup_saved) + " saved keys",
+                   ReportTone::accent);
+        report.row("Persistence I/O",
+                   "startup " + human_duration(learning.startup_ms) + " | save " +
+                       human_duration(learning.save_ms),
+                   ReportTone::info);
+        report.row("Run decay", std::to_string(learning_decay), ReportTone::muted);
+        return;
+    }
     out << "model_learning_enabled=" << enabled
         << " model_persistence_enabled=" << bool(learning.store)
         << " model_persistence_disabled_reason="
@@ -676,27 +794,43 @@ std::string histogram_quantile(const std::array<std::uint64_t, 32>& histogram, u
 }
 /// 固定空间的单次运行观测；无堆栈采样器或跨运行训练的暗示。
 /// Fixed-space per-run observations; no implication of stack sampling or cross-run training.
-void render_online_profile(const Resources& resources, std::ostream& out, bool pretty) {
+void render_online_profile(const Resources& resources, std::ostream& out, bool pretty,
+                           bool color = false) {
     const auto profile = resources.profile_snapshot();
     const auto enabled = resources.profiling_enabled();
     const auto p50 = histogram_quantile(profile.latency_histogram, 50);
     const auto p95 = histogram_quantile(profile.latency_histogram, 95);
     const auto residual95 = histogram_quantile(profile.residual_histogram, 95);
     if (pretty) {
-        out << "  Online PGO      " << (enabled ? "enabled" : "disabled") << " | "
-            << profile.samples << " samples (" << profile.cpu_samples << " CPU | "
-            << profile.gpu_samples << " CUDA | " << profile.igpu_samples << " iGPU) | "
-            << resources.exploration_jobs() << " exploration jobs\n"
-            << "  Model coverage  " << profile.cpu_known_bands << " CPU | "
-            << profile.gpu_known_bands << " CUDA | " << profile.igpu_known_bands
-            << " iGPU observed worker-band pairs (run-only diagnostics)\n"
-            << "  Model residual  " << profile.predicted_samples
-            << " predictions checked | p95 residual " << residual95 << " us\n"
-            << "  Prediction error  |sum| " << profile.absolute_error_sum_ms << " ms | squared sum "
-            << profile.squared_error_sum_ms2 << " ms2\n"
-            << "  Learning scope  decayed cross-run prior + thread-local run delta\n"
-            << "  Sample latency  p50 " << p50 << " us | p95 " << p95
-            << " us (bucket ranges; service incl. I/O)\n";
+        PrettyReport report(out, color);
+        report.section("Online routing model");
+        report.row("Online PGO",
+                   std::string(enabled ? "enabled" : "disabled") + " | " +
+                       std::to_string(profile.samples) + " samples (" +
+                       std::to_string(profile.cpu_samples) + " CPU | " +
+                       std::to_string(profile.gpu_samples) + " CUDA | " +
+                       std::to_string(profile.igpu_samples) + " iGPU) | " +
+                       std::to_string(resources.exploration_jobs()) + " exploration jobs",
+                   enabled ? ReportTone::good : ReportTone::warning);
+        report.row("Model coverage",
+                   std::to_string(profile.cpu_known_bands) + " CPU | " +
+                       std::to_string(profile.gpu_known_bands) + " CUDA | " +
+                       std::to_string(profile.igpu_known_bands) +
+                       " iGPU observed worker-band pairs (run-only diagnostics)",
+                   ReportTone::accent);
+        report.row("Model residual",
+                   std::to_string(profile.predicted_samples) +
+                       " predictions checked | p95 residual " + residual95 + " us",
+                   ReportTone::accent);
+        report.row("Prediction error",
+                   "|sum| " + std::to_string(profile.absolute_error_sum_ms) + " ms | squared sum " +
+                       std::to_string(profile.squared_error_sum_ms2) + " ms2",
+                   ReportTone::accent);
+        report.row("Learning scope", "decayed cross-run prior + thread-local run delta",
+                   ReportTone::muted);
+        report.row("Sample latency",
+                   "p50 " + p50 + " us | p95 " + p95 + " us (bucket ranges; service incl. I/O)",
+                   ReportTone::info);
         return;
     }
     out << "pgo_enabled=" << enabled << " pgo_samples=" << profile.samples
@@ -716,9 +850,9 @@ void render_online_profile(const Resources& resources, std::ostream& out, bool p
 }
 /// 空闲后展示每工作线程的真实贡献；模型误差不跨线程合并。
 /// Show worker contributions after idle; never merge independent model error EWMAs.
-void render_worker_profiles(const Resources& resources, std::ostream& out, bool pretty) {
+void render_worker_profiles(const Resources& resources, std::ostream& out, bool pretty,
+                            bool color = false) {
     const auto workers = resources.worker_profiles();
-    out << (pretty ? "  Worker count    " : "worker_count=") << workers.size() << '\n';
     std::uint64_t cpu_bytes = 0, gpu_bytes = 0, igpu_bytes = 0;
     std::size_t gpu_peak = 0, gpu_available = 0;
     for (const auto& worker : workers) {
@@ -728,30 +862,54 @@ void render_worker_profiles(const Resources& resources, std::ostream& out, bool 
         gpu_peak = std::max(gpu_peak, worker.gpu_peak_concurrency);
         gpu_available += worker.gpu_enabled ? 1 : 0;
     }
-    if (pretty)
-        out << "  Backend reads   " << human_bytes(static_cast<double>(cpu_bytes)) << " CPU | "
-            << human_bytes(static_cast<double>(gpu_bytes)) << " CUDA | "
-            << human_bytes(static_cast<double>(igpu_bytes)) << " iGPU | peak " << gpu_peak
-            << " concurrent GPU tasks\n";
-    else
+    if (pretty) {
+        PrettyReport report(out, color);
+        report.section("Workers");
+        report.row("Worker count",
+                   std::to_string(workers.size()) + " total | " + std::to_string(gpu_available) +
+                       " CUDA-capable",
+                   ReportTone::accent);
+        report.row("Backend reads",
+                   human_bytes(static_cast<double>(cpu_bytes)) + " CPU | " +
+                       human_bytes(static_cast<double>(gpu_bytes)) + " CUDA | " +
+                       human_bytes(static_cast<double>(igpu_bytes)) + " iGPU | peak " +
+                       std::to_string(gpu_peak) + " concurrent GPU tasks",
+                   ReportTone::info);
+    } else {
+        out << "worker_count=" << workers.size() << '\n';
         out << "cpu_hash_read_bytes=" << cpu_bytes << " gpu_hash_read_bytes=" << gpu_bytes
             << " igpu_hash_read_bytes=" << igpu_bytes << " gpu_peak_concurrency=" << gpu_peak
             << " gpu_available_workers=" << gpu_available << '\n';
+    }
     for (const auto& worker : workers) {
         const auto& profile = worker.snapshot;
         const auto error =
             profile.predicted_samples ? std::to_string(profile.mean_absolute_error_ms) : "unknown";
         if (pretty) {
-            out << "  Worker " << worker.index << "        " << worker.cpu_hashes << " CPU | "
-                << worker.gpu_hashes << " GPU attempts | " << worker.cpu_hash_bytes << " CPU B | "
-                << worker.gpu_hash_bytes << " CUDA B | " << worker.igpu_hashes
-                << " iGPU attempts | " << worker.igpu_hash_bytes << " iGPU B\n"
-                << "                  " << profile.samples << " samples | local error EWMA "
-                << error << " ms | GPU setup " << human_duration(worker.setup_ms) << " | init "
-                << (worker.gpu_attempted ? "attempted" : "not-needed") << " | GPU "
-                << (worker.gpu_enabled ? "available" : "unavailable") << " | "
-                << worker.gpu_init_failures << " init failures | " << worker.fallbacks
-                << " retries | " << worker.cold_start_cpu << " cold-start CPU bypasses\n";
+            PrettyReport report(out, color);
+            report.row("Worker " + std::to_string(worker.index),
+                       std::to_string(worker.cpu_hashes) + " CPU | " +
+                           std::to_string(worker.gpu_hashes) + " GPU attempts | " +
+                           std::to_string(worker.igpu_hashes) + " iGPU attempts",
+                       ReportTone::accent);
+            report.detail("Read",
+                          std::to_string(worker.cpu_hash_bytes) + " CPU B | " +
+                              std::to_string(worker.gpu_hash_bytes) + " CUDA B | " +
+                              std::to_string(worker.igpu_hash_bytes) + " iGPU B",
+                          ReportTone::info);
+            report.detail("Learning",
+                          std::to_string(profile.samples) + " samples | local error EWMA " + error +
+                              " ms",
+                          ReportTone::accent);
+            report.detail("Device",
+                          "GPU setup " + human_duration(worker.setup_ms) + " | init " +
+                              (worker.gpu_attempted ? "attempted" : "not-needed") + " | GPU " +
+                              (worker.gpu_enabled ? "available" : "unavailable") + " | " +
+                              std::to_string(worker.gpu_init_failures) + " init failures | " +
+                              std::to_string(worker.fallbacks) + " retries | " +
+                              std::to_string(worker.cold_start_cpu) + " cold-start CPU bypasses",
+                          worker.gpu_init_failures || worker.fallbacks ? ReportTone::warning
+                                                                       : ReportTone::muted);
             continue;
         }
         const auto prefix = "worker." + std::to_string(worker.index) + ".";
@@ -801,75 +959,103 @@ void render_pretty_profile(const Counters& counters, const Resources& resources,
                            const std::array<double, 5>& phases, double elapsed,
                            std::uint64_t hashed, std::uint64_t compared, std::ostream& out,
                            bool color, bool unique_files) {
-    const auto heading = color ? "\033[1;36m" : "";
-    const auto value = color ? "\033[36m" : "";
-    const auto reset = color ? "\033[0m" : "";
-    const auto row = [&](std::string_view label, const std::string& text) {
-        out << "  " << std::left << std::setw(16) << label << value << text << reset << '\n';
-    };
-    out << '\n'
-        << heading << "Summary" << reset << "\n"
-        << "-----------------------------------------\n";
+    PrettyReport report(out, color);
+    report.heading("Summary");
     // Consolidate result counts and state metadata into the opt-in diagnostic table.
     // 将结果计数与状态元数据统一放入显式启用的诊断表。
-    row("Groups", std::to_string(counters.groups));
-    row("Matching files", std::to_string(counters.matches));
-    row("Unique files", std::to_string(counters.scanned - counters.matches) +
-                            (!unique_files && counters.scanned != counters.matches
-                                 ? " (hidden; --unique-files to show)"
-                                 : ""));
-    row("Database", ".same/state.db | " +
-                        human_bytes(static_cast<double>(counters.database_bytes)) + " | " +
-                        std::to_string(counters.scanned) + " records | committed");
-    row("Files", std::to_string(counters.scanned) + " scanned | " +
-                     std::to_string(counters.hashed) + " hashed | " +
-                     std::to_string(counters.cached) + " cached");
-    row("Data", human_bytes(static_cast<double>(counters.scanned_bytes)) + " scanned | " +
-                    human_bytes(static_cast<double>(counters.cached_bytes)) + " cached");
-    row("Read", human_bytes(static_cast<double>(hashed) + static_cast<double>(compared)) +
-                    " total | " + human_bytes(static_cast<double>(hashed)) + " hash | " +
-                    human_bytes(static_cast<double>(compared)) + " compare");
-    row("Initialize", human_duration(phases[0]));
-    row("Scan", human_duration(std::max(0.0, phases[1] - counters.hash_wait_ms)) +
-                    " (coordinator incl. walk wait)");
-    row("Hash wait", human_duration(counters.hash_wait_ms) + " (submit + join)");
-    row("Hash work", human_duration(counters.hash_work_ms) + " (summed workers; overlaps scan)");
-    row("Walk wait", human_duration(counters.walk_wait_ms) + " (coordinator wait)");
-    row("Enumerate work", human_duration(counters.enumerate_work_ms) + " (summed workers)");
-    row("Metadata work", human_duration(counters.metadata_work_ms) + " (summed workers)");
-    row("Database work", human_duration(counters.database_work_ms) + " (coordinator)");
-    row("Pipeline", human_duration(phases[1]) + " (Scan + Hash wait; excludes Hash work sum)");
-    row("Compare", human_duration(phases[2]));
-    row("Validate", human_duration(phases[3]));
-    row("Output", human_duration(phases[4]));
-    row("Elapsed", human_duration(elapsed));
+    report.section("Results");
+    report.row("Groups", std::to_string(counters.groups), ReportTone::good);
+    report.row("Matching files", std::to_string(counters.matches), ReportTone::good);
+    const bool hidden_unique = !unique_files && counters.scanned != counters.matches;
+    report.row("Unique files",
+               std::to_string(counters.scanned - counters.matches) +
+                   (hidden_unique ? " (hidden; --unique-files to show)" : ""),
+               hidden_unique ? ReportTone::warning : ReportTone::good);
+
+    report.section("Storage and I/O");
+    report.row("Database",
+               ".same/state.db | " + human_bytes(static_cast<double>(counters.database_bytes)) +
+                   " | " + std::to_string(counters.scanned) + " records | committed",
+               ReportTone::good);
+    report.row("Files",
+               std::to_string(counters.scanned) + " scanned | " + std::to_string(counters.hashed) +
+                   " hashed | " + std::to_string(counters.cached) + " cached",
+               ReportTone::info);
+    report.row("Data",
+               human_bytes(static_cast<double>(counters.scanned_bytes)) + " scanned | " +
+                   human_bytes(static_cast<double>(counters.cached_bytes)) + " cached",
+               ReportTone::info);
+    report.row("Read",
+               human_bytes(static_cast<double>(hashed) + static_cast<double>(compared)) +
+                   " total | " + human_bytes(static_cast<double>(hashed)) + " hash | " +
+                   human_bytes(static_cast<double>(compared)) + " compare",
+               ReportTone::info);
+
+    report.section("Performance");
+    report.row("Elapsed", human_duration(elapsed), ReportTone::good);
+    report.row("Initialize", human_duration(phases[0]), ReportTone::info);
+    report.row("Pipeline",
+               human_duration(phases[1]) + " (Scan + Hash wait; excludes Hash work sum)",
+               ReportTone::info);
+    report.row("Scan",
+               human_duration(std::max(0.0, phases[1] - counters.hash_wait_ms)) +
+                   " (coordinator incl. walk wait)",
+               ReportTone::info);
+    report.row("Hash wait", human_duration(counters.hash_wait_ms) + " (submit + join)",
+               ReportTone::info);
+    report.row("Hash work",
+               human_duration(counters.hash_work_ms) + " (summed workers; overlaps scan)",
+               ReportTone::info);
+    report.row("Walk wait", human_duration(counters.walk_wait_ms) + " (coordinator wait)",
+               ReportTone::info);
+    report.row("Enumerate work", human_duration(counters.enumerate_work_ms) + " (summed workers)",
+               ReportTone::info);
+    report.row("Metadata work", human_duration(counters.metadata_work_ms) + " (summed workers)",
+               ReportTone::info);
+    report.row("Database work", human_duration(counters.database_work_ms) + " (coordinator)",
+               ReportTone::info);
+    report.row("Compare", human_duration(phases[2]), ReportTone::info);
+    report.row("Validate", human_duration(phases[3]), ReportTone::info);
+    report.row("Output", human_duration(phases[4]), ReportTone::info);
     const auto rate = elapsed > 0 ? (static_cast<double>(hashed) + static_cast<double>(compared)) /
                                         (elapsed / 1000)
                                   : 0;
-    row("Read rate", human_bytes(rate) + "/s");
-    row("Backend", std::to_string(resources.gpu_workers()) + " workers initialized CUDA | " +
-                       std::to_string(resources.fallbacks()) + " CPU fallbacks");
-    row("iGPU", std::string(resources.igpu_service_enabled() ? "available"
-                            : resources.igpu_retired()       ? "retired"
-                            : resources.igpu_attempted()     ? "unavailable"
-                            : resources.igpu_deferred()      ? "activation deferred"
-                                                             : "not probed") +
-                    " | discovery " + human_duration(resources.igpu_discovery_ms()) +
-                    " | activation " + human_duration(resources.igpu_setup_ms()));
-    row("Cold-start budget", "credit " + human_duration(resources.cold_credit_ms()) + " | spent " +
-                                 human_duration(resources.cold_spent_ms()) +
-                                 " | iGPU setup estimate " +
-                                 human_duration(resources.igpu_setup_estimate_ms()));
-    row("CPU size route",
-        std::to_string(resources.cpu_routed_hashes()) + " hash attempts (policy, not failure)");
+    report.row("Read rate", human_bytes(rate) + "/s", ReportTone::good);
+
+    report.section("Compute and routing");
+    report.row("Backend",
+               std::to_string(resources.gpu_workers()) + " workers initialized CUDA | " +
+                   std::to_string(resources.fallbacks()) + " CPU fallbacks",
+               resources.fallbacks() ? ReportTone::warning : ReportTone::accent);
+    report.row("iGPU",
+               std::string(resources.igpu_service_enabled() ? "available"
+                           : resources.igpu_retired()       ? "retired"
+                           : resources.igpu_attempted()     ? "unavailable"
+                           : resources.igpu_deferred()      ? "activation deferred"
+                                                            : "not probed") +
+                   " | discovery " + human_duration(resources.igpu_discovery_ms()) +
+                   " | activation " + human_duration(resources.igpu_setup_ms()),
+               resources.igpu_service_enabled() ? ReportTone::good : ReportTone::muted);
+    report.row("Cold-start budget",
+               "credit " + human_duration(resources.cold_credit_ms()) + " | spent " +
+                   human_duration(resources.cold_spent_ms()) + " | iGPU setup estimate " +
+                   human_duration(resources.igpu_setup_estimate_ms()),
+               ReportTone::muted);
+    report.row("CPU size route",
+               std::to_string(resources.cpu_routed_hashes()) +
+                   " hash attempts (policy, not failure)",
+               ReportTone::accent);
     const auto [cpu_attempts, gpu_attempts] = resources.hash_attempts();
-    row("Hash backends", std::to_string(cpu_attempts) + " CPU | " + std::to_string(gpu_attempts) +
-                             " CUDA | " + std::to_string(resources.igpu_hash_attempts()) +
-                             " iGPU attempts");
-    row("Scheduling", "one queue | worker-local CPU/CUDA/iGPU selection and models");
-    row("GPU input", human_bytes(static_cast<double>(resources.gpu_block_bytes())));
-    render_online_profile(resources, out, true);
-    render_worker_profiles(resources, out, true);
+    report.row("Hash backends",
+               std::to_string(cpu_attempts) + " CPU | " + std::to_string(gpu_attempts) +
+                   " CUDA | " + std::to_string(resources.igpu_hash_attempts()) + " iGPU attempts",
+               ReportTone::accent);
+    report.row("Scheduling", "one queue | worker-local CPU/CUDA/iGPU selection and models",
+               ReportTone::muted);
+    report.row("GPU input", human_bytes(static_cast<double>(resources.gpu_block_bytes())),
+               ReportTone::info);
+    render_online_profile(resources, out, true, color);
+    render_worker_profiles(resources, out, true, color);
 }
 /// Print phase wall times and successful read bytes, not CPU time or physical I/O.
 /// 输出各阶段墙钟耗时及成功读取字节，不代表 CPU 时间或物理 I/O。
@@ -1210,20 +1396,39 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
 /// Append final writer health; legacy elapsed excludes this explicit exit drain.
 /// 附加写入器终态；旧 elapsed 不含明确展示的退出排空耗时。
 void render_telemetry(const telemetry::Telemetry* trace, const telemetry::Stats& stats,
-                      double total_ms, std::ostream& out, bool pretty) {
+                      double total_ms, std::ostream& out, bool pretty, bool color) {
     if (!trace) {
-        out << (pretty ? "  Telemetry       disabled\n" : "telemetry_enabled=0\n");
+        if (pretty) {
+            PrettyReport report(out, color);
+            report.section("Telemetry");
+            report.row("Persistence", "disabled", ReportTone::warning);
+        } else {
+            out << "telemetry_enabled=0\n";
+        }
         return;
     }
     if (pretty) {
-        out << "  Telemetry       .same/telemetry.db | " << stats.status.c_str() << '\n'
-            << "  Run ID          " << trace->run_id() << '\n'
-            << "  Trace records   " << stats.accepted << " accepted | " << stats.persisted
-            << " persisted | " << stats.dropped << " dropped | " << stats.errors << " errors\n"
-            << "  Trace pressure  " << stats.queue_high_water << " queued peak | "
-            << stats.truncated << " truncated\n"
-            << "  Telemetry drain " << human_duration(stats.drain_ms) << " (exit wait)\n"
-            << "  Total incl. I/O " << human_duration(total_ms) << " (includes telemetry drain)\n";
+        PrettyReport report(out, color);
+        report.section("Telemetry");
+        report.row("Database", ".same/telemetry.db | " + std::string(stats.status.c_str()),
+                   stats.errors ? ReportTone::danger : ReportTone::good);
+        report.row("Run ID", trace->run_id(), ReportTone::accent);
+        report.row("Trace records",
+                   std::to_string(stats.accepted) + " accepted | " +
+                       std::to_string(stats.persisted) + " persisted | " +
+                       std::to_string(stats.dropped) + " dropped | " +
+                       std::to_string(stats.errors) + " errors",
+                   stats.errors    ? ReportTone::danger
+                   : stats.dropped ? ReportTone::warning
+                                   : ReportTone::good);
+        report.row("Trace pressure",
+                   std::to_string(stats.queue_high_water) + " queued peak | " +
+                       std::to_string(stats.truncated) + " truncated",
+                   stats.truncated ? ReportTone::warning : ReportTone::muted);
+        report.row("Telemetry drain", human_duration(stats.drain_ms) + " (exit wait)",
+                   ReportTone::info);
+        report.row("Total incl. I/O", human_duration(total_ms) + " (includes telemetry drain)",
+                   ReportTone::info);
     } else {
         out << "telemetry_enabled=1 telemetry_db=.same/telemetry.db telemetry_run_id="
             << trace->run_id() << " telemetry_status=" << stats.status.c_str()
@@ -1500,8 +1705,10 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
     const auto total_ms = milliseconds(start, Clock::now());
     if (options.summary) {
         diagnostics << summary.str();
-        render_learning(learning, config.pgo, diagnostics);
-        render_telemetry(trace.get(), stats, total_ms, diagnostics, options.diagnostics_pretty);
+        render_learning(learning, config.pgo, diagnostics, options.diagnostics_pretty,
+                        options.diagnostics_color);
+        render_telemetry(trace.get(), stats, total_ms, diagnostics, options.diagnostics_pretty,
+                         options.diagnostics_color);
     }
     // 写入失败不依赖 --summary，避免静默失去整个运行历史。 / Surface writer failure even
     // without --summary so a missing run history is never silently reported as healthy.

@@ -13,3 +13,18 @@ function(same_build_routes output mode vs_generator)
   endif()
   set(${output} "${_routes}" PARENT_SCOPE)
 endfunction()
+
+# Preserve every vswhere candidate in its declared order; compatibility probing chooses among them.
+# 保留 vswhere 声明顺序中的全部候选；兼容性探针再从中选择。
+function(same_visual_studio_installations output json)
+  string(JSON _count LENGTH "${json}")
+  set(_installations)
+  if(_count GREATER 0)
+    math(EXPR _last "${_count} - 1")
+    foreach(_index RANGE 0 ${_last})
+      string(JSON _installation GET "${json}" ${_index} installationPath)
+      list(APPEND _installations "${_installation}")
+    endforeach()
+  endif()
+  set(${output} "${_installations}" PARENT_SCOPE)
+endfunction()
