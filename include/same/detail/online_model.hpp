@@ -51,7 +51,8 @@ public:
         /// 区间指数索引；不转换为可能溢出的有符号大小边界。
         /// Band exponent index; avoids conversion into overflowing signed size boundaries.
         unsigned band_index{};
-        /// false 为 CPU，true 为 GPU。 / False identifies CPU, true identifies GPU.
+        /// 兼容字段：仅 CUDA 为 true，iGPU 为 false；请优先读取 backend。
+        /// Legacy field: true only for CUDA, false for iGPU; prefer backend.
         bool gpu{};
         /// 实际后端，gpu 仅表示 CUDA。 / Actual backend; legacy gpu means CUDA only.
         BackendKind backend{BackendKind::cpu};
@@ -173,7 +174,7 @@ private:
         std::uint64_t samples{};
         bool known{};
     };
-    /// 两后端各32个四倍区间，覆盖完整 uint64_t 范围。
+    /// 三后端各32个四倍区间，覆盖完整 uint64_t 范围。
     /// Thirty-two factor-four bands per backend cover the complete uint64_t range.
     std::array<std::array<Band, band_count>, backend_count> bands_{};
     /// 固定空间的累计诊断状态。 / Fixed-space cumulative diagnostic state.

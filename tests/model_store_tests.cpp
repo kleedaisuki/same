@@ -47,6 +47,8 @@ int main() {
             require(db.diagnostic().empty(), "initialization");
             require(!db.load("machine-a"), "invented state");
             require(db.save("machine-a", state), "save valid statistics");
+            require(db.save_setup("machine-a", {2, 2, 2, 1}),
+                    "save setup beside model with the same key");
             auto invalid = state;
             invalid[0].weight = std::numeric_limits<double>::quiet_NaN();
             require(!db.save("machine-a", invalid), "NaN accepted");
@@ -58,6 +60,8 @@ int main() {
             require(db.load("machine-a")->at(0).xty == state[0].xty &&
                         db.load("machine-a")->at(0).samples == 1,
                     "roundtrip statistics changed");
+            require(db.load_setup("machine-a") && db.load_setup("machine-a")->last_ms == 2,
+                    "setup/model tables crossed or setup roundtrip changed");
             require(!db.load("machine-b"), "key isolation");
             sql(path, "CREATE TRIGGER reject_write BEFORE INSERT ON models BEGIN SELECT "
                       "RAISE(ABORT,'test'); END");
@@ -65,7 +69,8 @@ int main() {
         }
         {
             same::ModelStore db(path);
-            require(db.load("machine-a").has_value(), "failed write destroyed previous state");
+            require(db.load("machine-a").has_value() && db.load_setup("machine-a"),
+                    "failed write destroyed previous model or setup state");
         }
         sql(path, "DROP TRIGGER reject_write; UPDATE models SET version=999");
         {

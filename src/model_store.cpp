@@ -7,7 +7,9 @@
 #include <stdexcept>
 #include <vector>
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -104,6 +106,41 @@ detail::OnlineModel::State decode(const unsigned char* bytes) {
         s.samples = take(bytes);
     }
     return state;
+}
+/// 存储种类决定表与版本列，避免调用方组合不一致的 SQL。
+/// Record kind selects the table and version column, preventing mismatched SQL combinations.
+enum class RecordKind { model, setup };
+/// 两种学习载荷共享原子替换与有界裁剪；失败由调用方回滚并形成诊断。
+/// Both payloads share atomic replacement and bounded pruning; caller rolls back on failure.
+void replace_payload(sqlite3* db, std::string_view key, const unsigned char* payload,
+                     std::size_t payload_bytes, RecordKind kind) {
+    const bool model = kind == RecordKind::model;
+    const char* insert_sql =
+        model ? "INSERT OR REPLACE INTO models(key,version,payload) VALUES(?,?,?)"
+              : "INSERT OR REPLACE INTO setups(key,payload) VALUES(?,?)";
+    const char* prune_sql = model ? "DELETE FROM models WHERE key IN (SELECT key FROM models "
+                                    "WHERE key<>? ORDER BY key LIMIT -1 OFFSET 31)"
+                                  : "DELETE FROM setups WHERE key IN (SELECT key FROM setups "
+                                    "WHERE key<>? ORDER BY key LIMIT -1 OFFSET 31)";
+    execute(db, "BEGIN IMMEDIATE");
+    Statement insert;
+    check(db, sqlite3_prepare_v2(db, insert_sql, -1, &insert.value, nullptr));
+    check(db, sqlite3_bind_blob(insert.value, 1, key.data(), static_cast<int>(key.size()),
+                                SQLITE_TRANSIENT));
+    const int payload_column = model ? 3 : 2;
+    if (model)
+        check(db, sqlite3_bind_int(insert.value, 2, detail::OnlineModel::feature_version));
+    check(db, sqlite3_bind_blob(insert.value, payload_column, payload,
+                                static_cast<int>(payload_bytes), SQLITE_TRANSIENT));
+    check(db, sqlite3_step(insert.value));
+
+    // 保留当前键，其余按稳定次序裁剪。 / Keep the current key; trim others deterministically.
+    Statement prune;
+    check(db, sqlite3_prepare_v2(db, prune_sql, -1, &prune.value, nullptr));
+    check(db, sqlite3_bind_blob(prune.value, 1, key.data(), static_cast<int>(key.size()),
+                                SQLITE_TRANSIENT));
+    check(db, sqlite3_step(prune.value));
+    execute(db, "COMMIT");
 }
 } // namespace
 /// 冷路径连接；关闭自动回滚未提交事务。 / Cold-path connection; closing rolls back transactions.
@@ -268,30 +305,7 @@ bool ModelStore::save(std::string_view key, const detail::OnlineModel::State& st
         if (!detail::OnlineModel::valid_state(state))
             throw std::runtime_error("invalid model statistics");
         const auto bytes = encode(state);
-        execute(impl_->db, "BEGIN IMMEDIATE");
-        Statement insert;
-        check(impl_->db,
-              sqlite3_prepare_v2(impl_->db,
-                                 "INSERT OR REPLACE INTO models(key,version,payload) VALUES(?,?,?)",
-                                 -1, &insert.value, nullptr));
-        check(impl_->db, sqlite3_bind_blob(insert.value, 1, key.data(),
-                                           static_cast<int>(key.size()), SQLITE_TRANSIENT));
-        check(impl_->db, sqlite3_bind_int(insert.value, 2, detail::OnlineModel::feature_version));
-        check(impl_->db, sqlite3_bind_blob(insert.value, 3, bytes.data(),
-                                           static_cast<int>(bytes.size()), SQLITE_TRANSIENT));
-        check(impl_->db, sqlite3_step(insert.value));
-
-        // 当前键必保留，其他键按稳定次序裁剪。 / Keep the current key and trim others
-        // deterministically.
-        Statement prune;
-        check(impl_->db, sqlite3_prepare_v2(impl_->db,
-                                            "DELETE FROM models WHERE key IN (SELECT key FROM "
-                                            "models WHERE key<>? ORDER BY key LIMIT -1 OFFSET 31)",
-                                            -1, &prune.value, nullptr));
-        check(impl_->db, sqlite3_bind_blob(prune.value, 1, key.data(), static_cast<int>(key.size()),
-                                           SQLITE_TRANSIENT));
-        check(impl_->db, sqlite3_step(prune.value));
-        execute(impl_->db, "COMMIT");
+        replace_payload(impl_->db, key, bytes.data(), bytes.size(), RecordKind::model);
         impl_->diagnostic.clear();
         return true;
     } catch (const std::exception& e) {
@@ -318,24 +332,7 @@ bool ModelStore::save_setup(std::string_view key, const SetupHistory& history) {
         append(bytes, std::bit_cast<std::uint64_t>(history.mean_ms));
         append(bytes, std::bit_cast<std::uint64_t>(history.max_ms));
         append(bytes, history.samples);
-        execute(impl_->db, "BEGIN IMMEDIATE");
-        Statement insert;
-        check(impl_->db, sqlite3_prepare_v2(
-                             impl_->db, "INSERT OR REPLACE INTO setups(key,payload) VALUES(?,?)",
-                             -1, &insert.value, nullptr));
-        check(impl_->db, sqlite3_bind_blob(insert.value, 1, key.data(),
-                                           static_cast<int>(key.size()), SQLITE_TRANSIENT));
-        check(impl_->db, sqlite3_bind_blob(insert.value, 2, bytes.data(), 32, SQLITE_TRANSIENT));
-        check(impl_->db, sqlite3_step(insert.value));
-        Statement prune;
-        check(impl_->db, sqlite3_prepare_v2(impl_->db,
-                                            "DELETE FROM setups WHERE key IN (SELECT key FROM "
-                                            "setups WHERE key<>? ORDER BY key LIMIT -1 OFFSET 31)",
-                                            -1, &prune.value, nullptr));
-        check(impl_->db, sqlite3_bind_blob(prune.value, 1, key.data(), static_cast<int>(key.size()),
-                                           SQLITE_TRANSIENT));
-        check(impl_->db, sqlite3_step(prune.value));
-        execute(impl_->db, "COMMIT");
+        replace_payload(impl_->db, key, bytes.data(), bytes.size(), RecordKind::setup);
         impl_->diagnostic.clear();
         return true;
     } catch (const std::exception& e) {
