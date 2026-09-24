@@ -50,7 +50,16 @@ int main() {
 #ifdef _WIN32
     // 显式扩展路径创建夹具，避免依赖注册表或测试进程清单。
     // Create fixtures with explicit extended paths, independent of registry/manifest opt-in.
-    const auto deep = root / std::wstring(100, L'a') / std::wstring(100, L'b') / L"论文资料";
+    // 临时目录长度因机器而异；按实际路径补足长度，始终覆盖超过 MAX_PATH 的场景。
+    // Temp roots vary by machine; extend one component to guarantee a path beyond MAX_PATH.
+    const auto first = root / std::wstring(100, L'a');
+    std::wstring second(100, L'b');
+    auto deep = first / second / L"论文资料";
+    const auto length = (deep / L"论文.pdf").native().size();
+    if (length <= MAX_PATH) {
+        second.append(MAX_PATH + 1 - length, L'b');
+        deep = first / second / L"论文资料";
+    }
     const fs::path extended(L"\\\\?\\" + deep.native());
     fs::create_directories(extended);
     {
