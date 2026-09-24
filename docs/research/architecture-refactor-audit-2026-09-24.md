@@ -4,6 +4,8 @@
 
 Reviewed the public data/contracts in `include/same/{application,config,files,store,resources,compute}.hpp`, the scan/partition/run paths in `src/application.cpp`, `src/store.cpp`, and `src/resources.cpp`, and existing design/maintenance notes. This is a source audit, not a benchmark or test run. The current uncommitted traversal/security work was excluded. Preserve CLI text, output ordering, state schema, library overloads, and failure semantics. Prefer the first two small changes below; the third is conditional on measured maintenance need.
 
+**Implementation update:** priorities 1 and 2 landed in `cf9fea3` and `787ad74` respectively. Their combined MSVC Release build and 25/25 CTest suite passed with repository-local `TEMP`/`TMP`; cross-platform Actions evidence is recorded in [validation](../validation.md). Priority 3 remains deferred because neither profiling nor golden-output evidence justifies its broader reporting surface.
+
 | Priority | Current data/state problem | Recommended boundary | Compatibility and cost |
 |---|---|---|---|
 | 1 | `HashInput` carries a `FileRecord` with a default zero digest before hashing (`src/application.cpp`, `HashInput`, `scan`, `hash_file`). The type used by `Store::save` thus also represents a not-yet-hashed file. | Introduce an application-private move-only `HashCandidate { path, stamp, reader }`; let `hash_file` return a `FileRecord` only after `finish()` and both version checks. `scan` constructs candidates from walk entries; `HashResult` remains a verified record plus timing. | Small local edit; keep public `FileRecord`, Store schema and output unchanged. Update direct `hash_file` test calls. Avoid a new inheritance hierarchy or generic typestate framework. |

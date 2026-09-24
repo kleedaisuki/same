@@ -17,6 +17,7 @@ DDD expresses semantics and ownership, not a large inheritance framework. `Compu
 | 领域 / Domain | `FileStamp` | 大小、平台文件身份、修改/变更时间组成缓存版本证据 / Size, platform identity, modification/change timestamps form cache-version evidence |
 | 领域 / Domain | `Digest` | 固定 32 字节 BLAKE3 摘要，不表示字节相等 / Fixed 32-byte BLAKE3 digest, not byte equality |
 | 领域 / Domain | `FileRecord` | 根目录相对路径、版本证据、摘要 / Root-relative path, version evidence, digest |
+| 应用 / Application | `HashCandidate` → `FileRecord` | 候选项仅有路径、文件戳与首次读取句柄；完整哈希及版本复核后才形成可持久化记录 / Candidate has path, stamp and first-read handle, but no digest; only complete hashing and version checks produce a persistable record |
 | 应用 / Application | scan → hash → partition → validate → output | 编排流程与失败传播，不直接实现 CUDA 或 SQL / Orchestration and failure propagation, not CUDA or SQL |
 | 边界 / Ports | `Store`, `Compute`, `FileReader`, `Resources` | 单所有者仓储、计算后端、句柄读取、统一任务准入 / Single-owner repository, compute backend, handle-based reads, unified admission |
 | 基础设施 / Infrastructure | SQLite, CUDA, CPU BLAKE3, Win32/POSIX, run lock | 封装平台和库细节 / Encapsulate library/platform details |
@@ -59,7 +60,11 @@ Scan updates form one transaction: failures roll back and a successful scan comm
 
 定义工作线程数 `W`、块大小 `B`、排队容量 `Q`、显存预算 `V`。所有哈希和比较任务共享一个资源池。每个线程独占两个读取缓冲和计算实例，避免数据竞争（data race）和隐式嵌套线程池。队列满时提交者等待；在途 future 同样有界，防止早期慢任务导致后续已完成结果无限堆积。
 
+公开配置仍用 `backend = auto|cpu|cuda|igpu`；`Resources` 验证后将其转成单个内部 `BackendPolicy`，表示用户的调度意图。它不同于表示实际执行设备的 `BackendKind`：`auto` 不是设备，设备探测与回退也不会改变配置意图。这样预算、冷启动和候选设备共享同一策略状态，而不组合多个互斥布尔标志。
+
 Let `W` be workers, `B` block bytes, `Q` queue capacity, and `V` the device budget. Hashing and comparison share one pool. Each worker owns two read buffers and a compute instance. A full queue blocks producers, and pending futures are also bounded so slow early tasks cannot cause unbounded completed-result accumulation.
+
+The public `backend = auto|cpu|cuda|igpu` setting remains unchanged. After validation, `Resources` converts it to one internal `BackendPolicy` representing configured routing intent. This is distinct from `BackendKind`, the actual execution device: `auto` is not a device, and discovery or fallback does not change intent. Budgeting, cold start and candidate eligibility therefore share one policy state instead of a combination of mutually exclusive booleans.
 
 | 资源 / Resource | 管理方式 / Accounting |
 |---|---|
