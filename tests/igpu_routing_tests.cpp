@@ -347,6 +347,45 @@ void exploration() {
             "zero-estimate experiment did not tolerate measured startup debt");
     require(pool.profile_snapshot().igpu_samples > 0, "iGPU sample attributed incorrectly");
 }
+/// 四种配置意图保持独立；非哈希任务仅在显式设备模式下使用设备。
+/// Four configured intents stay distinct; generic work uses a device only when forced.
+void backend_policy() {
+    for (const auto* name : {"cpu", "auto", "cuda", "igpu"}) {
+        auto c = config();
+        c.workers = 1;
+        c.backend = name;
+        c.pgo = false;
+        unsigned cuda_calls = 0, igpu_calls = 0;
+        same::Resources pool(
+            c,
+            [&](auto, auto) -> std::unique_ptr<same::Compute> {
+                ++cuda_calls;
+                return std::make_unique<Device>(same::BackendKind::cuda);
+            },
+            [&](auto, auto) -> std::unique_ptr<same::Compute> {
+                ++igpu_calls;
+                return std::make_unique<Device>(same::BackendKind::igpu);
+            });
+        const auto generic = pool.submit([](same::Worker& w) { return w.compute->kind(); }).get();
+        const auto small =
+            pool.submit_hash([](same::Worker& w) { return w.compute->kind(); }, 1024).get();
+        const auto large = pool.submit_hash([](same::Worker& w) { return w.compute->kind(); },
+                                            same::detail::RoutingParameters::static_gpu_floor_bytes)
+                               .get();
+        pool.wait_idle();
+        const std::string_view policy{name};
+        const auto forced = policy == "cuda"   ? same::BackendKind::cuda
+                            : policy == "igpu" ? same::BackendKind::igpu
+                                               : same::BackendKind::cpu;
+        require(generic == forced, "generic work violated configured backend policy");
+        require(small == forced, "small hash violated configured backend policy");
+        require(large == (policy == "auto" ? same::BackendKind::cuda : forced),
+                "large hash violated configured backend policy");
+        require((cuda_calls > 0) == (policy == "auto" || policy == "cuda") &&
+                    (igpu_calls > 0) == (policy == "igpu"),
+                "backend policy initialized an ineligible device");
+    }
+}
 } // namespace
 int main() {
     try {
@@ -360,6 +399,7 @@ int main() {
         short_scan_discovery(true);
         short_scan_discovery(false);
         exploration();
+        backend_policy();
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 1;

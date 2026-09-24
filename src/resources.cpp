@@ -28,6 +28,18 @@ void add_atomic(std::atomic<double>& target, double value) {
 }
 } // namespace
 
+Resources::BackendPolicy Resources::parse_backend(std::string_view backend) {
+    if (backend == "cpu")
+        return BackendPolicy::cpu;
+    if (backend == "auto")
+        return BackendPolicy::automatic;
+    if (backend == "cuda")
+        return BackendPolicy::cuda;
+    if (backend == "igpu")
+        return BackendPolicy::igpu;
+    throw std::invalid_argument("unsupported backend policy");
+}
+
 Resources::Resources(const Config& config)
     : Resources(config, try_cuda_compute, try_igpu_compute, {}, {}, try_igpu_profile) {}
 Resources::Resources(const Config& config, detail::CudaFactory factory)
@@ -39,8 +51,7 @@ Resources::Resources(const Config& config, detail::ModelPriorLoader prior,
 Resources::Resources(const Config& config, detail::CudaFactory factory, detail::CudaFactory igpu,
                      detail::ModelPriorLoader prior, detail::SetupPriorLoader setup,
                      detail::IgpuProbe probe)
-    : pgo_(config.pgo), auto_mode_(config.backend == "auto"), forced_gpu_(config.backend == "cuda"),
-      forced_igpu_(config.backend == "igpu"), igpu_bootstrap_ms_(config.igpu_bootstrap_ms),
+    : pgo_(config.pgo), igpu_bootstrap_ms_(config.igpu_bootstrap_ms),
       cuda_bootstrap_ms_(config.cuda_bootstrap_ms), setup_loader_(std::move(setup)),
       igpu_probe_(std::move(probe)), igpu_setup_estimate_ms_(config.igpu_bootstrap_ms),
       cold_exploration_fraction_(config.cold_exploration_fraction),
@@ -48,10 +59,11 @@ Resources::Resources(const Config& config, detail::CudaFactory factory, detail::
       igpu_factory_(std::move(igpu)), capacity_(config.queue_capacity),
       cuda_factory_(std::move(factory)) {
     config.validate();
+    policy_ = parse_backend(config.backend);
     auto remaining = config.memory_bytes - buffer_cost(config.block_bytes) * config.workers;
-    if ((auto_mode_ || forced_igpu_) && igpu_factory_) {
+    if ((policy_ == BackendPolicy::automatic || policy_ == BackendPolicy::igpu) && igpu_factory_) {
         auto block = std::min(config.block_bytes, detail::RoutingParameters::gpu_block_bytes);
-        const auto allowance = forced_igpu_ ? remaining : remaining / 2;
+        const auto allowance = policy_ == BackendPolicy::igpu ? remaining : remaining / 2;
         while (block >= 1024 && buffer_cost(block) + 2 * block + 65536 > allowance)
             block /= 2;
         if (block >= 1024) {
@@ -63,9 +75,9 @@ Resources::Resources(const Config& config, detail::CudaFactory factory, detail::
     }
     gpu_device_budget_ = (config.device_memory_bytes - igpu_budget_) / config.workers;
     const auto share = remaining / config.workers;
-    if (forced_gpu_)
+    if (policy_ == BackendPolicy::cuda)
         gpu_block_bytes_ = config.block_bytes;
-    else if (auto_mode_) {
+    else if (policy_ == BackendPolicy::automatic) {
         auto block = detail::RoutingParameters::gpu_block_bytes;
         while (block >= 1024 && buffer_cost(block) > share)
             block /= 2;
@@ -87,7 +99,7 @@ Resources::Resources(const Config& config, detail::CudaFactory factory, detail::
         worker->cpu_block_bytes = config.block_bytes;
         worker->gpu_block_bytes = gpu_block_bytes_;
         worker->device_budget_bytes = gpu_device_budget_;
-        worker->gpu_reuses_cpu_buffers = forced_gpu_;
+        worker->gpu_reuses_cpu_buffers = policy_ == BackendPolicy::cuda;
         load_prior(*worker, BackendKind::cpu, *worker->compute, config.block_bytes);
         workers_.push_back(std::move(worker));
     }
@@ -170,10 +182,10 @@ Resources::choose_backend(Worker& worker, std::uint64_t bytes, bool hash,
                           const std::array<bool, 3>& candidates) {
     if (hash && (!bytes || bytes < worker.gpu_floor))
         return {BackendKind::cpu, Reason::size};
-    if (!auto_mode_ || !hash) {
-        const auto forced = forced_gpu_    ? BackendKind::cuda
-                            : forced_igpu_ ? BackendKind::igpu
-                                           : BackendKind::cpu;
+    if (policy_ != BackendPolicy::automatic || !hash) {
+        const auto forced = policy_ == BackendPolicy::cuda   ? BackendKind::cuda
+                            : policy_ == BackendPolicy::igpu ? BackendKind::igpu
+                                                             : BackendKind::cpu;
         return {candidates[static_cast<unsigned>(forced)] ? forced : BackendKind::cpu,
                 Reason::fixed};
     }
@@ -231,7 +243,7 @@ Resources::choose_backend(Worker& worker, std::uint64_t bytes, bool hash,
 }
 
 bool Resources::begin_cold(const Worker& worker, double estimate) {
-    if (!auto_mode_ || !pgo_)
+    if (policy_ != BackendPolicy::automatic || !pgo_)
         return true;
     bool idle = false;
     if (!cold_start_busy_.compare_exchange_strong(idle, true, std::memory_order_acquire))
@@ -250,7 +262,7 @@ bool Resources::begin_cold(const Worker& worker, double estimate) {
 }
 
 void Resources::end_cold() {
-    if (auto_mode_ && pgo_)
+    if (policy_ == BackendPolicy::automatic && pgo_)
         cold_start_busy_.store(false, std::memory_order_release);
 }
 
@@ -317,7 +329,7 @@ bool Resources::discover_igpu(Worker& worker) {
 }
 
 bool Resources::admit_cold_igpu(const Worker& worker) const {
-    if (!auto_mode_ || !pgo_ || igpu_setup_estimate_ms_ == 0)
+    if (policy_ != BackendPolicy::automatic || !pgo_ || igpu_setup_estimate_ms_ == 0)
         return true;
     const auto cpu = worker.model.predict(BackendKind::cpu, worker.candidate_contexts[0]);
     const auto igpu = worker.model.predict(BackendKind::igpu, worker.candidate_contexts[2]);
@@ -475,7 +487,7 @@ bool Resources::prepare_gpu(Worker& worker) {
 
 bool Resources::activate_cuda(Worker& worker) {
     bool owns_bootstrap = false;
-    if (auto_mode_ && !worker.gpu_attempted) {
+    if (policy_ == BackendPolicy::automatic && !worker.gpu_attempted) {
         auto state = Bootstrap::cold;
         owns_bootstrap = bootstrap_.compare_exchange_strong(state, Bootstrap::initializing,
                                                             std::memory_order_acq_rel);
@@ -527,12 +539,14 @@ void Resources::select_backend(Worker& worker, std::uint64_t bytes, bool hash) n
     try {
         std::array<bool, 3> candidates{
             true,
-            (auto_mode_ || forced_gpu_) && cuda_factory_ && worker.gpu_block_bytes &&
-                worker.device_budget_bytes && !worker.gpu_retired &&
-                (!worker.gpu_attempted || worker.gpu_enabled),
-            (auto_mode_ || forced_igpu_) && igpu_factory_ && igpu_block_bytes_};
+            (policy_ == BackendPolicy::automatic || policy_ == BackendPolicy::cuda) &&
+                cuda_factory_ && worker.gpu_block_bytes && worker.device_budget_bytes &&
+                !worker.gpu_retired && (!worker.gpu_attempted || worker.gpu_enabled),
+            (policy_ == BackendPolicy::automatic || policy_ == BackendPolicy::igpu) &&
+                igpu_factory_ && igpu_block_bytes_};
         const auto band = bytes ? (std::bit_width(bytes) - 1) / detail::OnlineModel::band_shift : 0;
-        if (auto_mode_ && pgo_ && hash && bytes >= worker.gpu_floor && bytes)
+        if (policy_ == BackendPolicy::automatic && pgo_ && hash && bytes >= worker.gpu_floor &&
+            bytes)
             ++worker.arrivals[band];
         // 两设备各至多一次首次资料重选及一次排除；最后必有 CPU。
         // Each device permits one discovery reconsideration and one exclusion; CPU always remains.
@@ -563,7 +577,8 @@ void Resources::select_backend(Worker& worker, std::uint64_t bytes, bool hash) n
                 continue;
             }
             worker.selected_backend = worker.compute.get();
-            if (auto_mode_ && pgo_ && !known_device && kind != BackendKind::cpu) {
+            if (policy_ == BackendPolicy::automatic && pgo_ && !known_device &&
+                kind != BackendKind::cpu) {
                 // 首次发现的真实容量与先验必须参与执行前的同一选择过程。
                 // Newly discovered capacity/prior participates before execution, not after it.
                 finish_task(worker);

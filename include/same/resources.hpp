@@ -9,6 +9,7 @@
 #include <functional>
 #include <future>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -363,8 +364,15 @@ private:
     /// 所属线程恢复 CPU 缓冲并退休失败上下文。 / Owner restores CPU buffers and retires failed
     /// contexts.
     void finish_task(Worker& worker);
+    /// 配置意图不同于实际执行设备；automatic 不是 BackendKind。
+    /// Configured intent differs from the selected device; automatic is not a BackendKind.
+    enum class BackendPolicy { cpu, automatic, cuda, igpu };
+    /// 仅在 Config::validate 后转换；未知值不能默认为 CPU。
+    /// Convert only after Config::validate; unknown values must not default to CPU.
+    static BackendPolicy parse_backend(std::string_view backend);
     /// 固定配置及集中预算。 / Frozen configuration and centralized budgets.
-    bool pgo_{}, auto_mode_{}, forced_gpu_{}, forced_igpu_{};
+    bool pgo_{};
+    BackendPolicy policy_{BackendPolicy::cpu};
     /// 单上下文、统一内存配额；原子准入失败立即继续其他后端。
     /// One context and unified-memory quota; failed atomic admission never waits.
     bool select_igpu(Worker& worker);

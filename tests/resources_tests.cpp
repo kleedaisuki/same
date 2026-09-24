@@ -89,6 +89,16 @@ int main() {
             threw = true;
         }
         require(threw, "impossible host budget was accepted");
+        cfg.memory_bytes = 8192;
+        cfg.backend = "unknown";
+        std::string validation_message;
+        try {
+            same::Resources invalid(cfg);
+        } catch (const std::runtime_error& error) {
+            validation_message = error.what();
+        }
+        require(validation_message == "backend must be auto, cpu, cuda or igpu",
+                "invalid backend bypassed Config validation or changed diagnostics");
         std::cout << "unified queue, exception and drain contracts passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
