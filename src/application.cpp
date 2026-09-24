@@ -153,9 +153,9 @@ void quoted_path(std::ostream& out, std::string_view path) {
     }
     out << '"';
 }
-/// Reject linked state paths before opening SQLite; concurrent hostile replacement
-/// still requires filesystem-level isolation rather than these preflight checks.
-/// 打开 SQLite 前拒绝链接状态路径；恶意并发替换仍需文件系统隔离，不能仅靠预检查。
+/// Reject existing core database redirects before SQLite opens them; RunLock and ModelStore
+/// validate their own paths at the owning open boundary.
+/// 在 SQLite 打开核心数据库前拒绝已有重定向；RunLock 和 ModelStore 在各自的打开边界验证路径。
 void prepare_state(const fs::path& root) {
     const auto state = root / ".same";
     const auto status = fs::symlink_status(state);
@@ -164,8 +164,7 @@ void prepare_state(const fs::path& root) {
             throw std::runtime_error(".same must be a real directory, not a link");
     } else
         fs::create_directory(state);
-    for (const auto* name :
-         {"state.db", "state.db-wal", "state.db-shm", "state.db-journal", "run.lock"}) {
+    for (const auto* name : {"state.db", "state.db-wal", "state.db-shm", "state.db-journal"}) {
         const auto path = state / name;
         const auto entry = fs::symlink_status(path);
         if (fs::exists(entry) && (!fs::is_regular_file(entry) || is_reparse_point(path)))
@@ -1525,14 +1524,8 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
         if (config.pgo) {
             const auto learning_start = Clock::now();
             try {
-                for (const auto* name :
-                     {"model.db", "model.db-wal", "model.db-shm", "model.db-journal"}) {
-                    const auto path = root / ".same" / name;
-                    const auto status = fs::symlink_status(path);
-                    if (fs::exists(status) &&
-                        (!fs::is_regular_file(status) || is_reparse_point(path)))
-                        throw std::runtime_error("model path must be a regular non-link file");
-                }
+                // ModelStore validates database and sidecars at its owning open boundary.
+                // ModelStore 在自身打开边界验证数据库及旁路文件，避免重复的路径预检查。
                 learning.cpu = make_cpu_compute()->profile();
                 if (learning.cpu.device_name.empty())
                     learning.disabled_reason = "cpu_identity_unknown";

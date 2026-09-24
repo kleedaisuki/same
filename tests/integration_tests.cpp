@@ -458,6 +458,26 @@ void symlinks(const fs::path& exe) {
     }
     {
         Fixture f(exe);
+        const auto target = f.file("lock-target", "do not modify");
+        if (f.symlink(target, f.root / ".same/run.lock")) {
+            f.run(2);
+            check(read(target) == "do not modify", "linked run lock modified");
+        }
+    }
+    {
+        Fixture f(exe);
+        f.config({{"pgo", "true"}});
+        f.file("a", "same");
+        f.file("b", "same");
+        const auto target = f.file("model-target", "do not modify");
+        if (f.symlink(target, f.root / ".same/model.db")) {
+            check(f.run() == Groups{group({"a", "b"})},
+                  "linked optional model changed duplicate groups");
+            check(read(target) == "do not modify", "linked optional model modified");
+        }
+    }
+    {
+        Fixture f(exe);
         fs::remove(f.root / ".same/config.toml");
         fs::remove(f.root / ".same");
         auto target = f.root / "state-target";
