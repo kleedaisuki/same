@@ -1,5 +1,25 @@
 # 验证记录 / Validation record
 
+## 2026-09-24：兼容性重构与治理 / Compatibility refactor and governance
+
+本轮只改变内部组织：未修改 CLI/终端展示、用户配置键、SQLite 模式或发布包格式。`HashCandidate` 将待哈希文件与已验证的 `FileRecord` 分开；`BackendPolicy` 将内部后端意图从三个互斥布尔标志改为单一枚举；模型仓储共用原子替换/裁剪逻辑。移除重复的模型数据库及运行锁路径预检，但保留资源所有者检查和主数据库保护。Windows `.SAME` 别名回归在全量集成测试中被发现，并通过仅对根级大小写候选执行身份查询修复。
+
+Only internal organization changed: CLI/terminal presentation, user configuration keys, SQLite schemas and release package formats remain unchanged. `HashCandidate` distinguishes pending input from a verified `FileRecord`; `BackendPolicy` replaces three mutually exclusive internal flags; the model store shares atomic replace/prune logic. Duplicate model-database and run-lock preflights were removed while owner checks and the core database guard remain. The full integration suite exposed a Windows `.SAME` alias regression, fixed with an identity query limited to root-level case candidates.
+
+| 环境 / Environment | 实测结果 / Observed result |
+|---|---|
+| Windows, Visual Studio 18 MSVC 19.51, CPU Release; `TEMP`/`TMP` 指向仓库 `.temp` | 完整构建及 25/25 CTest 通过；测试产物位于 `.cache`/`.temp` / Full build and 25/25 CTest passed; artifacts stayed in `.cache`/`.temp` |
+| Windows, 独立 Python 遥测归档测试 / standalone Python archive tests | 12/12 `unittest` 通过 / 12/12 passed |
+| `clang-format` 22.1.8 与 Git 差异检查 / diff check | 本轮改动文件或改动行检查通过，`git diff --check` 通过；既有 `integration_tests.cpp` 非改动行仍不符合当前 `clang-format` / Changed files or lines and `git diff --check` passed; unrelated existing `integration_tests.cpp` lines remain unformatted |
+
+提交 `787ad7449304bf9db4721f2c0fc31531400d79e6` 的 [GitHub Actions 运行 35976744240](https://github.com/kleedaisuki/same/actions/runs/35976744240) 已完成：16 个执行作业全部成功，非标签发布作业按条件跳过。成功作业包括 Linux/Windows/macOS × OpenCL 开关的 6 组原生 CTest、3 组遥测归档测试、PoCL 内核测试、Linux ASan/UBSan，以及 5 组跨平台标准/CUDA 发布包构建与测试。CUDA 发布作业没有 GPU 驱动，**不能据此宣称真实 CUDA 设备执行通过**。
+
+For commit `787ad7449304bf9db4721f2c0fc31531400d79e6`, [GitHub Actions run 35976744240](https://github.com/kleedaisuki/same/actions/runs/35976744240) completed with all 16 executed jobs successful; the non-tag publish job was skipped as intended. Jobs covered six native CTest OS/OpenCL combinations, three telemetry archive test runs, a PoCL kernel run, Linux ASan/UBSan, and five standard/CUDA package builds and tests. CUDA packaging had no GPU driver and **does not establish execution on actual CUDA hardware**.
+
+MinGW 编译可用，但其现有目录符号链接测试夹具在 `std::filesystem::remove_all` 清理阶段超时；这不证明生产扫描失败。Windows 本地测试不证明 CUDA 硬件执行；跨平台结果应以对应提交的 GitHub Actions 运行记录为准。
+
+MinGW compilation succeeded, but an existing directory-symlink test fixture timed out during `std::filesystem::remove_all` cleanup; that is not evidence of a production scan failure. Local Windows tests do not establish CUDA hardware execution. Cross-platform claims require the GitHub Actions run for the corresponding commit.
+
 ## 2026-09-07：原生构建与可读性重构 / Native build and readability refactor
 
 本轮重新执行，集成测试已迁移为 C++，构建及全部 CTest 不依赖 Python。下方旧记录保留为历史，不替代本轮证据。
