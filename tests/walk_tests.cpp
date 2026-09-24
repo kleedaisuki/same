@@ -98,6 +98,19 @@ int run_tests() {
         failed = true;
     }
     require(failed);
+    // 无工作区状态时也应遍历普通目录；忽略策略而非路径等价查询负责排除 .same。
+    // A bare root still traverses ordinary directories; ignore policy, not path identity,
+    // excludes .same.
+    const auto bare = root / "bare";
+    fs::create_directory(bare);
+    fs::create_directory(bare / "data");
+    std::ofstream(bare / "data" / "only.txt") << "abc";
+    {
+        same::ParallelWalk walk(bare, 2, 1);
+        const auto item = walk.next();
+        require(item && item->path == "data/only.txt");
+        require(!walk.next());
+    }
     failed = false;
     try {
         same::ParallelWalk walk(root, 0, 1);

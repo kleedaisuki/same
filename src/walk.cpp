@@ -5,8 +5,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <exception>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -25,6 +25,21 @@ std::string key_of(const fs::path& path) {
 double elapsed(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
+#ifdef _WIN32
+/// 仅大小写别名需要对象身份查询；大小写敏感目录中的独立 .SAME 仍可扫描。
+/// Only a case alias needs an identity query; a distinct .SAME in a case-sensitive directory
+/// remains scannable.
+bool state_alias(const fs::path& path, const fs::path& root) {
+    if (path.parent_path() != root ||
+        CompareStringOrdinal(path.filename().c_str(), -1, L".same", -1, TRUE) != CSTR_EQUAL)
+        return false;
+    std::error_code error;
+    const bool alias = fs::equivalent(path, root / ".same", error);
+    if (error && error != std::errc::no_such_file_or_directory)
+        throw fs::filesystem_error("identify state directory alias", path, root / ".same", error);
+    return alias;
+}
+#endif
 /// 枚举缓存属性；不把目录缓存时间当成文件版本。 / Enumeration attributes, never used as a version
 /// stamp.
 struct Entry {
@@ -225,16 +240,21 @@ struct ParallelWalk::Impl {
         totals.result_peak = std::max(totals.result_peak, results.size());
         changed.notify_all();
     }
-    /// 保留原有链接与忽略语义；目录在下降前过滤。 / Preserve links/ignore semantics; filter before
-    /// descending.
+    /// 通常由忽略策略处理 .same；Windows 大小写别名才需额外对象身份查询。
+    /// Ignore policy handles the usual .same path; only Windows case aliases need an extra
+    /// filesystem identity query.
     std::optional<Task> classify(const Entry& entry) {
         const auto path = entry.path;
         const auto key = key_of(path.lexically_relative(root));
         if (entry.reparse)
             return {};
         if (entry.directory) {
-            if (!recursive || ignore.can_prune(key) || fs::equivalent(path, root / ".same"))
+            if (!recursive || ignore.can_prune(key))
                 return {};
+#ifdef _WIN32
+            if (state_alias(path, root))
+                return {};
+#endif
             return Task{path, true};
         }
         if (entry.regular && !ignore.matches(key, false))
