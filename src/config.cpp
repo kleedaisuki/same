@@ -80,24 +80,19 @@ Config Config::load(const std::filesystem::path& root) {
             throw std::runtime_error("backend must be a string");
         result.backend = *value;
     }
-    if (table.contains("rehash")) {
-        auto value = table["rehash"].value_exact<bool>();
+    // Keep supported booleans strict while unknown keys retain forward compatibility.
+    // 已支持的布尔项保持严格类型；未知键继续允许未来版本扩展。
+    auto boolean = [&](const char* name, bool& target) {
+        if (!table.contains(name))
+            return;
+        const auto value = table[name].value_exact<bool>();
         if (!value)
-            throw std::runtime_error("rehash must be boolean");
-        result.rehash = *value;
-    }
-    if (table.contains("pgo")) {
-        auto value = table["pgo"].value_exact<bool>();
-        if (!value)
-            throw std::runtime_error("pgo must be boolean");
-        result.pgo = *value;
-    }
-    if (table.contains("telemetry")) {
-        auto value = table["telemetry"].value_exact<bool>();
-        if (!value)
-            throw std::runtime_error("telemetry must be boolean");
-        result.telemetry = *value;
-    }
+            throw std::runtime_error(std::string(name) + " must be boolean");
+        target = *value;
+    };
+    boolean("rehash", result.rehash);
+    boolean("pgo", result.pgo);
+    boolean("telemetry", result.telemetry);
     auto real = [&](const char* name, double& target) {
         if (!table.contains(name))
             return;
