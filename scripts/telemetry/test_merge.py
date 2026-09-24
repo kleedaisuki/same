@@ -16,6 +16,7 @@ from pathlib import Path
 
 
 MERGER = Path(__file__).with_name("merge.py")
+FIXTURE_PARENT = Path(__file__).resolve().parents[2] / ".temp"
 TELEMETRY_ID = 1396788564
 ARCHIVE_ID = 1396788545
 SCHEMA = """
@@ -49,8 +50,9 @@ class MergeTests(unittest.TestCase):
     """
 
     def setUp(self):
-        """Create a private fixture root. / 创建独立测试目录。"""
-        self.temporary = tempfile.TemporaryDirectory(prefix="same-merge-")
+        """Keep isolated fixtures inside the repository. / 将隔离夹具限制在仓库内。"""
+        FIXTURE_PARENT.mkdir(exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(prefix="same-merge-", dir=FIXTURE_PARENT)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.output = self.root / "archive.db"

@@ -5,6 +5,22 @@ on:
 permissions:
   contents: read
 jobs:
+  telemetry-archive:
+    # The standalone Python archive tool is not part of CTest.
+    # 独立 Python 归档工具不属于 CTest，须单独验证。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-14]
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Test telemetry archive CLI
+        run: python -m unittest discover -s scripts/telemetry -p test_merge.py -v
   cpu:
     strategy:
       fail-fast: false

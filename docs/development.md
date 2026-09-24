@@ -2,6 +2,8 @@
 
 ## 从哪里开始 / Reading order
 
+跨模块维护和兼容性敏感重构可先使用仓库内的 [same-maintenance skill](../skills/same-maintenance/SKILL.md) 作为路线图；各文档与测试仍是实际契约。 / For cross-module maintenance and compatibility-sensitive refactors, the repository-local skill is a routing aid; documentation and tests remain the actual contracts.
+
 | 顺序 / Order | 文件 / File | 先理解的契约 / Contract to understand |
 |---|---|---|
 | 1 | `include/same/config.hpp` | 工作线程、缓冲区、队列预算 / Worker, buffer and queue budgets |
@@ -39,3 +41,13 @@ ctest --test-dir build/release --output-on-failure
 多配置生成器增加 `--config Release`（构建）和 `-C Release`（CTest）。构建策略由 CMake 脚本测试，CLI 集成测试直接启动原生可执行文件并调用 SQLite C API，不再发现或启动 Python。历史性能实验脚本 `tools/benchmark.py` 仅为可选复现实验，不参与配置、构建、CTest 或 CI。
 
 For multi-configuration generators add `--config Release` to builds and `-C Release` to CTest. Route policy is tested in CMake; native CLI integration tests spawn the executable and use the SQLite C API. The historical `tools/benchmark.py` is an optional experiment only, never part of configuration, builds, CTest or CI.
+
+## CI 与依赖治理 / CI and dependency governance
+
+`.github/workflows/release.yml` 在每次推送和拉取请求中调用 `ci.yml`，并构建发布包；标签发布须等所有检查通过。`ci.yml` 的原生矩阵覆盖三种操作系统和 OpenCL 开关，另有 PoCL 内核与主机 sanitizer 检查。独立遥测归档脚本不属于 CTest，故在三种操作系统上单独运行 `python -m unittest discover -s scripts/telemetry -p test_merge.py -v`。其测试数据库在仓库 `.temp/` 中创建并清理；普通 C++ 构建仍不依赖 Python。
+
+The release workflow invokes reusable CI for every push and pull request, then builds packages; tag publication waits for all checks. Native CI covers three operating systems with OpenCL on/off, plus PoCL kernel and host sanitizer jobs. The standalone telemetry archive tests run separately on all three operating systems because they are not CTest targets. Their fixture databases are created and removed under repository-local `.temp/`; normal C++ builds still require no Python.
+
+新增或升级构建依赖时，保持 `cmake/Dependencies.cmake` 中固定版本及 SHA-256，同步更新 README 与相关许可证/发布资料；不要为清理告警而改变可交付二进制的运行时依赖。新增独立脚本时，要明确最低运行时版本、把测试纳入 CI，并将测试产物放在仓库 `.temp/` 或 `.cache/`。工作流配置本身只说明计划覆盖范围，实际结论仍以对应提交的 Actions 运行结果为准。
+
+When adding or upgrading build dependencies, retain version and SHA-256 pins in `cmake/Dependencies.cmake` and update the README and relevant license/release material. Do not change distributed runtime dependencies merely to silence a warning. New standalone scripts need an explicit minimum runtime, CI tests, and repository-local `.temp/` or `.cache/` test output. Workflow configuration describes intended coverage; only the run for a specific commit establishes that it passed.

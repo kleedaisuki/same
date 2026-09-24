@@ -69,3 +69,5 @@ python -m unittest discover -s scripts/telemetry -p test_merge.py -v
 
 独立 CLI 回归覆盖完整载荷、重复/冲突、WAL 活动快照、源数据不变、已有输出保护、未知模式、归档再合并和失败原子性。
 Standalone CLI regressions cover payloads, duplicates/conflicts, live WAL, source preservation, output protection, schema rejection, archive composition and failure atomicity.
+测试夹具仅在仓库根目录 `.temp/` 中创建并于测试结束后清理；GitHub Actions 在 Windows、Linux 和 macOS 上运行同一命令。
+Fixtures live only under repository-root `.temp/` and are cleaned after each test; GitHub Actions runs the same command on Windows, Linux and macOS.
