@@ -79,10 +79,10 @@ void retry_reopens() {
     worker.cpu_compute = same::make_cpu_compute();
     worker.fallbacks = &fallbacks;
     auto opened = std::make_unique<same::FileReader>(fixture.root / "file");
-    same::FileRecord record{"file", opened->stamp(), {}};
-    auto result = worker.execute(
-        [&] { return same::hash_file(fixture.root, record, worker, 0, std::move(opened)); });
-    require(!opened, "handoff must transfer ownership");
+    same::HashCandidate candidate{"file", opened->stamp(), std::move(opened)};
+    auto result =
+        worker.execute([&] { return same::hash_file(fixture.root, candidate, worker, 0); });
+    require(!candidate.reader, "handoff must transfer ownership");
     require(same::hex_digest(result.digest) ==
                 "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
             "retry digest differs from BLAKE3 abc vector");
@@ -101,7 +101,7 @@ void replacement_rejected() {
     worker.cpu_compute = same::make_cpu_compute();
     worker.fallbacks = &fallbacks;
     auto opened = std::make_unique<same::FileReader>(fixture.root / "file");
-    same::FileRecord record{"file", opened->stamp(), {}};
+    same::HashCandidate candidate{"file", opened->stamp(), std::move(opened)};
     std::filesystem::rename(fixture.root / "file", fixture.root / "original");
     {
         std::ofstream out(fixture.root / "file", std::ios::binary);
@@ -110,8 +110,7 @@ void replacement_rejected() {
     }
     bool rejected = false;
     try {
-        worker.execute(
-            [&] { return same::hash_file(fixture.root, record, worker, 0, std::move(opened)); });
+        worker.execute([&] { return same::hash_file(fixture.root, candidate, worker, 0); });
     } catch (const std::runtime_error& error) {
         rejected =
             std::string(error.what()).find("file changed while processing:") != std::string::npos;
@@ -186,7 +185,7 @@ void routed_file_hash(bool inject_failure, bool profiling = true) {
     auto reference = reference_cpu->hasher();
     reference->update(content);
     const auto expected = reference->finish();
-    same::FileRecord record{"file", same::stamp_path(fixture.root / "file"), {}};
+    const auto stamp = same::stamp_path(fixture.root / "file");
     same::Config cfg;
     cfg.cuda_bootstrap_ms = 0;
     cfg.backend = profiling ? "auto" : "cuda";
@@ -215,14 +214,14 @@ void routed_file_hash(bool inject_failure, bool profiling = true) {
     }
     auto submit = [&](bool fault) {
         return pool.submit_hash(
-            [root = fixture.root, record, fault, fail](same::Worker& worker) mutable {
+            [root = fixture.root, stamp, fault, fail](same::Worker& worker) mutable {
                 require(worker.index == 0, "file migrated away from the sole worker");
                 // 初始化已经成功返回；只在真实文件读取时注入故障。
                 // Initialization already finished; inject faults only during actual file reads.
                 fail->store(fault);
-                auto input = std::make_unique<same::FileReader>(root / "file");
-                return worker.execute(
-                    [&] { return same::hash_file(root, record, worker, 0, std::move(input)); });
+                same::HashCandidate candidate{"file", stamp,
+                                              std::make_unique<same::FileReader>(root / "file")};
+                return worker.execute([&] { return same::hash_file(root, candidate, worker, 0); });
             },
             content.size());
     };

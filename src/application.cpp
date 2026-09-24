@@ -66,17 +66,31 @@ std::size_t read_block(FileReader& reader, std::span<std::byte> buffer, std::uin
     }
     return count;
 }
-/// Hash from a fresh handle; reject size/stamp changes before publishing the digest.
-/// 从新句柄计算哈希；发布摘要前拒绝大小或文件戳变化。
-FileRecord hash_file(const fs::path& root, FileRecord record, Worker& worker,
-                     std::size_t gpu_min_bytes, std::unique_ptr<FileReader> opened = {}) {
-    const auto path = native_path(root, record.path);
+/** 尚未验证的哈希输入，仅持有路径、版本证据和可选未读句柄，没有摘要。
+ * Unverified hash input owns path, version evidence and an optional unread handle, but no digest.
+ * 首次尝试消耗 reader；计算故障后重试会按路径重新打开并从零读取。
+ * The first attempt consumes reader; compute retries reopen the path and read from offset zero.
+ */
+struct HashCandidate {
+    /// 根相对 UTF-8 路径。 / Root-relative UTF-8 path.
+    std::string path;
+    /// 元数据阶段取得的期望版本。 / Expected version from metadata work.
+    FileStamp stamp;
+    /// 只供首次尝试使用的未读句柄。 / Unread handle for the first attempt only.
+    std::unique_ptr<FileReader> reader;
+};
+/// 只有完整摘要及前后版本验证成功才构造可持久化记录。
+/// Construct a persistable record only after complete hashing and before/after version checks.
+FileRecord hash_file(const fs::path& root, HashCandidate& candidate, Worker& worker,
+                     std::size_t gpu_min_bytes) {
+    const auto path = native_path(root, candidate.path);
     // 元数据句柄仅首次尝试复用；重试必须从新句柄的起点读取。
     // Reuse the metadata handle only on the first attempt; retries reopen at offset zero.
-    auto owned = opened ? std::move(opened) : std::make_unique<FileReader>(path);
+    auto owned =
+        candidate.reader ? std::move(candidate.reader) : std::make_unique<FileReader>(path);
     auto& reader = *owned;
-    unchanged(path, reader, record.stamp);
-    const bool small = record.stamp.size < std::max(gpu_min_bytes, worker.gpu_floor);
+    unchanged(path, reader, candidate.stamp);
+    const bool small = candidate.stamp.size < std::max(gpu_min_bytes, worker.gpu_floor);
     if (small)
         ++worker.cpu_routed_hashes;
     // 资源工作线程已选择独有后端及匹配缓冲，应用层不二次路由。
@@ -103,16 +117,16 @@ FileRecord hash_file(const fs::path& root, FileRecord record, Worker& worker,
             worker.cpu_hash_bytes += count;
         if (!count)
             break;
-        if (count > record.stamp.size - total)
-            throw std::runtime_error("file grew while hashing: " + record.path);
+        if (count > candidate.stamp.size - total)
+            throw std::runtime_error("file grew while hashing: " + candidate.path);
         hasher->update(std::span(worker.first).first(count));
         total += count;
     }
-    if (total != record.stamp.size)
-        throw std::runtime_error("file shrank while hashing: " + record.path);
-    record.digest = hasher->finish();
-    unchanged(path, reader, record.stamp);
-    return record;
+    if (total != candidate.stamp.size)
+        throw std::runtime_error("file shrank while hashing: " + candidate.path);
+    const auto digest = hasher->finish();
+    unchanged(path, reader, candidate.stamp);
+    return {candidate.path, candidate.stamp, digest};
 }
 /// Digest equality only selects candidates: establish equality from actual bytes.
 /// 摘要相等仅用于筛选候选：真正相等必须逐字节验证。
@@ -479,14 +493,6 @@ struct HashResult {
     /// Worker wall time; queue residence excluded. 工作线程墙钟时间，不含排队。
     double work_ms;
 };
-/// 待哈希记录与未读句柄；仅协调线程转移所有权。
-/// Pending hash metadata and unread handle, moved only by the coordinator.
-struct HashInput {
-    /// 待处理的缓存记录。 / Pending cache record.
-    FileRecord record;
-    /// 从元数据阶段移交的未读取句柄。 / Unread handle from metadata work.
-    std::unique_ptr<FileReader> reader;
-};
 /// Stream the tree into bounded worker jobs; keep every SQLite mutation on this thread.
 /// 流式遍历目录并提交有界任务；所有 SQLite 修改留在当前线程。
 void scan(const fs::path& root, const Config& config, Store& store, Resources& resources,
@@ -508,18 +514,17 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
     // 单调提交编号保证所有工作线程的跨度 ID 唯一。
     // Monotonic submission IDs keep trace spans unique across every worker.
     std::uint64_t next_hash_span = 16;
-    auto submit = [&](HashInput input) {
+    auto submit = [&](HashCandidate candidate) {
         const auto submitted = Clock::now();
-        const auto bytes = input.record.stamp.size;
+        const auto bytes = candidate.stamp.size;
         const auto span_id = next_hash_span++;
         auto operation = [root, trace, trace_start, span_id, gpu_min_bytes = config.gpu_min_bytes,
-                          record = std::move(input.record),
-                          opened = std::move(input.reader)](Worker& worker) mutable {
+                          candidate = std::move(candidate)](Worker& worker) mutable {
             // 每64个小任务抽样；合格任务全采样，关闭时不修改采样状态。
             // Sample every 64th small task and every eligible task; disabled leaves no sample
             // state.
             const bool sample = worker.profile_enabled &&
-                                (record.stamp.size >= gpu_min_bytes ||
+                                (candidate.stamp.size >= gpu_min_bytes ||
                                  (++worker.profile_sequence &
                                   (detail::RoutingParameters::small_sample_period - 1)) == 0);
             const auto cpu_before = worker.cpu_hashes;
@@ -545,11 +550,11 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
                                       : (igpu_attempts  ? "igpu"
                                          : gpu_attempts ? "gpu"
                                                         : "cpu");
-                event.message = record.path;
+                event.message = candidate.path;
                 event.span_id = span_id;
                 event.parent_span_id = 3;
                 event.worker = static_cast<std::int64_t>(worker.index);
-                event.bytes = record.stamp.size;
+                event.bytes = candidate.stamp.size;
                 event.time_ns = static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(start - trace_start)
                         .count());
@@ -563,17 +568,18 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
                     trace->emit(event);
                 }
             };
-            FileRecord hashed;
             Clock::time_point ended;
-            try {
-                hashed = worker.execute([&] {
-                    return hash_file(root, record, worker, gpu_min_bytes, std::move(opened));
-                });
-                ended = Clock::now();
-            } catch (...) {
-                report(Clock::now(), false);
-                throw;
-            }
+            FileRecord hashed = [&] {
+                try {
+                    auto result = worker.execute(
+                        [&] { return hash_file(root, candidate, worker, gpu_min_bytes); });
+                    ended = Clock::now();
+                    return result;
+                } catch (...) {
+                    report(Clock::now(), false);
+                    throw;
+                }
+            }();
             const auto elapsed = milliseconds(start, ended);
             report(ended, true);
             // 复用已有计时；仅完整成功且没有重试的实际后端样本进入模型。
@@ -601,18 +607,20 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
         if (!entry)
             break;
         ++counters.scanned;
-        FileRecord record{std::move(entry->path), std::move(entry->stamp), {}};
-        counters.scanned_bytes += record.stamp.size;
+        HashCandidate candidate{std::move(entry->path), std::move(entry->stamp),
+                                std::move(entry->reader)};
+        counters.scanned_bytes += candidate.stamp.size;
         const auto queried = Clock::now();
-        const bool cached = !config.rehash && store.mark_if_unchanged(record.path, record.stamp);
+        const bool cached =
+            !config.rehash && store.mark_if_unchanged(candidate.path, candidate.stamp);
         counters.database_work_ms += milliseconds(queried, Clock::now());
         if (cached) {
             ++counters.cached;
-            counters.cached_bytes += record.stamp.size;
+            counters.cached_bytes += candidate.stamp.size;
             continue;
         }
         ++counters.hashed;
-        submit({std::move(record), std::move(entry->reader)});
+        submit(std::move(candidate));
     }
     while (pending.pending())
         drain();
