@@ -92,7 +92,173 @@ void training_override() {
     require(snapshot.cpu_samples == 1 && snapshot.gpu_samples == 1 && snapshot.igpu_samples == 1,
             "training labels leaked across backends");
 }
-/// 忙设备不等待，工厂仅调用一次。 / Busy device never waits; initialize exactly once.
+/// 每个线程都可测量三设备，并用各自的真实执行上下文更新模型。
+/// Every worker can measure all three backends and update its own model from actual execution.
+void three_backend_workers() {
+    auto c = config();
+    c.backend = "auto";
+    std::atomic<unsigned> cuda_calls{}, igpu_calls{};
+    same::Resources pool(
+        c,
+        [&](std::size_t, std::size_t budget) {
+            require(budget <= c.device_memory_bytes / c.workers, "CUDA budget multiplied");
+            ++cuda_calls;
+            return std::make_unique<Device>(same::BackendKind::cuda);
+        },
+        [&](std::size_t block, std::size_t budget) {
+            require(block <= c.block_bytes && budget <= c.device_memory_bytes / c.workers,
+                    "iGPU budget multiplied");
+            ++igpu_calls;
+            return std::make_unique<Device>(same::BackendKind::igpu, block);
+        });
+    for (auto kind : {same::BackendKind::cpu, same::BackendKind::cuda, same::BackendKind::igpu}) {
+        std::atomic<unsigned> entered{};
+        std::promise<void> both, release;
+        auto gate = release.get_future().share();
+        auto submit = [&] {
+            return pool.submit_training_hash(
+                [&](same::Worker& w) {
+                    require(w.compute->kind() == kind, "worker did not select requested backend");
+                    w.sample = {2048, 2, kind == same::BackendKind::cuda, true, kind};
+                    if (++entered == 2)
+                        both.set_value();
+                    gate.wait();
+                    return w.index;
+                },
+                2048, kind);
+        };
+        auto first = submit();
+        auto second = submit();
+        const auto ready = both.get_future().wait_for(std::chrono::seconds(5));
+        release.set_value();
+        const auto first_index = first.get();
+        const auto second_index = second.get();
+        require(ready == std::future_status::ready && first_index != second_index,
+                "training did not reach both workers");
+    }
+    pool.wait_idle();
+    const auto profiles = pool.worker_profiles();
+    if (cuda_calls != 2 || igpu_calls != 2 || pool.igpu_peak_concurrency() < 2)
+        throw std::runtime_error(
+            "not every worker owned both accelerators: cuda=" + std::to_string(cuda_calls.load()) +
+            " igpu=" + std::to_string(igpu_calls.load()) +
+            " peak=" + std::to_string(pool.igpu_peak_concurrency()) +
+            " gpu_peak=" + std::to_string(pool.gpu_peak_concurrency()) +
+            " selections=" + std::to_string(profiles[0].igpu_selections) + "," +
+            std::to_string(profiles[1].igpu_selections) + " decisions=" +
+            std::to_string(profiles[0].decisions[2][0] + profiles[0].decisions[2][1] +
+                           profiles[0].decisions[2][2]) +
+            "," +
+            std::to_string(profiles[1].decisions[2][0] + profiles[1].decisions[2][1] +
+                           profiles[1].decisions[2][2]) +
+            " prior=" + std::to_string(profiles[0].prior[2].samples) + "," +
+            std::to_string(profiles[1].prior[2].samples));
+    for (const auto& profile : profiles)
+        for (unsigned slot = 0; slot < 3; ++slot)
+            require(profile.delta[slot].samples == 1 &&
+                        profile.devices[slot].backend == static_cast<same::BackendKind>(slot),
+                    "worker-local three-backend model lost a label or device identity");
+}
+/// 默认级预算不能只为一个核显实例预留却允许所有工作线程分配。
+/// Pool budgets reserve all worker iGPU instances without losing normal batch size.
+void shared_budget() {
+    auto c = config();
+    c.backend = "auto";
+    c.workers = 12;
+    c.block_bytes = 1ULL << 20;
+    c.memory_bytes = c.device_memory_bytes = 64ULL << 20;
+    same::Resources pool(
+        c, [](auto, auto) { return std::make_unique<Device>(same::BackendKind::cuda); },
+        [](auto, auto) { return std::make_unique<Device>(same::BackendKind::igpu); });
+    pool.wait_idle();
+    const auto profiles = pool.worker_profiles();
+    std::uint64_t host = 0, device = 0;
+    const auto buffers = [](std::size_t block) { return 2 * block + block / 32 + 4096; };
+    for (const auto& p : profiles) {
+        require(p.igpu_block_bytes == c.block_bytes && p.gpu_block_bytes > 0 &&
+                    p.igpu_budget_bytes >= p.igpu_block_bytes,
+                "per-worker iGPU reservation shrank a supported default workload");
+        host += buffers(p.cpu_block_bytes) + buffers(p.gpu_block_bytes) + p.igpu_block_bytes / 32 +
+                4096 + p.igpu_budget_bytes;
+        device += p.igpu_budget_bytes + p.device_budget_bytes;
+    }
+    require(profiles.size() == c.workers && host <= c.memory_bytes &&
+                device <= c.device_memory_bytes,
+            "multi-worker CPU/CUDA/iGPU reservations exceed pool budgets");
+}
+/// 载入三设备先验后，每个线程在实际争用下都能选择核显而非被池级闸门挡回 CPU/CUDA。
+/// With all priors loaded, each worker can route to iGPU under contention without a pool gate.
+void auto_parallel_igpu() {
+    auto c = config();
+    c.backend = "auto";
+    same::Resources pool(
+        c, [](auto, auto) { return std::make_unique<Device>(same::BackendKind::cuda); },
+        [](auto block, auto) { return std::make_unique<Device>(same::BackendKind::igpu, block); },
+        [](same::BackendKind kind, const same::DeviceProfile& profile) {
+            same::detail::OnlineModel prior;
+            const double ms = kind == same::BackendKind::cpu    ? 100.0
+                              : kind == same::BackendKind::cuda ? 50.0
+                                                                : 1.0;
+            for (auto bytes : {64ULL << 20, 128ULL << 20, 256ULL << 20})
+                for (unsigned peers = 0; peers < 3; ++peers)
+                    prior.observe(
+                        kind, {bytes, profile.effective_batch_bytes, static_cast<double>(peers)},
+                        ms);
+            return prior.delta();
+        });
+    constexpr auto bytes = 128ULL << 20;
+    for (auto kind : {same::BackendKind::cuda, same::BackendKind::igpu}) {
+        std::atomic<unsigned> active{};
+        std::promise<void> both, release;
+        auto gate = release.get_future().share();
+        const auto submit = [&] {
+            return pool.submit_training_hash(
+                [&](same::Worker& w) {
+                    require(w.compute->kind() == kind, "cannot warm requested backend");
+                    if (++active == 2)
+                        both.set_value();
+                    gate.wait();
+                    return w.index;
+                },
+                bytes, kind);
+        };
+        auto first = submit(), second = submit();
+        const auto ready = both.get_future().wait_for(std::chrono::seconds(5));
+        release.set_value();
+        require(ready == std::future_status::ready && first.get() != second.get(),
+                "both workers did not load accelerator priors");
+    }
+    std::atomic<unsigned> active{};
+    std::promise<void> both, release;
+    auto gate = release.get_future().share();
+    const auto submit = [&] {
+        return pool.submit_hash(
+            [&](same::Worker& w) {
+                if (++active == 2)
+                    both.set_value();
+                gate.wait();
+                w.sample = {bytes, 1, false, true, same::BackendKind::igpu};
+                return std::pair{w.index, w.compute->kind()};
+            },
+            bytes);
+    };
+    auto first = submit(), second = submit();
+    const auto ready = both.get_future().wait_for(std::chrono::seconds(5));
+    release.set_value();
+    const auto a = first.get(), b = second.get();
+    pool.wait_idle();
+    require(ready == std::future_status::ready && a.first != b.first &&
+                a.second == same::BackendKind::igpu && b.second == same::BackendKind::igpu &&
+                pool.igpu_peak_concurrency() >= 2,
+            "online model did not route both workers to the preferred iGPU");
+    const auto profiles = pool.worker_profiles();
+    require(profiles[a.first].delta[2].samples == 1 && profiles[b.first].delta[2].samples == 1 &&
+                profiles[a.first].learning_context.contention > 0 &&
+                profiles[b.first].learning_context.contention > 0,
+            "parallel auto iGPU samples lost actual contention or owner identity");
+}
+/// 两个工作线程在各自核显实例上同时处理文件，并各自学习真实争用上下文。
+/// Two owners run iGPU work concurrently and learn their actual contention contexts.
 void admission() {
     auto c = config();
     std::atomic<unsigned> calls{};
@@ -107,34 +273,123 @@ void admission() {
             require(w.compute->kind() == same::BackendKind::igpu, "iGPU missing");
             entered.set_value();
             gate.wait();
+            w.sample = {1024, 3, false, true, same::BackendKind::igpu};
+            return w.index;
         },
         1024);
-    entered.get_future().wait();
-    auto second = pool.submit_hash([](same::Worker& w) { return w.compute->kind(); }, 1024);
+    require(entered.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+            "first iGPU worker never started");
+    auto second = pool.submit_hash(
+        [](same::Worker& w) {
+            require(w.compute->kind() == same::BackendKind::igpu, "second worker lost iGPU");
+            w.sample = {1024, 2, false, true, same::BackendKind::igpu};
+            return w.index;
+        },
+        1024);
     const auto ready = second.wait_for(std::chrono::seconds(5));
     release.set_value();
-    first.get();
-    require(ready == std::future_status::ready, "busy iGPU blocked other worker");
-    require(second.get() == same::BackendKind::cpu, "busy iGPU was reused");
+    const auto first_index = first.get();
+    const auto second_index = second.get();
+    require(ready == std::future_status::ready && first_index != second_index,
+            "one iGPU file task serialized another worker");
     pool.wait_idle();
-    require(calls == 1, "compiler storm");
-    auto retry = pool.submit_hash(
-        [](same::Worker& w) {
-            unsigned attempts = 0;
-            return w.execute([&] {
-                if (++attempts == 1)
-                    throw same::ComputeError("injected device failure");
-                require(w.compute->kind() == same::BackendKind::cpu, "retry not CPU");
-                return attempts;
-            });
+    const auto profiles = pool.worker_profiles();
+    require(calls == 2 && pool.gpu_peak_concurrency() == 0 && pool.igpu_peak_concurrency() >= 2 &&
+                pool.profile_snapshot().igpu_samples == 2,
+            "iGPU resources, peak, or samples still pooled as one instance");
+    require(profiles[first_index].delta[2].samples == 1 &&
+                profiles[second_index].delta[2].samples == 1 &&
+                profiles[second_index].decision_context.contention >= 1,
+            "parallel iGPU observations lost per-worker identity or contention");
+}
+
+/// 强制核显不把另一个线程正在探测误当成设备不可用。
+/// Forced iGPU waits for a peer's one-time probe rather than silently using CPU.
+void forced_probe_waits() {
+    auto c = config();
+    std::promise<void> entered, release;
+    auto gate = release.get_future().share();
+    std::promise<void> first_active, finish_first;
+    auto finish_gate = finish_first.get_future().share();
+    std::atomic<unsigned> probes{}, factories{};
+    same::Resources pool(
+        c, {},
+        [&](std::size_t block, std::size_t) {
+            ++factories;
+            return std::make_unique<Device>(same::BackendKind::igpu, block);
+        },
+        {}, {},
+        [&](std::size_t block, std::size_t) -> std::optional<same::DeviceProfile> {
+            ++probes;
+            entered.set_value();
+            gate.wait();
+            return Device(same::BackendKind::igpu, block).profile();
+        });
+    auto first = pool.submit_hash(
+        [&](same::Worker& w) {
+            first_active.set_value();
+            finish_gate.wait();
+            return w.compute->kind();
         },
         1024);
-    require(retry.get() == 2, "whole operation not retried");
+    require(entered.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+            "first forced iGPU probe did not start");
+    auto second = pool.submit_hash([](same::Worker& w) { return w.compute->kind(); }, 1024);
+    release.set_value();
+    const auto active = first_active.get_future().wait_for(std::chrono::seconds(5));
+    const auto ready = second.wait_for(std::chrono::seconds(5));
+    finish_first.set_value();
+    require(active == std::future_status::ready && ready == std::future_status::ready &&
+                first.get() == same::BackendKind::igpu && second.get() == same::BackendKind::igpu,
+            "forced iGPU fell back solely because discovery was busy");
     pool.wait_idle();
-    require(pool.submit_hash([](same::Worker& w) { return w.compute->kind(); }, 1024).get() ==
-                same::BackendKind::cpu,
-            "failed iGPU not retired");
-    require(calls == 1, "failed device reinitialized");
+    require(probes == 1 && factories == 2, "probe was repeated or owner backend omitted");
+}
+
+/// 所属线程的设备错误不能退休其他线程的核显。 / One owner's failure cannot retire a peer iGPU.
+void failure_isolation() {
+    auto c = config();
+    std::atomic<unsigned> calls{};
+    same::Resources pool(c, {}, [&](auto, auto) {
+        ++calls;
+        return std::make_unique<Device>(same::BackendKind::igpu);
+    });
+    std::promise<void> entered, release;
+    auto gate = release.get_future().share();
+    auto failed = pool.submit_hash(
+        [&](same::Worker& w) {
+            require(w.compute->kind() == same::BackendKind::igpu, "first worker lacks iGPU");
+            entered.set_value();
+            gate.wait();
+            unsigned attempts = 0;
+            return std::pair{w.index, w.execute([&] {
+                                 if (++attempts == 1)
+                                     throw same::ComputeError("injected device failure");
+                                 require(w.compute->kind() == same::BackendKind::cpu,
+                                         "failed file was not retried on CPU");
+                                 return attempts;
+                             })};
+        },
+        1024);
+    require(entered.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+            "failure fixture did not start");
+    auto healthy = pool.submit_hash(
+        [](same::Worker& w) {
+            require(w.compute->kind() == same::BackendKind::igpu,
+                    "peer iGPU was excluded before failure");
+            return w.index;
+        },
+        1024);
+    const auto ready = healthy.wait_for(std::chrono::seconds(5));
+    release.set_value();
+    const auto [failed_index, attempts] = failed.get();
+    const auto healthy_index = healthy.get();
+    pool.wait_idle();
+    const auto profiles = pool.worker_profiles();
+    require(ready == std::future_status::ready && attempts == 2 && failed_index != healthy_index &&
+                calls == 2 && pool.fallbacks() == 1 && pool.igpu_service_enabled() &&
+                profiles[healthy_index].igpu_enabled && !profiles[failed_index].igpu_enabled,
+            "worker-local iGPU failure poisoned the peer or skipped complete retry");
 }
 /// 初始化失败不重探，低预算不分配。 / Failed initialization is not repeated; low budget allocates
 /// nothing.
@@ -421,6 +676,8 @@ void backend_policy() {
 int main() {
     try {
         admission();
+        forced_probe_waits();
+        failure_isolation();
         unavailable();
         contextual_prior();
         lazy_prior_reselection();
@@ -431,6 +688,9 @@ int main() {
         short_scan_discovery(false);
         exploration();
         training_override();
+        three_backend_workers();
+        shared_budget();
+        auto_parallel_igpu();
         backend_policy();
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

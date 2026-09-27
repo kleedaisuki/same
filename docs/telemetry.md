@@ -136,7 +136,7 @@ Each worker exports 64 CPU/GPU bands, including unknown cells. Categories use wo
 
 Worker parameters retain actual buffers/budget. Error EWMAs are worker-local, not global. Aggregate known-band counters count worker-band cells, up to workers × 32 per backend.
 
-原始直方图（histogram）保留汇总 `pgo.latency_bucket_us.0`…`.31` / `pgo.residual_bucket_us.0`…`.31` 和逐线程 `worker.<id>.pgo.*`；桶索引为 `floor(log2(us))`、两端饱和，数值是次数而非微秒。每线程另存 CPU/GPU 次数和逻辑字节、初始化与回退、探索和各决策原因（包括 `worker.<id>.cold_start_cpu`：自动模式一次性首设备初始化期间暂走 CPU，不等于永久停用 GPU）、选择时 GPU 在途数、峰值并发与竞争样本数。GPU 在途与峰值统计覆盖选中 GPU 的任务生命周期（含 I/O），不是实际内核忙碌数；`contended_samples` 仅在选择时观察 active>1，不能完整捕捉随后出现的区间重叠。它们用于分析样本碎片化与可能竞争，不构成全局调度模型。
+原始直方图（histogram）保留汇总 `pgo.latency_bucket_us.0`…`.31` / `pgo.residual_bucket_us.0`…`.31` 和逐线程 `worker.<id>.pgo.*`；桶索引为 `floor(log2(us))`、两端饱和，数值是次数而非微秒。每线程另存 CPU/CUDA/iGPU 次数和逻辑字节、初始化与回退、探索和各决策原因（包括 `worker.<id>.cold_start_cpu`：自动模式一次性首设备初始化期间暂走 CPU，不等于永久停用 GPU）、选择时 GPU 在途数、峰值并发与竞争样本数。兼容字段 `gpu_peak_concurrency` 与 `worker.<id>.contended_samples` 仍只统计 CUDA；新增 `igpu_peak_concurrency` 与 `worker.<id>.igpu_contended_samples` 单列核显，避免改变现有指标含义。峰值统计覆盖已准入文件任务的生命周期（含 I/O），**不是同时执行内核的硬件证明**。竞争样本结合任务开始时在途数与任务期间新增的重叠事件，仍不测量重叠时长或共享内存带宽。兼容字段 `worker.<id>.igpu_busy` 现在只代表一次性设备探测忙，不再代表稳态核显被池级独占；新增的逐线程核显批容量、预算、初始化耗时及可用状态可用于检查所有权。它们用于分析样本碎片化与可能竞争，不构成全局调度模型。
 
 Histograms retain aggregate and worker-prefixed raw buckets. Bucket indices are saturated floor(log2(us)); values are counts. Per-worker work, initialization/fallback, exploration/decision reasons and concurrency metrics expose fragmentation/contention without creating a global model.
 

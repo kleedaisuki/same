@@ -279,6 +279,9 @@ void save_learning(Learning& learning, const Config& config, const Resources& re
             if (worker.gpu_enabled)
                 add_setup_history(setups, learning, config, BackendKind::cuda, worker.devices[1],
                                   worker.setup_ms);
+            if (worker.igpu_enabled)
+                add_setup_history(setups, learning, config, BackendKind::igpu, worker.devices[2],
+                                  worker.igpu_setup_ms);
             for (unsigned i = 0; i < 3; ++i) {
                 if (!worker.delta[i].samples)
                     continue;
@@ -291,9 +294,6 @@ void save_learning(Learning& learning, const Config& config, const Resources& re
                     throw std::runtime_error("model aggregate rejected");
             }
         }
-        if (resources.igpu_attempted())
-            add_setup_history(setups, learning, config, BackendKind::igpu, resources.igpu_profile(),
-                              resources.igpu_setup_ms());
         for (const auto& [key, history] : setups) {
             if (learning.store->save_setup_delta(key, history)) {
                 ++learning.setup_saved;
@@ -931,6 +931,15 @@ void render_worker_profiles(const Resources& resources, std::ostream& out, bool 
                               std::to_string(worker.cold_start_cpu) + " cold-start CPU bypasses",
                           worker.gpu_init_failures || worker.fallbacks ? ReportTone::warning
                                                                        : ReportTone::muted);
+            report.detail("iGPU",
+                          "setup " + human_duration(worker.igpu_setup_ms) + " | init " +
+                              (worker.igpu_attempted ? "attempted" : "not-needed") + " | " +
+                              (worker.igpu_enabled ? "available" : "unavailable") + " | batch " +
+                              human_bytes(static_cast<double>(worker.igpu_block_bytes)) +
+                              " | quota " +
+                              human_bytes(static_cast<double>(worker.igpu_budget_bytes)),
+                          worker.igpu_attempted && !worker.igpu_enabled ? ReportTone::warning
+                                                                        : ReportTone::muted);
             continue;
         }
         const auto prefix = "worker." + std::to_string(worker.index) + ".";
@@ -940,6 +949,12 @@ void render_worker_profiles(const Resources& resources, std::ostream& out, bool 
         WORKER_VALUE(igpu_hashes);
         WORKER_VALUE(igpu_hash_bytes);
         WORKER_VALUE(igpu_busy);
+        WORKER_VALUE(igpu_contended_samples);
+        WORKER_VALUE(igpu_setup_ms);
+        WORKER_VALUE(igpu_attempted);
+        WORKER_VALUE(igpu_enabled);
+        WORKER_VALUE(igpu_block_bytes);
+        WORKER_VALUE(igpu_budget_bytes);
         WORKER_VALUE(cpu_hash_bytes);
         WORKER_VALUE(gpu_hash_bytes);
         WORKER_VALUE(hash_bytes);
@@ -1054,8 +1069,9 @@ void render_pretty_profile(const Counters& counters, const Resources& resources,
                            : resources.igpu_attempted()     ? "unavailable"
                            : resources.igpu_deferred()      ? "activation deferred"
                                                             : "not probed") +
-                   " | discovery " + human_duration(resources.igpu_discovery_ms()) +
-                   " | activation " + human_duration(resources.igpu_setup_ms()),
+                   " | discovery " + human_duration(resources.igpu_discovery_ms()) + " | setup " +
+                   human_duration(resources.igpu_setup_ms()) + " (summed workers) | peak " +
+                   std::to_string(resources.igpu_peak_concurrency()) + " tasks",
                resources.igpu_service_enabled() ? ReportTone::good : ReportTone::muted);
     report.row("Cold-start budget",
                "credit " + human_duration(resources.cold_credit_ms()) + " | spent " +
@@ -1133,6 +1149,7 @@ void render_profile(const Counters& counters, const Resources& resources,
             << " igpu_available=" << resources.igpu_service_enabled()
             << " igpu_retired=" << resources.igpu_retired()
             << " igpu_setup_ms=" << resources.igpu_setup_ms()
+            << " igpu_peak_concurrency=" << resources.igpu_peak_concurrency()
             << " igpu_discovery_ms=" << resources.igpu_discovery_ms()
             << " igpu_deferred=" << resources.igpu_deferred()
             << " igpu_setup_estimate_ms=" << resources.igpu_setup_estimate_ms()
@@ -1268,6 +1285,8 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
     metric("igpu_attempted", resources->igpu_attempted() ? 1 : 0);
     metric("igpu_retired", resources->igpu_retired() ? 1 : 0);
     metric("igpu_setup_ms", resources->igpu_setup_ms(), "ms");
+    metric("igpu_peak_concurrency", static_cast<double>(resources->igpu_peak_concurrency()),
+           "count");
     metric("igpu_discovery_ms", resources->igpu_discovery_ms(), "ms");
     metric("igpu_deferred", static_cast<double>(resources->igpu_deferred()));
     metric("igpu_setup_estimate_ms", resources->igpu_setup_estimate_ms(), "ms");
@@ -1307,6 +1326,12 @@ void capture_telemetry(telemetry::FinalRecord& final, const Counters& counters,
         WORKER_METRIC(igpu_hashes, "count");
         WORKER_METRIC(igpu_hash_bytes, "bytes");
         WORKER_METRIC(igpu_busy, "count");
+        WORKER_METRIC(igpu_contended_samples, "count");
+        WORKER_METRIC(igpu_setup_ms, "ms");
+        WORKER_METRIC(igpu_attempted, "count");
+        WORKER_METRIC(igpu_enabled, "count");
+        WORKER_METRIC(igpu_block_bytes, "bytes");
+        WORKER_METRIC(igpu_budget_bytes, "bytes");
         WORKER_METRIC(cpu_hash_bytes, "bytes");
         WORKER_METRIC(gpu_hash_bytes, "bytes");
         WORKER_METRIC(hash_bytes, "bytes");
@@ -1997,8 +2022,8 @@ Digest train_digest(Worker& worker, const TrainFile& file, BackendKind requested
     return digest;
 }
 
-/// 同一文件交错提交三后端，待单实例核显彻底归还后核对完整摘要。
-/// Submit all three backends for one file and wait for iGPU handback before digest comparison.
+/// 同一文件交错提交三后端，等待各工作线程的私有设备完成后核对完整摘要。
+/// Submit all three backends for one file and compare digests after owner-local devices finish.
 void train_one_file(Resources& resources, TrainTrace& trace, const TrainFile& file,
                     std::size_t index, std::array<std::uint64_t, 3>& submitted) {
     constexpr std::array<BackendKind, 3> backends{BackendKind::cpu, BackendKind::cuda,
@@ -2025,8 +2050,8 @@ void train_one_file(Resources& resources, TrainTrace& trace, const TrainFile& fi
     std::array<Digest, 3> digests;
     for (unsigned slot = 0; slot < 3; ++slot)
         digests[slot] = pending[slot].get();
-    // future 可在池释放单实例 iGPU 前就绪；下一文件等待实际任务收尾。
-    // A future may be ready before the pool releases its single iGPU instance.
+    // future 可在所属线程完成设备收尾前就绪；下一文件等待完整任务收尾。
+    // A future can become ready before an owner finishes device cleanup; wait for full idle.
     resources.wait_idle();
     if (digests[0] != digests[1] || digests[0] != digests[2])
         throw std::runtime_error("training digest mismatch: " + file.path);

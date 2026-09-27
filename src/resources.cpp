@@ -13,6 +13,11 @@ namespace {
 std::size_t buffer_cost(std::size_t block) {
     return 2 * block + block / 32 + 4096;
 }
+/// 核显直接复用线程的 CPU 输入缓冲，只新增叶链值暂存。
+/// iGPU reuses owner CPU input buffers and adds only leaf-CV host scratch.
+std::size_t igpu_host_cost(std::size_t block) {
+    return block / 32 + 4096;
+}
 /// 饱和累加仅用于空闲后的导出。 / Saturating addition used only for idle-time exports.
 void add(std::uint64_t& target, std::uint64_t value) {
     target += std::min(value, std::numeric_limits<std::uint64_t>::max() - target);
@@ -63,17 +68,20 @@ Resources::Resources(const Config& config, detail::CudaFactory factory, detail::
     auto remaining = config.memory_bytes - buffer_cost(config.block_bytes) * config.workers;
     if ((policy_ == BackendPolicy::automatic || policy_ == BackendPolicy::igpu) && igpu_factory_) {
         auto block = std::min(config.block_bytes, detail::RoutingParameters::gpu_block_bytes);
-        const auto allowance = policy_ == BackendPolicy::igpu ? remaining : remaining / 2;
-        while (block >= 1024 && buffer_cost(block) + 2 * block + 65536 > allowance)
+        const auto allowance =
+            (policy_ == BackendPolicy::igpu ? remaining : remaining / 2) / config.workers;
+        const auto device_share = config.device_memory_bytes / config.workers;
+        while (block >= 1024 && (igpu_host_cost(block) + block + block / 32 + 65536 > allowance ||
+                                 block + block / 32 > device_share))
             block /= 2;
         if (block >= 1024) {
             igpu_block_bytes_ = block;
-            igpu_budget_ = std::min(config.device_memory_bytes,
-                                    std::min(allowance - buffer_cost(block), block + block / 32));
-            remaining -= buffer_cost(block) + igpu_budget_;
+            igpu_budget_ = block + block / 32;
+            remaining -= config.workers * (igpu_host_cost(block) + igpu_budget_);
         }
     }
-    gpu_device_budget_ = (config.device_memory_bytes - igpu_budget_) / config.workers;
+    gpu_device_budget_ =
+        (config.device_memory_bytes - config.workers * igpu_budget_) / config.workers;
     const auto share = remaining / config.workers;
     if (policy_ == BackendPolicy::cuda)
         gpu_block_bytes_ = config.block_bytes;
@@ -99,6 +107,8 @@ Resources::Resources(const Config& config, detail::CudaFactory factory, detail::
         worker->cpu_block_bytes = config.block_bytes;
         worker->gpu_block_bytes = gpu_block_bytes_;
         worker->device_budget_bytes = gpu_device_budget_;
+        worker->igpu_block_bytes = igpu_block_bytes_;
+        worker->igpu_budget_bytes = igpu_budget_;
         worker->gpu_reuses_cpu_buffers = policy_ == BackendPolicy::cuda;
         load_prior(*worker, BackendKind::cpu, *worker->compute, config.block_bytes);
         workers_.push_back(std::move(worker));
@@ -124,7 +134,6 @@ void Resources::close() {
     for (auto& thread : threads_)
         if (thread.joinable())
             thread.join();
-    igpu_compute_.reset();
 }
 void Resources::wait_idle() {
     std::unique_lock lock(mutex_);
@@ -172,8 +181,7 @@ detail::OnlineModel::Context Resources::context(const Worker& worker, BackendKin
     // CPU/iGPU share host resources; CUDA counts device peers, not causal bandwidth estimates.
     const auto peers = kind == BackendKind::cuda
                            ? backend_active_[1].load(std::memory_order_relaxed)
-                           : backend_active_[0].load(std::memory_order_relaxed) +
-                                 backend_active_[2].load(std::memory_order_relaxed);
+                           : host_igpu_active_.load(std::memory_order_relaxed);
     return {bytes, batch, static_cast<double>(peers)};
 }
 
@@ -274,16 +282,25 @@ void Resources::end_cold() {
 }
 
 bool Resources::discover_igpu(Worker& worker, bool training) {
+    const bool required = training || policy_ == BackendPolicy::igpu;
     bool idle = false;
-    if (!igpu_busy_.compare_exchange_strong(idle, true, std::memory_order_acquire)) {
-        ++worker.igpu_busy;
-        return false;
+    while (!igpu_probe_busy_.compare_exchange_strong(idle, true, std::memory_order_acquire)) {
+        if (!required) {
+            ++worker.igpu_busy;
+            return false;
+        }
+        igpu_probe_busy_.wait(true, std::memory_order_acquire);
+        idle = false;
     }
+    const auto release_probe = [&] {
+        igpu_probe_busy_.store(false, std::memory_order_release);
+        igpu_probe_busy_.notify_all();
+    };
     try {
         if (!igpu_probed_) {
             if (!begin_cold(worker, igpu_bootstrap_ms_, training)) {
                 ++igpu_deferred_;
-                igpu_busy_.store(false, std::memory_order_release);
+                release_probe();
                 return false;
             }
             igpu_probed_ = true;
@@ -306,14 +323,16 @@ bool Resources::discover_igpu(Worker& worker, bool training) {
                                          std::chrono::steady_clock::now() - start)
                                          .count();
                 add_atomic(cold_spent_ms_, igpu_discovery_ms_);
-                end_cold();
+                if (!training)
+                    end_cold();
                 throw;
             }
             igpu_discovery_ms_ =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                     .count();
             add_atomic(cold_spent_ms_, igpu_discovery_ms_);
-            end_cold();
+            if (!training)
+                end_cold();
             if (igpu_present_ && igpu_probe_ && setup_loader_ && pgo_) {
                 const auto estimate = setup_loader_(BackendKind::igpu, igpu_profile_);
                 if (std::isfinite(estimate) && estimate > 0)
@@ -322,15 +341,15 @@ bool Resources::discover_igpu(Worker& worker, bool training) {
         }
         if (igpu_present_ && igpu_probe_)
             load_prior(worker, BackendKind::igpu, igpu_profile_, igpu_block_bytes_);
-        const bool present = igpu_present_ && !igpu_retired_;
-        igpu_busy_.store(false, std::memory_order_release);
+        const bool present = igpu_present_;
+        release_probe();
         return present;
     } catch (const ComputeError&) {
         igpu_present_ = false;
-        igpu_busy_.store(false, std::memory_order_release);
+        release_probe();
         return false;
     } catch (...) {
-        igpu_busy_.store(false, std::memory_order_release);
+        release_probe();
         throw;
     }
 }
@@ -351,50 +370,48 @@ bool Resources::admit_cold_igpu(const Worker& worker, bool training) const {
 }
 
 bool Resources::select_igpu(Worker& worker, bool training) {
-    bool idle = false;
-    if (!igpu_busy_.compare_exchange_strong(idle, true, std::memory_order_acquire)) {
-        ++worker.igpu_busy;
+    if (worker.igpu_retired)
+        return false;
+    const bool starting = !worker.igpu_attempted;
+    const bool cold = starting && !igpu_ready_.load(std::memory_order_acquire);
+    const bool guarded = cold && !training && policy_ == BackendPolicy::automatic && pgo_;
+    if (guarded && !begin_cold(worker, igpu_setup_estimate_ms_, false)) {
+        ++igpu_deferred_;
         return false;
     }
-    bool starting = false;
-    std::chrono::steady_clock::time_point setup_start;
+    if (cold && !admit_cold_igpu(worker, training)) {
+        if (guarded)
+            end_cold();
+        ++igpu_deferred_;
+        return false;
+    }
+    const auto setup_start = std::chrono::steady_clock::now();
     const auto record_setup = [&] {
-        if (!starting)
-            return;
-        igpu_setup_ms_ = std::chrono::duration<double, std::milli>(
-                             std::chrono::steady_clock::now() - setup_start)
-                             .count();
-        add_atomic(cold_spent_ms_, igpu_setup_ms_);
-        end_cold();
-        starting = false;
+        if (starting) {
+            const auto elapsed = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - setup_start)
+                                     .count();
+            worker.igpu_setup_ms += elapsed;
+            add_atomic(cold_spent_ms_, elapsed);
+        }
+        if (guarded)
+            end_cold();
     };
     try {
-        if (!igpu_attempted_) {
-            if (!begin_cold(worker, igpu_setup_estimate_ms_, training)) {
-                ++igpu_deferred_;
-                igpu_busy_.store(false, std::memory_order_release);
-                return false;
-            }
-            if (!admit_cold_igpu(worker, training)) {
-                end_cold();
-                ++igpu_deferred_;
-                igpu_busy_.store(false, std::memory_order_release);
-                return false;
-            }
-            igpu_attempted_ = true;
-            starting = true;
-            setup_start = std::chrono::steady_clock::now();
-            igpu_compute_ = igpu_factory_(igpu_block_bytes_, igpu_budget_);
-            if (igpu_compute_) {
-                igpu_first_.resize(igpu_block_bytes_);
-                igpu_second_.resize(igpu_block_bytes_);
+        if (starting) {
+            worker.igpu_attempted = true;
+            worker.igpu_compute = igpu_factory_(igpu_block_bytes_, igpu_budget_);
+            if (worker.igpu_compute) {
                 auto cpu = worker.cpu_compute->hasher();
-                auto device = igpu_compute_->hasher();
-                cpu->update(igpu_first_);
-                device->update(igpu_first_);
+                auto device = worker.igpu_compute->hasher();
+                const auto input =
+                    std::span(worker.first)
+                        .first(std::min<std::size_t>(worker.first.size(), 64 * 1024));
+                cpu->update(input);
+                device->update(input);
                 if (cpu->finish() != device->finish())
                     throw std::runtime_error("iGPU correctness validation mismatch");
-                auto actual = igpu_compute_->profile();
+                auto actual = worker.igpu_compute->profile();
                 actual.backend = BackendKind::igpu;
                 auto& batch = actual.effective_batch_bytes;
                 batch =
@@ -409,32 +426,31 @@ bool Resources::select_igpu(Worker& worker, bool training) {
                 if (igpu_probe_ && identity(actual) != identity(igpu_profile_))
                     throw std::runtime_error(
                         "iGPU profile changed between discovery and activation");
-                igpu_profile_ = std::move(actual);
+                load_prior(worker, BackendKind::igpu, actual, igpu_block_bytes_);
+                worker.igpu_enabled = true;
+                igpu_ready_.store(true, std::memory_order_release);
+            } else {
+                worker.igpu_retired = true;
             }
             record_setup();
         }
-        if (!igpu_compute_ || igpu_retired_) {
-            igpu_busy_.store(false, std::memory_order_release);
+        if (!worker.igpu_enabled || !worker.igpu_compute)
             return false;
-        }
-        load_prior(worker, BackendKind::igpu, igpu_profile_, igpu_block_bytes_);
-        std::swap(worker.compute, igpu_compute_);
-        worker.first.swap(igpu_first_);
-        worker.second.swap(igpu_second_);
+        std::swap(worker.compute, worker.igpu_compute);
         worker.igpu_selected = true;
         worker.selected_backend = worker.compute.get();
         return true;
     } catch (const ComputeError&) {
         record_setup();
-        igpu_retired_ = true;
-        igpu_compute_.reset();
-        igpu_busy_.store(false, std::memory_order_release);
+        worker.igpu_retired = true;
+        worker.igpu_enabled = false;
+        worker.igpu_compute.reset();
         return false;
     } catch (...) {
         record_setup();
-        igpu_retired_ = true;
-        igpu_compute_.reset();
-        igpu_busy_.store(false, std::memory_order_release);
+        worker.igpu_retired = true;
+        worker.igpu_enabled = false;
+        worker.igpu_compute.reset();
         throw;
     }
 }
@@ -494,7 +510,7 @@ bool Resources::prepare_gpu(Worker& worker) {
 
 bool Resources::activate_cuda(Worker& worker, bool training) {
     bool owns_bootstrap = false;
-    if (policy_ == BackendPolicy::automatic && !worker.gpu_attempted) {
+    if (policy_ == BackendPolicy::automatic && !worker.gpu_attempted && !training) {
         auto state = Bootstrap::cold;
         owns_bootstrap = bootstrap_.compare_exchange_strong(state, Bootstrap::initializing,
                                                             std::memory_order_acq_rel);
@@ -504,6 +520,7 @@ bool Resources::activate_cuda(Worker& worker, bool training) {
         }
     }
     const bool starting = !worker.gpu_attempted;
+    const bool guarded = starting && !training && policy_ == BackendPolicy::automatic && pgo_;
     if (starting && !begin_cold(worker, cuda_bootstrap_ms_, training)) {
         ++cuda_deferred_;
         if (owns_bootstrap)
@@ -515,7 +532,8 @@ bool Resources::activate_cuda(Worker& worker, bool training) {
         if (!starting)
             return;
         add_atomic(cold_spent_ms_, worker.setup_ms - setup_before);
-        end_cold();
+        if (guarded)
+            end_cold();
     };
     bool available = false;
     try {
@@ -555,7 +573,8 @@ void Resources::select_backend(Worker& worker, std::uint64_t bytes, bool hash,
                 cuda_factory_ && worker.gpu_block_bytes && worker.device_budget_bytes &&
                 !worker.gpu_retired && (!worker.gpu_attempted || worker.gpu_enabled),
             (policy_ == BackendPolicy::automatic || policy_ == BackendPolicy::igpu) &&
-                igpu_factory_ && igpu_block_bytes_};
+                igpu_factory_ && worker.igpu_block_bytes && worker.igpu_budget_bytes &&
+                !worker.igpu_retired && (!worker.igpu_attempted || worker.igpu_enabled)};
         const auto band = bytes ? (std::bit_width(bytes) - 1) / detail::OnlineModel::band_shift : 0;
         if (policy_ == BackendPolicy::automatic && pgo_ && hash && bytes >= worker.gpu_floor &&
             bytes)
@@ -607,7 +626,20 @@ void Resources::select_backend(Worker& worker, std::uint64_t bytes, bool hash,
                 worker.devices[slot].effective_batch_bytes;
             worker.decision_prediction = pgo_ ? worker.model.predict(kind, worker.decision_context)
                                               : detail::OnlineModel::Prediction{};
-            backend_active_[slot].fetch_add(1, std::memory_order_relaxed);
+            if (kind == BackendKind::cuda) {
+                worker.contention_epoch = cuda_overlap_epoch_.load(std::memory_order_relaxed);
+                worker.contention_at_start =
+                    backend_active_[slot].fetch_add(1, std::memory_order_relaxed);
+                if (worker.contention_at_start)
+                    cuda_overlap_epoch_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                worker.contention_epoch = host_igpu_overlap_epoch_.load(std::memory_order_relaxed);
+                worker.contention_at_start =
+                    host_igpu_active_.fetch_add(1, std::memory_order_relaxed);
+                if (worker.contention_at_start)
+                    host_igpu_overlap_epoch_.fetch_add(1, std::memory_order_relaxed);
+                backend_active_[slot].fetch_add(1, std::memory_order_relaxed);
+            }
             worker.decision_active = true;
             if (kind == BackendKind::cuda) {
                 worker.gpu_counted = true;
@@ -619,6 +651,13 @@ void Resources::select_backend(Worker& worker, std::uint64_t bytes, bool hash,
                 while (peak < worker.gpu_inflight_at_selection &&
                        !gpu_peak_.compare_exchange_weak(peak, worker.gpu_inflight_at_selection,
                                                         std::memory_order_relaxed)) {
+                }
+            }
+            if (kind == BackendKind::igpu) {
+                const auto active = igpu_active_.fetch_add(1, std::memory_order_relaxed) + 1;
+                auto peak = igpu_peak_.load(std::memory_order_relaxed);
+                while (peak < active &&
+                       !igpu_peak_.compare_exchange_weak(peak, active, std::memory_order_relaxed)) {
                 }
             }
             if (!hash)
@@ -650,23 +689,28 @@ void Resources::select_backend(Worker& worker, std::uint64_t bytes, bool hash,
 }
 
 void Resources::finish_task(Worker& worker) {
+    const bool counted_igpu =
+        worker.decision_active && worker.decision_backend == BackendKind::igpu;
     if (worker.decision_active) {
+        if (worker.decision_backend != BackendKind::cuda)
+            host_igpu_active_.fetch_sub(1, std::memory_order_relaxed);
         backend_active_[static_cast<unsigned>(worker.decision_backend)].fetch_sub(
             1, std::memory_order_relaxed);
         worker.decision_active = false;
     }
     if (worker.igpu_selected) {
+        if (counted_igpu)
+            igpu_active_.fetch_sub(1, std::memory_order_relaxed);
         if (worker.igpu_retired || worker.compute.get() != worker.selected_backend) {
-            igpu_retired_ = true;
-            worker.compute = std::move(igpu_compute_);
+            worker.compute = std::move(worker.igpu_compute);
+            worker.igpu_retired = true;
+            worker.igpu_enabled = false;
         } else {
-            std::swap(worker.compute, igpu_compute_);
+            std::swap(worker.compute, worker.igpu_compute);
         }
-        worker.first.swap(igpu_first_);
-        worker.second.swap(igpu_second_);
         worker.igpu_selected = false;
-        igpu_busy_.store(false, std::memory_order_release);
-    }
+    } else if (worker.igpu_retired)
+        worker.igpu_compute.reset();
     if (worker.gpu_selected) {
         if (worker.compute.get() != worker.selected_backend || worker.gpu_retired) {
             worker.compute = std::move(worker.gpu_compute);
@@ -680,13 +724,13 @@ void Resources::finish_task(Worker& worker) {
             worker.second.swap(worker.gpu_second);
         }
         worker.gpu_selected = false;
-        if (worker.gpu_counted) {
-            gpu_active_.fetch_sub(1, std::memory_order_relaxed);
-            worker.gpu_counted = false;
-        }
     } else if (worker.gpu_retired) {
         worker.gpu_compute.reset();
         worker.gpu_enabled = false;
+    }
+    if (worker.gpu_counted) {
+        gpu_active_.fetch_sub(1, std::memory_order_relaxed);
+        worker.gpu_counted = false;
     }
     worker.startup_error = {};
 }
@@ -713,16 +757,29 @@ void Resources::run(Worker& worker) {
         if (pgo_ && worker.sample.valid && !worker.startup_error &&
             worker.fallback_count == retries && worker.compute.get() == worker.selected_backend) {
             if (worker.sample.bytes == worker.decision_context.bytes) {
-                worker.model.observe(worker.decision_backend, worker.decision_context,
-                                     worker.sample.service_ms);
+                worker.learning_context = worker.decision_context;
+                const auto epoch = worker.decision_backend == BackendKind::cuda
+                                       ? cuda_overlap_epoch_.load(std::memory_order_relaxed)
+                                       : host_igpu_overlap_epoch_.load(std::memory_order_relaxed);
+                worker.learning_context.contention =
+                    std::max({worker.learning_context.contention,
+                              static_cast<double>(worker.contention_at_start),
+                              epoch != worker.contention_epoch ? 1.0 : 0.0});
+                worker.model.observe(worker.decision_backend, worker.learning_context,
+                                     worker.sample.service_ms, worker.decision_prediction);
                 if (worker.decision_backend == BackendKind::cpu && worker.sample.bytes &&
                     worker.sample.bytes >= worker.gpu_floor &&
                     std::isfinite(worker.sample.service_ms) && worker.sample.service_ms > 0)
                     add_atomic(cold_credit_ms_, cold_exploration_fraction_ *
                                                     worker.sample.service_ms / credit_divisor_);
             }
-            if (worker.sample.gpu && worker.gpu_inflight_at_selection > 1)
-                ++worker.contended_samples;
+            if (worker.decision_backend != BackendKind::cpu &&
+                worker.learning_context.contention > 0) {
+                if (worker.decision_backend == BackendKind::cuda)
+                    ++worker.contended_samples;
+                else if (worker.decision_backend == BackendKind::igpu)
+                    ++worker.igpu_contended_samples;
+            }
         }
         finish_task(worker);
         {
@@ -735,6 +792,7 @@ void Resources::run(Worker& worker) {
     // Destroy CUDA objects/registered buffers on their creating thread; never reset the shared
     // device.
     worker.gpu_compute.reset();
+    worker.igpu_compute.reset();
     worker.compute.reset();
     worker.gpu_first.clear();
     worker.gpu_second.clear();
@@ -743,6 +801,24 @@ void Resources::run(Worker& worker) {
 bool Resources::gpu_service_enabled() const {
     return std::any_of(workers_.begin(), workers_.end(),
                        [](const auto& w) { return w->gpu_enabled; });
+}
+bool Resources::igpu_service_enabled() const {
+    return std::any_of(workers_.begin(), workers_.end(),
+                       [](const auto& w) { return w->igpu_enabled; });
+}
+bool Resources::igpu_attempted() const {
+    return std::any_of(workers_.begin(), workers_.end(),
+                       [](const auto& w) { return w->igpu_attempted; });
+}
+bool Resources::igpu_retired() const {
+    return !igpu_service_enabled() && std::any_of(workers_.begin(), workers_.end(),
+                                                  [](const auto& w) { return w->igpu_retired; });
+}
+double Resources::igpu_setup_ms() const {
+    double total = 0;
+    for (const auto& w : workers_)
+        total += w->igpu_setup_ms;
+    return total;
 }
 std::uint64_t Resources::exploration_jobs() const {
     std::uint64_t total = 0;
@@ -818,6 +894,7 @@ std::vector<WorkerProfile> Resources::worker_profiles() const {
         p.delta = w->model.delta();
         p.devices = w->devices;
         p.decision_context = w->decision_context;
+        p.learning_context = w->learning_context;
         p.decision_prediction = w->decision_prediction;
         p.decision_backend = w->decision_backend;
         p.decisions = w->decisions;
@@ -825,15 +902,21 @@ std::vector<WorkerProfile> Resources::worker_profiles() const {
         p.cpu_block_bytes = w->cpu_block_bytes;
         p.gpu_block_bytes = w->gpu_block_bytes;
         p.device_budget_bytes = w->device_budget_bytes;
+        p.igpu_block_bytes = w->igpu_block_bytes;
+        p.igpu_budget_bytes = w->igpu_budget_bytes;
         p.setup_ms = w->setup_ms;
+        p.igpu_setup_ms = w->igpu_setup_ms;
         p.gpu_attempted = w->gpu_attempted;
         p.gpu_enabled = w->gpu_enabled;
+        p.igpu_attempted = w->igpu_attempted;
+        p.igpu_enabled = w->igpu_enabled;
         p.cpu_hashes = w->cpu_hashes;
         p.gpu_hashes = w->gpu_hashes;
         p.igpu_hashes = w->igpu_hashes;
         p.igpu_hash_bytes = w->igpu_hash_bytes;
         p.igpu_busy = w->igpu_busy;
         p.igpu_selections = w->igpu_selections;
+        p.igpu_contended_samples = w->igpu_contended_samples;
         p.cpu_routed_hashes = w->cpu_routed_hashes;
         p.hash_bytes = w->hash_bytes;
         p.compare_bytes = w->compare_bytes;

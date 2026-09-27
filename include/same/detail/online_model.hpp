@@ -134,6 +134,10 @@ public:
     /// 在更新前记录预测残差，然后累加充分统计量。 / Record pre-update residual then sufficient
     /// statistics.
     bool observe(BackendKind backend, const Context& context, double service_ms) noexcept;
+    /// 决策时冻结的预测只用于误差；实际重叠上下文用于拟合。
+    /// Use the decision-time prediction for error and the observed-overlap context for fitting.
+    bool observe(BackendKind backend, const Context& context, double service_ms,
+                 Prediction decision_prediction) noexcept;
 
     /// 兼容 CUDA 布尔调用。 / Compatibility for CUDA boolean callers.
     Prediction predict(bool gpu, std::uint64_t bytes) const noexcept {
