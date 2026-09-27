@@ -69,6 +69,14 @@ Schema version is 1 with application ID 1396788564 (`0x53414D54`). Ownership/ver
 
 Run accepted/persisted/dropped counters cover queued events only, not reserved final stages/metrics/parameters. Exact final drain includes DB close/thread exit and is available in current-run Summary after joining, not falsely persisted before it is known. Inspect both truncation totals and row flags.
 
+### 显式训练的端到端记录 / End-to-end train records
+
+`same train` 默认复用同一遥测库，`runs.command='train'`；`root` 是模型所属工作区，`config_json` 内的 `corpus` 是只读语料绝对路径，另含有效配置与选样上限。`runs.status` 对完整成功记 `completed`，设备不可用、文件变化、摘要不一致或保存失败记 `failed`，具体异常保留在 `runs.error` 和 `train.failed` 日志。`--no-telemetry` 不创建本轮遥测记录，但模型仍训练并落盘。 / Train uses the existing database with `command='train'`, a workspace root and an explicit corpus path in `config_json`. Failed training is finalized as failed with an error and terminal log; no-telemetry leaves training/model persistence active.
+
+固定终态跨度为 `train.select`、`train.initialize`、`train.measure`、`train.persist`、`train.output` 及父跨度 `train.run`。终态指标包括发现/选中/达到 GPU 资格/完成三方校验的文件数、逻辑输入及实际应用层读字节、各后端提交与接受样本数、预测前误差、先验命中与保存键数、CUDA 各线程启动时间之和、iGPU 发现/初始化时间、阶段与运行时间。`train.backend_attempt` 是每后端每文件的普通有界跨度，包含请求后端、工作线程、大小、起点、耗时及成功/失败；不包含文件路径或内容。其 `span_id=1000000+file_index*3+backend_index`，后端顺序为 CPU=0、CUDA=1、iGPU=2。普通事件可能被丢弃，不能只数跨度断言完成量；用终态 `train.*_samples`、`train.verified_files` 与 `runs.dropped/errors` 联合核对。 / Five fixed stages and the run span use the terminal slot; bounded per-backend attempts may be dropped. Final `train.*` metrics are the complete count source. A failed run can have partial accepted in-memory samples without publishing training deltas to the model store.
+
+库内 `train.elapsed_ms` 截止输出完成，不含遥测写入器的最终排空；stderr 单列 `telemetry_drain_ms` 与 `total_including_telemetry_ms`。CUDA 启动值是线程时间之和，可能与测量阶段重叠，不能与阶段或进程墙钟直接相加。语料路径及失败错误仍可能敏感，即使逐任务跨度省略路径。 / The stored elapsed value ends before telemetry drain; stderr reports drain and total including drain. Summed CUDA setup is not additive wall time, and corpus identity/error text can be sensitive.
+
 索引覆盖 `(run_id,time_ns)`、`(name,run_id)`、`(run_id,span_id)` 和运行开始时间；指标、参数按运行与名字建立主键。外部客户端建议以只读模式打开，并保持短读事务。仅复制主 `.db` 可能遗漏 WAL 中尚未合并的数据；运行中备份应使用 SQLite 备份 API 或客户端备份功能。
 
 Indexes cover run/time, event name/run, run/span and run start. Metrics and parameters have run/name keys. Prefer read-only clients and short transactions. Copying the main DB alone can omit live WAL data; use SQLite backup facilities for live backups.
@@ -141,6 +149,8 @@ The writer persists eight effective settings in category telemetry: queue_capaci
 Hash spans reuse analyzer sampling: eligible work is sampled, small work once every 64 tasks per worker. They are not a complete file trace. Unsampled failures emit hash.error even with no-pgo; sampled failures use an error-severity hash span. Fallbacks emit hash.fallback. Diagnostics remain subject to queue/cap limits. Missing spans do not prove work was absent. Inspect loss counters before distribution analysis; event loss does not undo model observations.
 
 ## 生命周期、保留与隐私 / Lifecycle, retention and privacy
+
+`same merge` 按运行 ID 导入来源工作区的遥测运行及其事件、指标和参数；重复合并跳过已导入运行。导入不覆盖目标配置，也不保证永久保留：目标下一次运行仍会按自己的保留配置淘汰旧运行。`merge --summary` 报告本次实际新增的运行与事件，不等于数据库当前总数。/ `same merge` imports telemetry by run ID with dependent rows, skips already imported runs, and preserves destination configuration. Later destination retention can evict imported runs. The merge summary counts newly imported rows, not the database total.
 
 后台打开前检查主库与 `-wal`、`-shm`、`-journal` 侧文件：拒绝符号链接、Windows 重解析点（reparse point）、多硬链接与非普通文件。该保护用于拒绝已存在的不安全路径，不声称抵御拥有同目录写权限的恶意进程并发替换路径。检查失败仅禁用遥测并报告，不阻塞文件比较业务。
 

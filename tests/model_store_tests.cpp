@@ -28,7 +28,7 @@ void sql(const std::filesystem::path& path, const char* text) {
 } // namespace
 int main() {
     const auto directory =
-        std::filesystem::temp_directory_path() /
+        std::filesystem::path(SAME_TEST_ROOT) / ".temp" /
         ("same-model-test-" +
          std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     try {
@@ -53,6 +53,22 @@ int main() {
             invalid[0].weight = std::numeric_limits<double>::quiet_NaN();
             require(!db.save("machine-a", invalid), "NaN accepted");
             require(!db.save(std::string(4097, 'x'), state), "oversized key accepted");
+        }
+        // 把真实序列化载荷降成旧 schema 2，核实迁移保留模型与初始化历史。
+        // Downgrade a real serialized payload to schema 2 and verify migration preserves it.
+        const auto legacy2 = std::filesystem::canonical(directory) / "legacy2.db";
+        std::filesystem::copy_file(path, legacy2);
+        sql(legacy2, "DROP TABLE model_parts; DROP TABLE setup_parts; DROP TABLE model_meta; "
+                     "PRAGMA user_version=2");
+        {
+            same::ModelStore db(legacy2);
+            require(db.diagnostic().empty(), "v2 migration failed");
+            require(db.load("machine-a") && db.load("machine-a")->at(0).samples == 1,
+                    "v2 migration lost statistics");
+            require(db.load_setup("machine-a") && db.load_setup("machine-a")->last_ms == 2,
+                    "v2 migration lost setup history");
+            require(db.contributions().size() == 1 && db.setup_contributions().size() == 1,
+                    "v2 migration did not create provenance");
         }
         {
             same::ModelStore db(path);

@@ -179,7 +179,14 @@ detail::OnlineModel::Context Resources::context(const Worker& worker, BackendKin
 
 std::pair<BackendKind, Resources::Reason>
 Resources::choose_backend(Worker& worker, std::uint64_t bytes, bool hash,
-                          const std::array<bool, 3>& candidates) {
+                          const std::array<bool, 3>& candidates,
+                          std::optional<BackendKind> training_backend) {
+    if (training_backend) {
+        const auto requested = *training_backend;
+        const auto slot = static_cast<unsigned>(requested);
+        return {slot < candidates.size() && candidates[slot] ? requested : BackendKind::cpu,
+                Reason::fixed};
+    }
     if (hash && (!bytes || bytes < worker.gpu_floor))
         return {BackendKind::cpu, Reason::size};
     if (policy_ != BackendPolicy::automatic || !hash) {
@@ -242,8 +249,8 @@ Resources::choose_backend(Worker& worker, std::uint64_t bytes, bool hash,
     return known ? std::pair{best, Reason::model} : std::pair{preferred, Reason::fixed};
 }
 
-bool Resources::begin_cold(const Worker& worker, double estimate) {
-    if (policy_ != BackendPolicy::automatic || !pgo_)
+bool Resources::begin_cold(const Worker& worker, double estimate, bool training) {
+    if (training || policy_ != BackendPolicy::automatic || !pgo_)
         return true;
     bool idle = false;
     if (!cold_start_busy_.compare_exchange_strong(idle, true, std::memory_order_acquire))
@@ -266,7 +273,7 @@ void Resources::end_cold() {
         cold_start_busy_.store(false, std::memory_order_release);
 }
 
-bool Resources::discover_igpu(Worker& worker) {
+bool Resources::discover_igpu(Worker& worker, bool training) {
     bool idle = false;
     if (!igpu_busy_.compare_exchange_strong(idle, true, std::memory_order_acquire)) {
         ++worker.igpu_busy;
@@ -274,7 +281,7 @@ bool Resources::discover_igpu(Worker& worker) {
     }
     try {
         if (!igpu_probed_) {
-            if (!begin_cold(worker, igpu_bootstrap_ms_)) {
+            if (!begin_cold(worker, igpu_bootstrap_ms_, training)) {
                 ++igpu_deferred_;
                 igpu_busy_.store(false, std::memory_order_release);
                 return false;
@@ -328,8 +335,8 @@ bool Resources::discover_igpu(Worker& worker) {
     }
 }
 
-bool Resources::admit_cold_igpu(const Worker& worker) const {
-    if (policy_ != BackendPolicy::automatic || !pgo_ || igpu_setup_estimate_ms_ == 0)
+bool Resources::admit_cold_igpu(const Worker& worker, bool training) const {
+    if (training || policy_ != BackendPolicy::automatic || !pgo_ || igpu_setup_estimate_ms_ == 0)
         return true;
     const auto cpu = worker.model.predict(BackendKind::cpu, worker.candidate_contexts[0]);
     const auto igpu = worker.model.predict(BackendKind::igpu, worker.candidate_contexts[2]);
@@ -343,7 +350,7 @@ bool Resources::admit_cold_igpu(const Worker& worker) const {
            igpu_setup_estimate_ms_;
 }
 
-bool Resources::select_igpu(Worker& worker) {
+bool Resources::select_igpu(Worker& worker, bool training) {
     bool idle = false;
     if (!igpu_busy_.compare_exchange_strong(idle, true, std::memory_order_acquire)) {
         ++worker.igpu_busy;
@@ -363,12 +370,12 @@ bool Resources::select_igpu(Worker& worker) {
     };
     try {
         if (!igpu_attempted_) {
-            if (!begin_cold(worker, igpu_setup_estimate_ms_)) {
+            if (!begin_cold(worker, igpu_setup_estimate_ms_, training)) {
                 ++igpu_deferred_;
                 igpu_busy_.store(false, std::memory_order_release);
                 return false;
             }
-            if (!admit_cold_igpu(worker)) {
+            if (!admit_cold_igpu(worker, training)) {
                 end_cold();
                 ++igpu_deferred_;
                 igpu_busy_.store(false, std::memory_order_release);
@@ -485,7 +492,7 @@ bool Resources::prepare_gpu(Worker& worker) {
     }
 }
 
-bool Resources::activate_cuda(Worker& worker) {
+bool Resources::activate_cuda(Worker& worker, bool training) {
     bool owns_bootstrap = false;
     if (policy_ == BackendPolicy::automatic && !worker.gpu_attempted) {
         auto state = Bootstrap::cold;
@@ -497,7 +504,7 @@ bool Resources::activate_cuda(Worker& worker) {
         }
     }
     const bool starting = !worker.gpu_attempted;
-    if (starting && !begin_cold(worker, cuda_bootstrap_ms_)) {
+    if (starting && !begin_cold(worker, cuda_bootstrap_ms_, training)) {
         ++cuda_deferred_;
         if (owns_bootstrap)
             bootstrap_.store(Bootstrap::cold, std::memory_order_release);
@@ -534,6 +541,11 @@ bool Resources::activate_cuda(Worker& worker) {
 }
 
 void Resources::select_backend(Worker& worker, std::uint64_t bytes, bool hash) noexcept {
+    select_backend(worker, bytes, hash, std::nullopt);
+}
+
+void Resources::select_backend(Worker& worker, std::uint64_t bytes, bool hash,
+                               std::optional<BackendKind> training_backend) noexcept {
     worker.startup_error = {};
     worker.selected_backend = worker.compute.get();
     try {
@@ -556,11 +568,12 @@ void Resources::select_backend(Worker& worker, std::uint64_t bytes, bool hash) n
             for (unsigned slot = 0; slot < 3; ++slot)
                 worker.candidate_contexts[slot] =
                     context(worker, static_cast<BackendKind>(slot), bytes);
-            const auto [kind, reason] = choose_backend(worker, bytes, hash, candidates);
+            const auto [kind, reason] =
+                choose_backend(worker, bytes, hash, candidates, training_backend);
             const auto slot = static_cast<unsigned>(kind);
             const bool known_device = worker.prior_loaded[slot];
             if (kind == BackendKind::igpu && igpu_probe_ && !known_device) {
-                if (!discover_igpu(worker)) {
+                if (!discover_igpu(worker, training_backend.has_value())) {
                     candidates[slot] = false;
                     ++worker.excluded[slot];
                 }
@@ -568,7 +581,8 @@ void Resources::select_backend(Worker& worker, std::uint64_t bytes, bool hash) n
             }
             const bool activated =
                 kind == BackendKind::cpu ||
-                (kind == BackendKind::cuda ? activate_cuda(worker) : select_igpu(worker));
+                (kind == BackendKind::cuda ? activate_cuda(worker, training_backend.has_value())
+                                           : select_igpu(worker, training_backend.has_value()));
             if (!activated) {
                 candidates[slot] = false;
                 ++worker.excluded[slot];

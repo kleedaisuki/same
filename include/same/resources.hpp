@@ -9,6 +9,7 @@
 #include <functional>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <thread>
 #include <type_traits>
@@ -236,7 +237,15 @@ public:
     template <class F>
     auto submit_hash(F&& operation, std::uint64_t bytes)
         -> std::future<std::invoke_result_t<F, Worker&>> {
-        return submit_impl(std::forward<F>(operation), bytes, true);
+        return submit_impl(std::forward<F>(operation), bytes, true, std::nullopt);
+    }
+    /// 显式训练使用自动模式的真实资源预算，但必须由请求后端完成，不隐式接受 CPU 回退。
+    /// Train with automatic-mode budgets while requiring the requested backend; callers must
+    /// reject any unavailable-backend fallback before assigning a training sample.
+    template <class F>
+    auto submit_training_hash(F&& operation, std::uint64_t bytes, BackendKind backend)
+        -> std::future<std::invoke_result_t<F, Worker&>> {
+        return submit_impl(std::forward<F>(operation), bytes, true, backend);
     }
     /// 曾成功启用的上下文数，支持并发读取。 / Contexts ever enabled; concurrent reads are safe.
     std::size_t gpu_workers() const {
@@ -319,12 +328,16 @@ private:
     /// 操作始终被调用以发布完成；初始化异常在其 execute 内传播。
     /// Always invoke callbacks to publish completion; setup errors propagate within their execute.
     template <class F>
-    auto submit_impl(F&& operation, std::uint64_t bytes, bool hash)
+    auto submit_impl(F&& operation, std::uint64_t bytes, bool hash,
+                     std::optional<BackendKind> training_backend = std::nullopt)
         -> std::future<std::invoke_result_t<F, Worker&>> {
         using Result = std::invoke_result_t<F, Worker&>;
-        auto invoke = [this, op = std::forward<F>(operation), bytes,
-                       hash](Worker& worker) mutable -> Result {
-            select_backend(worker, bytes, hash);
+        auto invoke = [this, op = std::forward<F>(operation), bytes, hash,
+                       training_backend](Worker& worker) mutable -> Result {
+            if (training_backend)
+                select_backend(worker, bytes, hash, training_backend);
+            else
+                select_backend(worker, bytes, hash);
             if constexpr (std::is_void_v<Result>) {
                 std::invoke(op, worker);
                 worker.rethrow_startup();
@@ -348,16 +361,21 @@ private:
     /// 本地成本与有界探索，不读取时钟或其他模型。 / Local costs and bounded exploration; no clock
     /// or peer model reads.
     std::pair<BackendKind, Reason> choose_backend(Worker& worker, std::uint64_t bytes, bool hash,
-                                                  const std::array<bool, 3>& candidates);
+                                                  const std::array<bool, 3>& candidates,
+                                                  std::optional<BackendKind> training_backend);
     /// 取得配置与实际容量组成的上下文，不查询驱动。 / Context from config/cached capacity, no
     /// driver query.
     detail::OnlineModel::Context context(const Worker& worker, BackendKind kind,
                                          std::uint64_t bytes) const;
     /// 初始化时只加载对应设备的先验。 / Load only this device prior at initialization.
     void load_prior(Worker& worker, BackendKind kind, const Compute& compute, std::size_t block);
-    bool activate_cuda(Worker& worker);
+    bool activate_cuda(Worker& worker, bool training);
     /// 捕获初始化异常但不跳过用户回调。 / Capture setup exceptions without skipping the callback.
     void select_backend(Worker& worker, std::uint64_t bytes, bool hash) noexcept;
+    /// 训练专用重载保留旧三参数符号和 Worker 布局。 / Training overload preserves the
+    /// existing three-argument symbol and Worker layout.
+    void select_backend(Worker& worker, std::uint64_t bytes, bool hash,
+                        std::optional<BackendKind> training_backend) noexcept;
     /// 所属线程首次初始化并验证，失败不重新探测。 / Owner-thread one-time
     /// initialization/validation, without repeated probing.
     bool prepare_gpu(Worker& worker);
@@ -375,10 +393,10 @@ private:
     BackendPolicy policy_{BackendPolicy::cpu};
     /// 单上下文、统一内存配额；原子准入失败立即继续其他后端。
     /// One context and unified-memory quota; failed atomic admission never waits.
-    bool select_igpu(Worker& worker);
-    bool discover_igpu(Worker& worker);
-    bool admit_cold_igpu(const Worker& worker) const;
-    bool begin_cold(const Worker& worker, double estimate);
+    bool select_igpu(Worker& worker, bool training);
+    bool discover_igpu(Worker& worker, bool training);
+    bool admit_cold_igpu(const Worker& worker, bool training) const;
+    bool begin_cold(const Worker& worker, double estimate, bool training);
     void end_cold();
     std::atomic<bool> cold_start_busy_{false};
     std::atomic<std::uint64_t> cuda_deferred_{0};

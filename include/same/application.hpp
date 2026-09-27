@@ -1,7 +1,9 @@
 #pragma once
 #include "same/config.hpp"
+#include <cstdint>
 #include <filesystem>
 #include <iosfwd>
+#include <vector>
 namespace same {
 /// Explicit presentation policy; library callers retain legacy TSV by default.
 /// 显式展示策略；库调用方默认保留旧 TSV 格式。
@@ -44,4 +46,30 @@ int run(const std::filesystem::path& root, const Config& config, std::ostream& o
  */
 int run(const std::filesystem::path& root, const Config& config, std::ostream& output,
         std::ostream& diagnostics);
+/// 显式训练三个后端；只读语料，在工作区模型库持久化成功的完整文件观测。
+/// Explicitly train all three backends on read-only corpus files, persisting complete successful
+/// observations to the workspace model store. No scan cache or duplicate results are changed.
+/// Example: train(workspace, corpus, Config::load(workspace), std::cout, std::cerr);
+int train(const std::filesystem::path& workspace, const std::filesystem::path& corpus,
+          const Config& config, std::ostream& output, std::ostream& diagnostics,
+          std::size_t max_files = 128, std::uint64_t max_bytes = 2ULL * 1024 * 1024 * 1024);
+/// 训练诊断与扫描 --summary 共用展示约定；默认不改变原有调用者输出。
+/// Training diagnostics follow scan --summary presentation without changing old callers.
+struct TrainReportOptions {
+    /// 仅显式请求时输出完整报告。 / Emit the full report only on explicit request.
+    bool summary{false};
+    /// 使用分区与可读单位。 / Use sections and human-readable units.
+    bool pretty{false};
+    /// 仅对终端诊断流启用颜色。 / Color only the terminal diagnostics stream.
+    bool color{false};
+};
+/// 使用明确展示策略训练，原有 train 重载仍保留。 / Train with explicit presentation.
+int train(const std::filesystem::path& workspace, const std::filesystem::path& corpus,
+          const Config& config, std::ostream& output, std::ostream& diagnostics,
+          std::size_t max_files, std::uint64_t max_bytes, TrainReportOptions options);
+/// 多目录使用同一个全局选样预算和同一个工作区模型；空列表等价于当前目录。
+/// Multiple corpora share one global sample budget and workspace model; empty means workspace.
+int train(const std::filesystem::path& workspace, const std::vector<std::filesystem::path>& corpora,
+          const Config& config, std::ostream& output, std::ostream& diagnostics,
+          std::size_t max_files, std::uint64_t max_bytes, TrainReportOptions options);
 } // namespace same

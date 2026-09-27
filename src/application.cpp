@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <deque>
@@ -24,6 +25,8 @@
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
+#include <vector>
 
 namespace same {
 namespace {
@@ -43,7 +46,7 @@ std::string path_key(const fs::path& path) {
 }
 /// Decode an internal root-relative database key without locale conversion.
 /// 无需本地编码转换，将内部相对路径键还原为本机路径。
-fs::path native_path(const fs::path& root, const std::string& key) {
+fs::path native_path(const fs::path& root, std::string_view key) {
     return root /
            fs::path(std::u8string_view(reinterpret_cast<const char8_t*>(key.data()), key.size()));
 }
@@ -245,8 +248,8 @@ struct Learning {
     /// export.
     std::map<std::string, SetupHistory> setup_snapshots;
 };
-/// 每个真实初始化形成一个观测，键相同的历史只加载一次。
-/// Each actual initialization adds one observation; load a keyed history only once.
+/// 每个真实初始化形成本轮增量，历史聚合交由来源账本处理。
+/// Each actual initialization forms a run delta; the provenance ledger owns history aggregation.
 void add_setup_history(std::map<std::string, SetupHistory>& histories, Learning& learning,
                        const Config& config, BackendKind backend, const DeviceProfile& device,
                        double milliseconds) {
@@ -254,8 +257,7 @@ void add_setup_history(std::map<std::string, SetupHistory>& histories, Learning&
         return;
     const auto key = learning_key(config, learning.cpu, backend, device);
     auto [entry, inserted] = histories.try_emplace(key);
-    if (inserted)
-        entry->second = learning.store->load_setup(key).value_or(SetupHistory{});
+    static_cast<void>(inserted);
     auto& history = entry->second;
     if (history.samples == std::numeric_limits<std::uint64_t>::max())
         return;
@@ -264,8 +266,8 @@ void add_setup_history(std::map<std::string, SetupHistory>& histories, Learning&
     history.mean_ms += (milliseconds - history.mean_ms) / static_cast<double>(history.samples);
     history.max_ms = std::max(history.max_ms, milliseconds);
 }
-/// 相同键只合并一次先验，再添加每线程本轮增量；失败扫描不调用。
-/// Merge each keyed prior once, then per-worker run deltas; never called for failed scans.
+/// 仅合并本轮增量；各来源历史由存储层衰减并重建，失败扫描不调用。
+/// Merge run-only deltas; storage decays/rematerializes provenance, never on failed scans.
 void save_learning(Learning& learning, const Config& config, const Resources& resources) {
     if (!learning.store)
         return;
@@ -282,10 +284,9 @@ void save_learning(Learning& learning, const Config& config, const Resources& re
                     continue;
                 const auto key = learning_key(config, learning.cpu, static_cast<BackendKind>(i),
                                               worker.devices[i]);
-                detail::OnlineModel::State prior{}, delta{};
-                prior[i] = worker.prior[i];
+                detail::OnlineModel::State delta{};
                 delta[i] = worker.delta[i];
-                auto entry = merged.try_emplace(key, prior).first;
+                auto entry = merged.try_emplace(key, detail::OnlineModel::State{}).first;
                 if (!detail::OnlineModel::merge(entry->second, delta))
                     throw std::runtime_error("model aggregate rejected");
             }
@@ -294,16 +295,16 @@ void save_learning(Learning& learning, const Config& config, const Resources& re
             add_setup_history(setups, learning, config, BackendKind::igpu, resources.igpu_profile(),
                               resources.igpu_setup_ms());
         for (const auto& [key, history] : setups) {
-            if (learning.store->save_setup(key, history)) {
+            if (learning.store->save_setup_delta(key, history)) {
                 ++learning.setup_saved;
-                learning.setup_snapshots.emplace(key, history);
+                learning.setup_snapshots.emplace(key, *learning.store->load_setup(key));
             } else {
                 ++learning.save_errors;
                 learning.diagnostic = learning.store->diagnostic();
             }
         }
         for (const auto& [key, state] : merged) {
-            if (learning.store->save(key, state))
+            if (learning.store->save_delta(key, state, learning_decay))
                 ++learning.saved;
             else {
                 ++learning.save_errors;
@@ -498,10 +499,17 @@ struct HashResult {
 void scan(const fs::path& root, const Config& config, Store& store, Resources& resources,
           Counters& counters, bool recursive, telemetry::Telemetry* trace = nullptr,
           Clock::time_point trace_start = {}) {
+    const auto cache_root = fs::canonical(root);
+    const auto absolute_key = [&](std::string_view relative) {
+        return path_key(native_path(cache_root, relative));
+    };
     detail::CompletionJobs<HashResult> pending(resources, config.queue_capacity);
     auto save = [&](const FileRecord& record) {
         const auto start = Clock::now();
         store.save(record);
+        auto absolute = record;
+        absolute.path = absolute_key(record.path);
+        store.save_absolute(absolute);
         counters.database_work_ms += milliseconds(start, Clock::now());
     };
     auto drain = [&] {
@@ -611,8 +619,15 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
                                 std::move(entry->reader)};
         counters.scanned_bytes += candidate.stamp.size;
         const auto queried = Clock::now();
-        const bool cached =
-            !config.rehash && store.mark_if_unchanged(candidate.path, candidate.stamp);
+        bool cached = !config.rehash && store.mark_if_unchanged(candidate.path, candidate.stamp);
+        if (!cached && !config.rehash) {
+            auto archived = store.cached_absolute(absolute_key(candidate.path));
+            if (archived && archived->stamp == candidate.stamp) {
+                archived->path = candidate.path;
+                store.save(*archived);
+                cached = true;
+            }
+        }
         counters.database_work_ms += milliseconds(queried, Clock::now());
         if (cached) {
             ++counters.cached;
@@ -631,9 +646,8 @@ void scan(const fs::path& root, const Config& config, Store& store, Resources& r
     counters.walk_task_peak = stats.task_peak;
     counters.walk_result_peak = stats.result_peak;
     const auto committed = Clock::now();
-    // 淘汰未访问记录，也隔离从递归扫描切换到浅扫描后留下的子目录缓存。
-    // Prune unseen records, including child-directory cache entries after switching to shallow
-    // mode.
+    // 仅清理本轮结果视图；绝对路径归档跨工作区保留，但不参与本轮候选比较。
+    // Prune only the active result view; the absolute archive persists but is not a candidate.
     store.end_scan();
     counters.database_work_ms += milliseconds(committed, Clock::now());
 }
@@ -1428,6 +1442,9 @@ void render_telemetry(const telemetry::Telemetry* trace, const telemetry::Stats&
                    stats.errors    ? ReportTone::danger
                    : stats.dropped ? ReportTone::warning
                                    : ReportTone::good);
+        if (stats.dropped)
+            report.row("Trace loss", "diagnostic events omitted; inspect aggregate metrics",
+                       ReportTone::warning);
         report.row("Trace pressure",
                    std::to_string(stats.queue_high_water) + " queued peak | " +
                        std::to_string(stats.truncated) + " truncated",
@@ -1718,6 +1735,650 @@ int run(const fs::path& root, const Config& config, std::ostream& output, std::o
         quoted_path(diagnostics, std::string_view(stats.error));
         diagnostics << '\n';
     }
+    if (failure)
+        std::rethrow_exception(failure);
+    return 0;
+}
+
+namespace {
+/// 训练语料只保存路径和元数据，不保留遍历期打开的文件句柄。
+/// Retain paths and stamps, not metadata-stage file handles, while choosing a bounded corpus.
+struct TrainFile {
+    fs::path root;
+    std::string path;
+    FileStamp stamp;
+    std::uint64_t rank{};
+};
+
+/// 稳定路径次序避免元数据线程完成顺序决定训练集。 / Stable path ranking prevents metadata
+/// completion order from choosing the training corpus.
+std::uint64_t train_rank(std::string_view root, std::string_view path) noexcept {
+    std::uint64_t value = 14695981039346656037ULL;
+    for (unsigned char byte : root) {
+        value ^= byte;
+        value *= 1099511628211ULL;
+    }
+    value ^= '/';
+    value *= 1099511628211ULL;
+    for (unsigned char byte : path) {
+        value ^= byte;
+        value *= 1099511628211ULL;
+    }
+    return value;
+}
+
+/// 拒绝重叠语料，避免同一个文件被多次选入并强化同一观测。
+/// Reject overlapping roots rather than counting one file repeatedly.
+std::vector<fs::path> training_roots(const fs::path& workspace,
+                                     const std::vector<fs::path>& corpora) {
+    std::vector<fs::path> roots;
+    for (const auto& input : corpora.empty() ? std::vector<fs::path>{workspace} : corpora) {
+        const auto absolute = fs::absolute(input).lexically_normal();
+        if (!fs::is_directory(absolute) || is_reparse_point(absolute))
+            throw std::runtime_error("training corpus must be a real directory");
+        const auto root = fs::canonical(absolute);
+        for (const auto& existing : roots) {
+            const auto from_existing = root.lexically_relative(existing);
+            const auto from_root = existing.lexically_relative(root);
+            const auto within = [](const fs::path& relative) {
+                return !relative.empty() && *relative.begin() != "..";
+            };
+            if (within(from_existing) || within(from_root))
+                throw std::runtime_error("training corpus directories overlap");
+        }
+        roots.push_back(root);
+    }
+    return roots;
+}
+
+/// 按大小区间有界抽样，随后交错选取；不读取或修改文件内容。
+/// Select bounded size-stratified metadata before reading any file contents.
+std::vector<TrainFile> training_files(const std::vector<fs::path>& corpora, const Config& config,
+                                      std::size_t max_files, std::uint64_t max_bytes,
+                                      std::uint64_t& discovered) {
+    if (!max_files || max_files > 4096 || !max_bytes)
+        throw std::invalid_argument("train limits require 1..4096 files and positive bytes");
+    constexpr std::size_t bands = detail::OnlineModel::band_count;
+    std::array<std::vector<TrainFile>, bands> choices;
+    const auto per_band = std::min<std::size_t>(max_files, 64);
+    for (const auto& corpus : corpora) {
+        const auto root_key = path_key(corpus);
+        ParallelWalk walk(corpus, config.metadata_workers, config.queue_capacity, true);
+        while (auto entry = walk.next()) {
+            ++discovered;
+            if (!entry->stamp.size || entry->stamp.size > max_bytes)
+                continue;
+            const auto band =
+                (std::bit_width(entry->stamp.size) - 1) / detail::OnlineModel::band_shift;
+            TrainFile file{corpus, std::move(entry->path), std::move(entry->stamp), 0};
+            file.rank = train_rank(root_key, file.path);
+            auto& group = choices[band];
+            if (group.size() < per_band)
+                group.push_back(std::move(file));
+            else {
+                const auto worst = std::max_element(
+                    group.begin(), group.end(), [](const TrainFile& a, const TrainFile& b) {
+                        return std::tie(a.rank, a.root, a.path) < std::tie(b.rank, b.root, b.path);
+                    });
+                if (std::tie(file.rank, file.root, file.path) <
+                    std::tie(worst->rank, worst->root, worst->path))
+                    *worst = std::move(file);
+            }
+        }
+    }
+    for (auto& group : choices)
+        std::sort(group.begin(), group.end(), [](const TrainFile& a, const TrainFile& b) {
+            return std::tie(a.rank, a.root, a.path) < std::tie(b.rank, b.root, b.path);
+        });
+    std::vector<TrainFile> selected;
+    selected.reserve(std::min<std::size_t>(max_files, bands * per_band));
+    std::uint64_t total = 0;
+    for (std::size_t round = 0; round < per_band && selected.size() < max_files; ++round) {
+        for (auto& group : choices) {
+            if (selected.size() == max_files)
+                break;
+            if (round >= group.size() || group[round].stamp.size > max_bytes - total)
+                continue;
+            total += group[round].stamp.size;
+            selected.push_back(std::move(group[round]));
+        }
+    }
+    return selected;
+}
+
+/// 训练复用扫描遥测库，但终态指标与阶段跨度走不丢失的结束槽。
+/// Training reuses the scan telemetry store; terminal metrics/stages bypass the event queue.
+struct TrainTrace {
+    Clock::time_point start{Clock::now()};
+    std::size_t corpora_count{};
+    std::unique_ptr<telemetry::Telemetry> writer;
+    telemetry::FinalRecord final;
+    std::array<double, 5> stage_ms{};
+    bool incomplete{};
+
+    /// 只记录工作区与语料身份，不记录文件内容。 / Record workspace/corpus identities, never bytes.
+    TrainTrace(const fs::path& workspace, const std::vector<fs::path>& corpora,
+               const Config& config, std::size_t max_files, std::uint64_t max_bytes,
+               std::ostream& diagnostics)
+        : corpora_count(corpora.size()) {
+        if (!config.telemetry)
+            return;
+        try {
+            std::ostringstream settings;
+            settings << "{\"effective\":" << telemetry_config(config, {});
+            if (corpora.size() == 1) {
+                settings << ",\"corpus\":";
+                quoted_path(settings, path_key(corpora.front()));
+            }
+            settings << ",\"corpora\":[";
+            for (std::size_t i = 0; i < corpora.size(); ++i) {
+                if (i)
+                    settings << ',';
+                quoted_path(settings, path_key(corpora[i]));
+            }
+            settings << ']';
+            settings << ",\"max_files\":" << max_files << ",\"max_bytes\":" << max_bytes << '}';
+            telemetry::RunInfo info;
+            info.version = SAME_VERSION;
+            info.command = "train";
+            info.root = path_key(workspace);
+            info.config_json = settings.str();
+            telemetry::Options options;
+            options.queue_capacity = config.telemetry_queue_capacity;
+            options.event_cap = config.telemetry_max_events;
+            options.retain_runs = config.telemetry_retention_runs;
+            writer = std::make_unique<telemetry::Telemetry>(workspace / ".same" / "telemetry.db",
+                                                            std::move(info), options);
+        } catch (...) {
+            diagnostics << "Telemetry warning: cannot allocate training run metadata.\n";
+        }
+    }
+
+    /// 固定五个阶段记录在终态槽，低内存错误另行提示。 / Fixed stages use the final slot.
+    void stage(unsigned slot, Clock::time_point begin, Clock::time_point end,
+               bool success) noexcept {
+        stage_ms[slot] = milliseconds(begin, end);
+        if (!writer)
+            return;
+        constexpr std::array<const char*, 5> names{
+            "train.select", "train.initialize", "train.measure", "train.persist", "train.output"};
+        telemetry::Event event;
+        event.type = "span";
+        event.name = names[slot];
+        event.severity = success ? "info" : "error";
+        event.span_id = slot + 2;
+        event.parent_span_id = 1;
+        event.time_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(begin - start).count());
+        event.duration_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+        event.value = success ? 1 : 0;
+        try {
+            final.events.push_back(event);
+        } catch (...) {
+            incomplete = true;
+        }
+    }
+
+    /// 每个后端尝试有独立跨度，丢弃由写入器显式计数。
+    /// One span per backend attempt; queue loss remains visible in writer counters.
+    void attempt(BackendKind backend, std::size_t worker, std::uint64_t file_index,
+                 std::uint64_t bytes, Clock::time_point begin, bool success) noexcept {
+        if (!writer)
+            return;
+        const auto end = Clock::now();
+        telemetry::Event event;
+        event.type = "span";
+        event.name = "train.backend_attempt";
+        event.severity = success ? "info" : "error";
+        event.backend = backend_name(backend);
+        event.worker = static_cast<std::int64_t>(worker);
+        event.span_id = 1000000 + file_index * 3 + static_cast<unsigned>(backend);
+        event.parent_span_id = 1;
+        event.time_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(begin - start).count());
+        event.duration_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+        event.bytes = bytes;
+        event.value = success ? 1 : 0;
+        writer->emit(event);
+    }
+};
+
+/// 作用域退出自动记录失败阶段；不在异常路径遗漏阶段状态。
+/// Scope exit records failed stages during exception unwinding.
+struct TrainStage {
+    TrainTrace& trace;
+    unsigned slot;
+    Clock::time_point begin{Clock::now()};
+    bool complete{};
+    ~TrainStage() {
+        trace.stage(slot, begin, Clock::now(), complete);
+    }
+};
+
+/// 与普通扫描相同的完整文件服务标签；设备失败不得伪装成 CPU 回退观测。
+/// Full-file service label matching scan semantics; a device failure must not become a CPU label.
+Digest train_digest(Worker& worker, const TrainFile& file, BackendKind requested) {
+    worker.rethrow_startup();
+    if (worker.decision_backend != requested || worker.compute->kind() != requested)
+        throw std::runtime_error(std::string("training backend unavailable: ") +
+                                 backend_name(requested));
+    ++(requested == BackendKind::cpu    ? worker.cpu_hashes
+       : requested == BackendKind::cuda ? worker.gpu_hashes
+                                        : worker.igpu_hashes);
+    const auto path = native_path(file.root, file.path);
+    FileReader reader(path);
+    // 扫描通常复用元数据阶段已打开的句柄；单独训练在计时前重开，保持服务标签口径。
+    // Scan usually reuses a metadata-stage handle; reopen before timing to match its service label.
+    const auto start = Clock::now();
+    unchanged(path, reader, file.stamp);
+    auto hasher = worker.compute->hasher();
+    std::uint64_t total = 0;
+    for (;;) {
+        const auto count = reader.read(worker.first);
+        if (!count)
+            break;
+        if (count > file.stamp.size - total)
+            throw std::runtime_error("file grew during training: " + file.path);
+        hasher->update(std::span(worker.first).first(count));
+        total += count;
+        worker.hash_bytes += count;
+        (requested == BackendKind::cpu    ? worker.cpu_hash_bytes
+         : requested == BackendKind::cuda ? worker.gpu_hash_bytes
+                                          : worker.igpu_hash_bytes) += count;
+    }
+    if (total != file.stamp.size)
+        throw std::runtime_error("file shrank during training: " + file.path);
+    const auto digest = hasher->finish();
+    unchanged(path, reader, file.stamp);
+    const auto elapsed = milliseconds(start, Clock::now());
+    worker.sample = {file.stamp.size, elapsed, requested == BackendKind::cuda, true, requested};
+    return digest;
+}
+
+/// 同一文件交错提交三后端，待单实例核显彻底归还后核对完整摘要。
+/// Submit all three backends for one file and wait for iGPU handback before digest comparison.
+void train_one_file(Resources& resources, TrainTrace& trace, const TrainFile& file,
+                    std::size_t index, std::array<std::uint64_t, 3>& submitted) {
+    constexpr std::array<BackendKind, 3> backends{BackendKind::cpu, BackendKind::cuda,
+                                                  BackendKind::igpu};
+    std::array<std::future<Digest>, 3> pending;
+    for (unsigned offset = 0; offset < 3; ++offset) {
+        const auto backend = backends[(index + offset) % 3];
+        const auto slot = static_cast<unsigned>(backend);
+        pending[slot] = resources.submit_training_hash(
+            [&, backend, index](Worker& worker) {
+                const auto began = Clock::now();
+                try {
+                    auto digest = train_digest(worker, file, backend);
+                    trace.attempt(backend, worker.index, index, file.stamp.size, began, true);
+                    return digest;
+                } catch (...) {
+                    trace.attempt(backend, worker.index, index, file.stamp.size, began, false);
+                    throw;
+                }
+            },
+            file.stamp.size, backend);
+        ++submitted[slot];
+    }
+    std::array<Digest, 3> digests;
+    for (unsigned slot = 0; slot < 3; ++slot)
+        digests[slot] = pending[slot].get();
+    // future 可在池释放单实例 iGPU 前就绪；下一文件等待实际任务收尾。
+    // A future may be ready before the pool releases its single iGPU instance.
+    resources.wait_idle();
+    if (digests[0] != digests[1] || digests[0] != digests[2])
+        throw std::runtime_error("training digest mismatch: " + file.path);
+}
+
+/// 使用与自动扫描完全相同的设备身份和预算加载先验。
+/// Load priors with the same device identities and budgets as automatic scanning.
+std::unique_ptr<Resources> open_training_resources(const fs::path& workspace,
+                                                   const Config& training, Learning& learning) {
+    const auto startup = Clock::now();
+    learning.cpu = make_cpu_compute()->profile();
+    if (learning.cpu.device_name.empty())
+        throw std::runtime_error("CPU identity unavailable; cannot persist training");
+    learning.store = std::make_unique<ModelStore>(workspace / ".same" / "model.db");
+    if (!learning.store->diagnostic().empty())
+        throw std::runtime_error("model store unavailable: " +
+                                 std::string(learning.store->diagnostic()));
+    learning.startup_ms = milliseconds(startup, Clock::now());
+    detail::ModelPriorLoader loader = [&](BackendKind backend, const DeviceProfile& device) {
+        ++learning.loads;
+        const auto prior =
+            learning.store->load(learning_key(training, learning.cpu, backend, device));
+        if (!prior)
+            return detail::OnlineModel::State{};
+        detail::OnlineModel model;
+        if (!model.initialize(*prior, learning_decay))
+            throw std::runtime_error("stored training prior is invalid");
+        ++learning.hits;
+        return model.prior();
+    };
+    detail::SetupPriorLoader setup_loader = [&](BackendKind backend, const DeviceProfile& device) {
+        ++learning.setup_loads;
+        const auto history =
+            learning.store->load_setup(learning_key(training, learning.cpu, backend, device));
+        if (history)
+            ++learning.setup_hits;
+        return history ? history->max_ms : 0.0;
+    };
+    return std::make_unique<Resources>(training, std::move(loader), std::move(setup_loader));
+}
+
+/// 终态快照保存失败时也能解释已经做了多少工作。
+/// Final state explains partial work even if training fails before persistence.
+struct TrainFacts {
+    std::uint64_t discovered{}, selected{}, useful{}, verified{}, bytes{}, read_bytes{};
+    std::array<std::uint64_t, 3> submitted{};
+    detail::OnlineModel::Snapshot snapshot;
+    double cuda_setup_ms_sum{}, igpu_discovery_ms{}, igpu_setup_ms{};
+};
+
+/// 与扫描报告共用可读单位、分区和标准错误输出；样本数不是性能提升率。
+/// Share scan's units, sections and stderr convention; sample counts are not speedups.
+void render_train_summary(const TrainFacts& facts, const Learning& learning,
+                          const TrainTrace& trace, double elapsed, std::ostream& out,
+                          TrainReportOptions options) {
+    if (!options.summary)
+        return;
+    const auto& model = facts.snapshot;
+    if (options.pretty) {
+        PrettyReport report(out, options.color);
+        report.heading("Training summary");
+        report.section("Results");
+        report.row("Corpora", std::to_string(trace.corpora_count) + " directories",
+                   ReportTone::info);
+        report.row("Files",
+                   std::to_string(facts.selected) + " selected | " +
+                       std::to_string(facts.verified) + " verified | " +
+                       std::to_string(facts.discovered) + " discovered",
+                   ReportTone::good);
+        report.row("GPU-eligible", std::to_string(facts.useful) + " selected files",
+                   facts.useful < 4 ? ReportTone::warning : ReportTone::good);
+        report.row("Samples",
+                   std::to_string(model.cpu_samples) + " CPU | " +
+                       std::to_string(model.gpu_samples) + " CUDA | " +
+                       std::to_string(model.igpu_samples) + " iGPU",
+                   ReportTone::accent);
+        report.section("Storage and I/O");
+        report.row("Corpus data", human_bytes(static_cast<double>(facts.bytes)) + " logical",
+                   ReportTone::info);
+        report.row("Read",
+                   human_bytes(static_cast<double>(facts.read_bytes)) +
+                       " logical across all backends (not physical disk I/O)",
+                   ReportTone::info);
+        report.section("Performance");
+        report.row("Elapsed", human_duration(elapsed) + " (excludes telemetry drain)",
+                   ReportTone::good);
+        constexpr std::array<const char*, 5> labels{"Select", "Initialize", "Measure", "Persist",
+                                                    "Output"};
+        for (unsigned slot = 0; slot < labels.size(); ++slot)
+            report.row(labels[slot], human_duration(trace.stage_ms[slot]), ReportTone::info);
+        report.row("CUDA setup", human_duration(facts.cuda_setup_ms_sum) + " (summed workers)",
+                   ReportTone::info);
+        report.row("iGPU startup",
+                   "discover " + human_duration(facts.igpu_discovery_ms) + " | activate " +
+                       human_duration(facts.igpu_setup_ms),
+                   ReportTone::info);
+        report.section("Online routing model");
+        report.row("Prediction checks",
+                   std::to_string(model.predicted_samples) + " | absolute error sum " +
+                       human_duration(model.absolute_error_sum_ms),
+                   ReportTone::accent);
+        report.row("Out of domain", std::to_string(model.out_of_domain_samples),
+                   model.out_of_domain_samples ? ReportTone::warning : ReportTone::muted);
+        report.row("Evidence", "calibration only; not held-out scan speedup validation",
+                   ReportTone::muted);
+        report.row("Use", "subsequent auto scans in this workspace load the same model",
+                   ReportTone::good);
+        render_learning(learning, true, out, true, options.color);
+        return;
+    }
+    out << "train_corpora=" << trace.corpora_count << " train_discovered_files=" << facts.discovered
+        << " train_selected_files=" << facts.selected << " train_verified_files=" << facts.verified
+        << " train_gpu_eligible_files=" << facts.useful << " train_logical_bytes=" << facts.bytes
+        << " train_read_bytes=" << facts.read_bytes << " train_cpu_samples=" << model.cpu_samples
+        << " train_cuda_samples=" << model.gpu_samples
+        << " train_igpu_samples=" << model.igpu_samples
+        << " train_predicted_samples=" << model.predicted_samples
+        << " train_out_of_domain_samples=" << model.out_of_domain_samples
+        << " train_absolute_error_sum_ms=" << model.absolute_error_sum_ms
+        << " train_elapsed_ms=" << elapsed;
+    constexpr std::array<const char*, 5> phases{"select", "initialize", "measure", "persist",
+                                                "output"};
+    for (unsigned slot = 0; slot < phases.size(); ++slot)
+        out << " train_" << phases[slot] << "_ms=" << trace.stage_ms[slot];
+    out << " train_cuda_setup_ms_sum=" << facts.cuda_setup_ms_sum
+        << " train_igpu_discovery_ms=" << facts.igpu_discovery_ms
+        << " train_igpu_setup_ms=" << facts.igpu_setup_ms << '\n';
+    render_learning(learning, true, out, false, false);
+}
+
+/// 完整终态指标与状态独立于可丢弃的逐任务事件；排空耗时只在结束后报告。
+/// Complete final metrics do not depend on queued attempts; drain time is reported afterward.
+void finish_train_trace(TrainTrace& trace, const TrainFacts& facts, const Learning& learning,
+                        Clock::time_point completed, bool failed, std::string_view error,
+                        std::ostream& diagnostics, TrainReportOptions options) {
+    if (!trace.writer) {
+        if (options.summary)
+            render_telemetry(nullptr, {}, milliseconds(trace.start, Clock::now()), diagnostics,
+                             options.pretty, options.color);
+        return;
+    }
+    try {
+        trace.final.status = failed ? "failed" : "completed";
+        trace.final.error = error;
+        auto metric = [&](std::string name, double value, std::string unit = "count") {
+            trace.final.metrics.push_back({std::move(name), value, std::move(unit)});
+        };
+        metric("train.discovered_files", static_cast<double>(facts.discovered));
+        metric("train.selected_files", static_cast<double>(facts.selected));
+        metric("train.eligible_files", static_cast<double>(facts.useful));
+        metric("train.verified_files", static_cast<double>(facts.verified));
+        metric("train.logical_bytes", static_cast<double>(facts.bytes), "bytes");
+        metric("train.read_bytes", static_cast<double>(facts.read_bytes), "bytes");
+        metric("train.submitted_cpu", static_cast<double>(facts.submitted[0]));
+        metric("train.submitted_cuda", static_cast<double>(facts.submitted[1]));
+        metric("train.submitted_igpu", static_cast<double>(facts.submitted[2]));
+        metric("train.cpu_samples", static_cast<double>(facts.snapshot.cpu_samples));
+        metric("train.cuda_samples", static_cast<double>(facts.snapshot.gpu_samples));
+        metric("train.igpu_samples", static_cast<double>(facts.snapshot.igpu_samples));
+        metric("train.predicted_samples", static_cast<double>(facts.snapshot.predicted_samples));
+        metric("train.absolute_error_sum_ms", facts.snapshot.absolute_error_sum_ms, "ms");
+        metric("train.out_of_domain_samples",
+               static_cast<double>(facts.snapshot.out_of_domain_samples));
+        metric("train.cuda_setup_ms_sum", facts.cuda_setup_ms_sum, "ms");
+        metric("train.igpu_discovery_ms", facts.igpu_discovery_ms, "ms");
+        metric("train.igpu_setup_ms", facts.igpu_setup_ms, "ms");
+        metric("train.model_load_attempts", static_cast<double>(learning.loads.load()));
+        metric("train.model_prior_hits", static_cast<double>(learning.hits.load()));
+        metric("train.model_saved_keys", static_cast<double>(learning.saved));
+        metric("train.model_save_errors", static_cast<double>(learning.save_errors));
+        constexpr std::array<const char*, 5> stages{"select", "initialize", "measure", "persist",
+                                                    "output"};
+        for (unsigned slot = 0; slot < stages.size(); ++slot)
+            metric("train." + std::string(stages[slot]) + "_ms", trace.stage_ms[slot], "ms");
+        metric("train.elapsed_ms", milliseconds(trace.start, completed), "ms");
+        trace.final.parameters.push_back(
+            {"train", "selection", "factor-four-band/deterministic-path-rank"});
+        trace.final.parameters.push_back(
+            {"train", "span_id_scheme", "1000000+file_index*3+backend_index"});
+        trace.final.parameters.push_back(
+            {"model", "feature_version", std::to_string(detail::OnlineModel::feature_version)});
+        trace.final.parameters.push_back({"model", "run_decay", std::to_string(learning_decay)});
+        telemetry::Event run;
+        run.type = "span";
+        run.name = "train.run";
+        run.severity = failed ? "error" : "info";
+        run.span_id = 1;
+        run.duration_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(completed - trace.start).count());
+        run.value = failed ? 0 : 1;
+        trace.final.events.push_back(run);
+        telemetry::Event log;
+        log.type = "log";
+        log.name = failed ? "train.failed" : "train.completed";
+        log.severity = failed ? "error" : "info";
+        log.message = error;
+        log.span_id = 1;
+        log.time_ns = run.duration_ns;
+        log.value = failed ? 0 : 1;
+        trace.final.events.push_back(log);
+    } catch (...) {
+        trace.incomplete = true;
+    }
+    const auto stats = trace.writer->finish(std::move(trace.final));
+    if (options.summary)
+        render_telemetry(trace.writer.get(), stats, milliseconds(trace.start, Clock::now()),
+                         diagnostics, options.pretty, options.color);
+    if (stats.errors)
+        diagnostics << "Telemetry warning: " << stats.error.c_str() << '\n';
+}
+} // namespace
+
+int train(const fs::path& workspace, const fs::path& corpus, const Config& config,
+          std::ostream& output, std::ostream& diagnostics, std::size_t max_files,
+          std::uint64_t max_bytes) {
+    return train(workspace, corpus, config, output, diagnostics, max_files, max_bytes, {});
+}
+
+int train(const fs::path& workspace, const fs::path& corpus, const Config& config,
+          std::ostream& output, std::ostream& diagnostics, std::size_t max_files,
+          std::uint64_t max_bytes, TrainReportOptions options) {
+    return train(workspace, std::vector<fs::path>{corpus}, config, output, diagnostics, max_files,
+                 max_bytes, options);
+}
+
+int train(const fs::path& workspace, const std::vector<fs::path>& corpora, const Config& config,
+          std::ostream& output, std::ostream& diagnostics, std::size_t max_files,
+          std::uint64_t max_bytes, TrainReportOptions options) {
+    // 保留公共签名供既有调用者链接；训练无结果记录，只有显式 summary 才展示统计。
+    // Preserve the public signature; train has no result records, only opt-in summary metrics.
+    static_cast<void>(output);
+    Config training = config;
+    training.backend = "auto";
+    training.pgo = true;
+    training.validate();
+    if (!max_files || max_files > 4096 || !max_bytes)
+        throw std::invalid_argument("train limits require 1..4096 files and positive bytes");
+    const auto roots = training_roots(workspace, corpora);
+    WorkspaceLock workspace_lock(workspace);
+    prepare_state(workspace);
+    RunLock lock(workspace / ".same" / "run.lock");
+    TrainTrace trace(workspace, roots, training, max_files, max_bytes, diagnostics);
+    std::vector<TrainFile> files;
+    Learning learning;
+    std::unique_ptr<Resources> resources;
+    std::uint64_t discovered = 0, useful = 0, verified = 0;
+    std::uint64_t bytes = 0;
+    std::array<std::uint64_t, 3> submitted{};
+    std::exception_ptr failure;
+    std::string failure_text;
+    try {
+        {
+            TrainStage stage{trace, 0};
+            files = training_files(roots, training, max_files, max_bytes, discovered);
+            if (files.empty())
+                throw std::runtime_error("training corpus has no nonempty eligible regular files");
+            useful = static_cast<std::uint64_t>(
+                std::count_if(files.begin(), files.end(), [&](const TrainFile& file) {
+                    return file.stamp.size >= training.gpu_min_bytes;
+                }));
+            if (!useful)
+                throw std::runtime_error("training corpus has no file at or above gpu_min_bytes");
+            stage.complete = true;
+        }
+        {
+            TrainStage stage{trace, 1};
+            resources = open_training_resources(workspace, training, learning);
+            stage.complete = true;
+        }
+        {
+            TrainStage stage{trace, 2};
+            for (std::size_t index = 0; index < files.size(); ++index) {
+                const auto& file = files[index];
+                train_one_file(*resources, trace, file, index, submitted);
+                ++verified;
+                bytes += file.stamp.size;
+            }
+            resources->wait_idle();
+            const auto snapshot = resources->profile_snapshot();
+            if (snapshot.cpu_samples != files.size() || snapshot.gpu_samples != files.size() ||
+                snapshot.igpu_samples != files.size())
+                throw std::runtime_error(
+                    "training did not produce one valid sample per backend/file");
+            stage.complete = true;
+        }
+        {
+            TrainStage stage{trace, 3};
+            save_learning(learning, training, *resources);
+            if (learning.save_errors || learning.saved < 3)
+                throw std::runtime_error("training model save failed: " + learning.diagnostic);
+            stage.complete = true;
+        }
+    } catch (...) {
+        failure = std::current_exception();
+        try {
+            std::rethrow_exception(failure);
+        } catch (const std::exception& error) {
+            failure_text = error.what();
+        } catch (...) {
+            failure_text = "non-standard training exception";
+        }
+    }
+    if (resources)
+        resources->wait_idle();
+    const auto snapshot =
+        resources ? resources->profile_snapshot() : detail::OnlineModel::Snapshot{};
+    double cuda_setup_ms_sum = 0;
+    if (resources)
+        for (const auto& worker : resources->worker_profiles())
+            cuda_setup_ms_sum += worker.setup_ms;
+    const auto igpu_discovery_ms = resources ? resources->igpu_discovery_ms() : 0.0;
+    const auto igpu_setup_ms = resources ? resources->igpu_setup_ms() : 0.0;
+    const auto read_bytes = resources ? resources->read_bytes().first : 0;
+    resources.reset();
+    if (!failure) {
+        try {
+            TrainStage stage{trace, 4};
+            if (useful < 4 || files.size() < 4)
+                diagnostics << "Training warning: fewer than four GPU-eligible files; "
+                               "prediction coverage may be weak.\n";
+            stage.complete = true;
+        } catch (...) {
+            failure = std::current_exception();
+            try {
+                std::rethrow_exception(failure);
+            } catch (const std::exception& error) {
+                failure_text = error.what();
+            } catch (...) {
+                failure_text = "non-standard training diagnostic exception";
+            }
+        }
+    }
+    const auto completed = Clock::now();
+    TrainFacts facts;
+    facts.discovered = discovered;
+    facts.selected = files.size();
+    facts.useful = useful;
+    facts.verified = verified;
+    facts.bytes = bytes;
+    facts.read_bytes = read_bytes;
+    facts.submitted = submitted;
+    facts.snapshot = snapshot;
+    facts.cuda_setup_ms_sum = cuda_setup_ms_sum;
+    facts.igpu_discovery_ms = igpu_discovery_ms;
+    facts.igpu_setup_ms = igpu_setup_ms;
+    if (!failure)
+        render_train_summary(facts, learning, trace, milliseconds(trace.start, completed),
+                             diagnostics, options);
+    finish_train_trace(trace, facts, learning, completed, bool(failure), failure_text, diagnostics,
+                       options);
+    if (trace.incomplete)
+        diagnostics << "Telemetry warning: training final metadata is incomplete.\n";
     if (failure)
         std::rethrow_exception(failure);
     return 0;

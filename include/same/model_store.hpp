@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace same {
 /// 设备初始化历史独立于稳定服务时间。 / Device setup history is separate from steady service time.
@@ -14,6 +15,20 @@ struct SetupHistory {
     double last_ms{}, mean_ms{}, max_ms{};
     /// 有效初始化观测次数。 / Number of valid setup observations.
     std::uint64_t samples{};
+};
+/// 可替换的来源贡献；revision 单调增长，attenuation 是目标内运行衰减。
+/// Replaceable source contribution; revision is monotonic and attenuation is local run decay.
+struct ModelContribution {
+    std::string source, key;
+    std::uint64_t revision{};
+    double attenuation{1};
+    detail::OnlineModel::State state;
+};
+/// 初始化历史的可替换来源贡献。 / Replaceable source setup contribution.
+struct SetupContribution {
+    std::string source, key;
+    std::uint64_t revision{};
+    SetupHistory history;
 };
 /// 独立的冷路径学习状态库；调用方持有工作区运行锁。
 /// Independent cold-path learning store; caller holds the workspace run lock.
@@ -36,10 +51,22 @@ public:
     /// 原子替换，失败保留旧状态；仅在所有工作线程停止后使用。
     /// Atomic replacement preserves old state on failure. Use after workers stop.
     bool save(std::string_view key, const detail::OnlineModel::State& state);
+    /// 本轮只保存新观测；对已有各来源贡献分别应用运行衰减后重建聚合。
+    /// Apply run decay to each source, add local observations, then rematerialize the aggregate.
+    bool save_delta(std::string_view key, const detail::OnlineModel::State& delta, double decay);
+    /// 取出当前来源账本，用于跨工作区幂等合并。 / Export provenance for idempotent merge.
+    std::vector<ModelContribution> contributions() const;
+    /// 较新 revision 替换来源，重复或较旧快照不重复计算。 / Replace only newer revisions.
+    bool merge_contribution(const ModelContribution& contribution);
     /// 不可变初始化历史快照，允许并发读取。 / Immutable setup snapshot supports concurrent reads.
     std::optional<SetupHistory> load_setup(std::string_view key) const;
     /// 空闲阶段原子写入初始化历史。 / Atomically save setup history while idle.
     bool save_setup(std::string_view key, const SetupHistory& history);
+    /// 合并本轮实际初始化观测。 / Merge this run's actual setup observations.
+    bool save_setup_delta(std::string_view key, const SetupHistory& delta);
+    /// 导出并替换初始化历史贡献。 / Export and replace setup provenance.
+    std::vector<SetupContribution> setup_contributions() const;
+    bool merge_setup_contribution(const SetupContribution& contribution);
     /// 构造或保存操作的结果；成功为空，load 不改变诊断。
     /// Constructor/save status; empty on success, never mutated by load.
     std::string_view diagnostic() const noexcept;
