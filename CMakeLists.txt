@@ -125,6 +125,7 @@ if(BUILD_TESTING)
   # 跨进程学习与故障隔离。 / Cross-process learning and failure isolation.
   add_executable(learning_integration_tests tests/learning_integration_tests.cpp)
   target_link_libraries(learning_integration_tests PRIVATE same_core)
+  target_compile_definitions(learning_integration_tests PRIVATE SAME_TEST_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
   if(WIN32)
     target_link_libraries(learning_integration_tests PRIVATE shell32)
   endif()

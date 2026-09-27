@@ -184,6 +184,24 @@ std::string stored_key(const fs::path& path) {
     sqlite3_close(db);
     return key;
 }
+/// 测试升级场景时仅移除当前身份，保留旧版来源贡献。
+/// Remove only the current identity while retaining the legacy contribution for upgrade tests.
+void remove_key(const fs::path& path, std::string_view key) {
+    sqlite3* db{};
+    check(sqlite3_open(utf8(path).c_str(), &db) == SQLITE_OK, "open model for identity test");
+    for (const auto* table : {"models", "model_parts"}) {
+        const auto sql = std::string("DELETE FROM ") + table + " WHERE key=?1";
+        sqlite3_stmt* statement{};
+        check(sqlite3_prepare_v2(db, sql.c_str(), -1, &statement, nullptr) == SQLITE_OK,
+              "prepare identity removal");
+        check(sqlite3_bind_blob(statement, 1, key.data(), static_cast<int>(key.size()),
+                                SQLITE_TRANSIENT) == SQLITE_OK &&
+                  sqlite3_step(statement) == SQLITE_DONE,
+              "remove current identity");
+        sqlite3_finalize(statement);
+    }
+    sqlite3_close(db);
+}
 /// 汇总中的明确计数，不解析展示顺序。 / Extract an explicit summary count independent of ordering.
 std::uint64_t metric(const std::string& text, const std::string& name) {
     std::smatch match;
@@ -197,7 +215,7 @@ int main(int argc, char** argv) {
     try {
         check(argc == 2, "expected CLI executable");
         const auto exe = executable_path(argv[1]);
-        base = fs::canonical(fs::temp_directory_path()) /
+        base = fs::canonical(fs::path(SAME_TEST_ROOT)) / ".temp" /
                ("same-learning-" +
                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         const auto root = base / "root";
@@ -263,6 +281,34 @@ int main(int argc, char** argv) {
             check(std::abs(second[0].weight - (0.9 * first[0].weight + 16)) < 1e-8,
                   "decayed prior not merged exactly once");
         }
+        // v0.6.0 的旧特征标签不能被新的实际重叠语义复用，但数据库须保持可写。
+        // Old selection-time labels must not load as observed-overlap priors; DB remains writable.
+        const auto current_prefix = std::string("same-learning-key-v2");
+        const auto prefix_at = key.find(current_prefix);
+        check(prefix_at != std::string::npos, "new model identity namespace missing");
+        auto legacy_key = key;
+        legacy_key.replace(prefix_at, current_prefix.size(), "same-learning-key-v1");
+        same::detail::OnlineModel::State legacy{};
+        {
+            same::ModelStore store(database);
+            legacy = *store.load(key);
+            check(store.save(legacy_key, legacy), "cannot seed legacy model contribution");
+        }
+        remove_key(database, key);
+        run();
+        check(metric(read(err), "model_prior_hits") == 0 &&
+                  metric(read(err), "model_persistence_enabled") == 1 && read(out) == expected,
+              "legacy model identity leaked into new routing or disabled persistence");
+        {
+            same::ModelStore store(database);
+            check(store.load(legacy_key) &&
+                      store.load(legacy_key)->at(0).samples == legacy[0].samples &&
+                      store.load(key) && store.load(key)->at(0).samples == 16,
+                  "new training erased legacy state or failed to create isolated state");
+        }
+        run();
+        check(metric(read(err), "model_prior_hits") == 2,
+              "new identity did not resume normal cross-run reuse");
         const auto before = read(database);
         run(false);
         check(read(database) == before, "no-pgo changed model database");
