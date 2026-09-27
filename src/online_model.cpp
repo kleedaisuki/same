@@ -311,13 +311,16 @@ OnlineModel::Prediction OnlineModel::predict(BackendKind backend,
     return {ms, fit.residual, fit.samples, true, outside};
 }
 bool OnlineModel::observe(BackendKind backend, const Context& context, double ms) noexcept {
+    return observe(backend, context, ms, predict(backend, context));
+}
+bool OnlineModel::observe(BackendKind backend, const Context& context, double ms,
+                          Prediction decision_prediction) noexcept {
     const auto b = static_cast<unsigned>(backend);
     std::array<double, 4> x{};
     if (b >= 3 || !features(context, x) || !std::isfinite(ms) || ms <= 0 || ms > 1e9) {
         increment(totals_.rejected_samples);
         return false;
     }
-    const auto before = predict(backend, context);
     Statistics s{};
     s.weight = 1;
     s.samples = 1;
@@ -344,14 +347,14 @@ bool OnlineModel::observe(BackendKind backend, const Context& context, double ms
         return false;
     }
     delta_[b] = next;
-    if (before.known) {
-        const double error = std::abs(ms - before.ms);
+    if (decision_prediction.known) {
+        const double error = std::abs(ms - decision_prediction.ms);
         totals_.absolute_error_sum_ms += error;
         totals_.squared_error_sum_ms2 += error * error;
         increment(totals_.predicted_samples);
         totals_.mean_absolute_error_ms = totals_.absolute_error_sum_ms / totals_.predicted_samples;
         increment(totals_.residual_histogram[histogram_index(error)]);
-        if (before.out_of_domain)
+        if (decision_prediction.out_of_domain)
             increment(totals_.out_of_domain_samples);
     }
     increment(totals_.samples);

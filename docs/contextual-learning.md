@@ -8,15 +8,15 @@ This is an implementation contract, not a speedup or platform-validation claim.
 每个内容工作线程独占在线模型（online model），分别预测 CPU、CUDA dGPU 和 OpenCL iGPU 的成功哈希服务时间。预测目标是任务服务耗时，不是单独的内核时间、物理磁盘带宽或整个扫描的完成时间。读取、哈希和设备争用相互影响；本模型不宣称因果识别。
 Each worker owns independent backend models for successful hash service time, not kernel time or whole-scan makespan. Storage caching and shared-resource pressure remain potential confounders.
 
-输入 payload 字节数为 B，有效更新批量为 L，提交时观测的竞争任务数为 C。四维特征（feature vector）是：
+输入 payload 字节数为 B，有效更新批量为 L，竞争任务数代理为 C。决策预测使用选择时在途数；完成后的拟合另外记录真实开始时在途数及任务期间是否有后续重叠，至少不会把两条同时开始的大任务都错标为零争用。它仍不测量重叠持续比例或物理内存带宽。四维特征（feature vector）是：
 
 ```text
 x = [1, B / 2^20, ceil(B/L) / 1024, (B / 2^20) * C / 1024]
 predicted_ms = xᵀ β_backend
 ```
 
-四项分别表示固定成本、字节成本、批量提交成本和与 payload 交互的竞争成本。CPU/iGPU 的 C 包括共享主机资源的在途任务；CUDA 使用同后端任务数。C 是轻量代理而非带宽测量。设备的名称、厂商、驱动、实现版本、架构、计算单元、硬件线程、内存约束、统一内存属性和实际批量参与设备身份键；它们**不是全部作为回归变量输入**。因此这是本机按设备拟合，不是跨任意 GPU 的零样本性能预测。
-The four terms represent fixed, byte, batch and payload–contention costs. Device characteristics namespace learned state; the implementation does not regress every hardware field or promise zero-shot transfer across devices.
+四项分别表示固定成本、字节成本、批量提交成本和与 payload 交互的竞争成本。CPU/iGPU 的 C 包括共享主机资源的在途任务；CUDA 使用同后端任务数。C 是轻量代理而非带宽测量。误差诊断始终比较**选择时冻结的预测**与结果，拟合则使用实际观测到的重叠上下文，避免把事后信息误称为决策时已知。设备的名称、厂商、驱动、实现版本、架构、计算单元、硬件线程、内存约束、统一内存属性和实际批量参与设备身份键；它们**不是全部作为回归变量输入**。因此这是本机按设备拟合，不是跨任意 GPU 的零样本性能预测。
+The four terms represent fixed, byte, batch and payload–contention costs. Decision prediction uses the selection-time context; fitting uses observed overlap, while the error diagnostic stays tied to the actual decision-time prediction. Contention is still a proxy, not a bandwidth meter or a causal estimate. Device characteristics namespace learned state; this does not promise zero-shot transfer.
 
 ## 数学模型 / Mathematical model
 
@@ -40,8 +40,8 @@ Fit RMS is distinct from pre-update prediction errors. Neither supplies a calibr
 自动模式先检查大小资格、预算和设备可用性，再比较三个候选的预测；CPU 偏好和残差余量是工程启发式。未知或训练域外输入触发有限初始探索，并有周期性确定性探索。该策略不是 LinUCB 或 Thompson sampling，没有遗憾界（regret bound）、无偏反事实估计或全局最优保证。被选择后端才产生标签，存在选择偏差；周期探索不能自动消除缓存、顺序与设备负载混杂。
 Routing uses bounded initial and periodic deterministic exploration, not a statistically calibrated bandit algorithm. Only selected devices generate outcomes, so selection bias remains.
 
-核显只有一个池内计算实例：占用时不等待，当前任务可回退 CPU；CUDA 使用工作线程自己的流。`--cpu`、`--cuda`、`--igpu` 覆盖配置，但加速器仍受大小门槛、预算和可用性约束。可恢复计算错误重试 CPU，内容正确性检查不一致仍失败。精确重复判断始终包含逐字节比较。
-The iGPU is admitted without waiting; forced accelerator modes remain subject to eligibility and safe fallback. Correctness failures are not hidden as performance fallback.
+每个内容工作线程独占 CPU、CUDA 流和核显 OpenCL 队列/内核/设备缓冲，并在自己的模型里比较三个候选。核显复用该线程已有的 CPU 文件读取缓冲；编译程序共享，完整文件任务不再持有池级核显互斥。所有核显实例共同受一个池预算约束，分配额按工作线程数预留；资源不足时不能假装设备可用。初次发现/冷启动仍可使自动模式的其他任务暂走 CPU，但不是稳态单任务限流。`--cpu`、`--cuda`、`--igpu` 覆盖配置，但加速器仍受大小门槛、预算和可用性约束。可恢复计算错误只退休所属线程的设备并完整重试 CPU；内容正确性检查不一致仍失败。精确重复判断始终包含逐字节比较。
+Every content worker owns CPU, a CUDA stream, and a private iGPU OpenCL queue/kernel/device buffers. iGPU reuses owner CPU file-I/O buffers while sharing only the compiled program; there is no pool-wide iGPU task lock. Aggregate host/device budgets reserve capacity across all owners. Cold discovery can still make automatic tasks temporarily use CPU, but does not serialize steady-state iGPU file work. Recoverable compute errors retire only the failing owner's backend and retry the complete file on CPU; correctness mismatches still fail.
 
 ## 跨运行状态 / Cross-run state
 

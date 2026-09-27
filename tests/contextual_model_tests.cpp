@@ -72,9 +72,23 @@ void collinear() {
     check(p.known && std::abs(p.ms - 2) < 1e-5);
     check(m.predict(same::BackendKind::cpu, {2097152, 1048576, 0}).out_of_domain);
 }
+/// 预测误差属于决策时的上下文；拟合样本属于实际观测到的争用。
+/// Error belongs to the decision-time prediction while fitting uses observed contention.
+void observed_contention() {
+    using Model = same::detail::OnlineModel;
+    Model model;
+    const Model::Context actual{64ULL << 20, 1ULL << 20, 2};
+    const Model::Prediction selected{2, 0, 1, true, false};
+    check(model.observe(same::BackendKind::igpu, actual, 10, selected));
+    const auto stats = model.snapshot();
+    check(stats.igpu_samples == 1 && stats.predicted_samples == 1 &&
+          std::abs(stats.absolute_error_sum_ms - 8) < 1e-9);
+    check(model.delta()[2].minimum[3] > 0 && model.delta()[2].maximum[3] > 0);
+}
 } // namespace
 int main() {
     regression();
     collinear();
+    observed_contention();
     std::cout << "contextual model tests passed\n";
 }
