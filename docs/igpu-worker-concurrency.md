@@ -75,6 +75,12 @@ uses the decision-time prediction, so it does not benefit from information that
 became available only after dispatch. This remains a coarse contention proxy;
 overlap duration and DRAM traffic are not observed.
 
+The fitting-context change is not compatible with old v0.6.0 learned
+statistics even though the four algebraic features have the same shape. The
+application uses `same-learning-key-v2` for all three backends, preserving old
+database rows while preventing mixed-semantic priors. This intentionally
+introduces one cold-learning run after upgrade; later runs reuse v2 evidence.
+
 ## Local validation evidence
 
 Windows x64 MSVC 19.51 CPU-only Debug CTest passed 27/27 after the

@@ -18,6 +18,8 @@ predicted_ms = xᵀ β_backend
 四项分别表示固定成本、字节成本、批量提交成本和与 payload 交互的竞争成本。CPU/iGPU 的 C 包括共享主机资源的在途任务；CUDA 使用同后端任务数。C 是轻量代理而非带宽测量。误差诊断始终比较**选择时冻结的预测**与结果，拟合则使用实际观测到的重叠上下文，避免把事后信息误称为决策时已知。设备的名称、厂商、驱动、实现版本、架构、计算单元、硬件线程、内存约束、统一内存属性和实际批量参与设备身份键；它们**不是全部作为回归变量输入**。因此这是本机按设备拟合，不是跨任意 GPU 的零样本性能预测。
 The four terms represent fixed, byte, batch and payload–contention costs. Decision prediction uses the selection-time context; fitting uses observed overlap, while the error diagnostic stays tied to the actual decision-time prediction. Contention is still a proxy, not a bandwidth meter or a causal estimate. Device characteristics namespace learned state; this does not promise zero-shot transfer.
 
+旧版本把选择时的在途数用于拟合，新版本则使用任务期间观测到的重叠；虽然四维公式未变，样本特征的**语义**已经变化。新模型身份为 `same-learning-key-v2`，不会把 v0.6.0 的 `v1` 统计与新标签混用。旧数据库与来源账本保留，不清空用户状态；第一次新版本运行需要重新积累或执行 `train`，后续相同工作区、设备与配置仍会正常加载 v2 先验。summary 的 `Model identity` 行可用于识别这一有意的冷启动。/ The feature formula is unchanged but its contention-label semantics changed. `same-learning-key-v2` isolates new observations from v0.6.0 v1 state without deleting old rows. The first new run must relearn or retrain; subsequent matching runs load v2 priors.
+
 ## 数学模型 / Mathematical model
 
 每后端维护可加充分统计量（sufficient statistics）：S=Σxxᵀ、t=Σxy、q=Σy² 和权重 W，以及特征范围。固定 4×4 数组，无逐样本历史分配。前四个本轮样本每次拟合，之后每 16 个样本重拟合，预测使用缓存系数。求解采用对角尺度归一化的岭回归（ridge regression）：

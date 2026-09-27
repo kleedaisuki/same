@@ -191,6 +191,9 @@ void prepare_state(const fs::path& root) {
 }
 /// 运行边界遗忘，不随工作线程数变化。 / Run-boundary forgetting, independent of worker count.
 constexpr double learning_decay = 0.9;
+/// 新标签使用实际重叠上下文，必须与旧的选择时标签分开存放。
+/// Observed-overlap labels must not mix with prior selection-time labels.
+constexpr std::string_view learning_identity = "same-learning-key-v2";
 /// 长度前缀消除字段拼接歧义，超长身份拒绝学习而不截断碰撞。
 /// Length prefixes avoid ambiguous identities; reject oversize keys rather than truncate.
 std::string learning_key(const Config& config, const DeviceProfile& cpu, BackendKind backend,
@@ -216,7 +219,7 @@ std::string learning_key(const Config& config, const DeviceProfile& cpu, Backend
         number(value.effective_batch_bytes);
         number(value.unified_memory);
     };
-    add("same-learning-key-v1");
+    add(learning_identity);
     number(detail::OnlineModel::feature_version);
     number(detail::OnlineModel::feature_count);
     add(backend_name(backend));
@@ -413,6 +416,8 @@ void render_learning(const Learning& learning, bool enabled, std::ostream& out, 
         report.row("Persistence", learning.store ? "enabled" : "disabled",
                    learning.store ? ReportTone::good : ReportTone::warning);
         report.row("Model database", ".same/model.db", ReportTone::info);
+        report.row("Model identity", std::string(learning_identity) + " | observed overlap",
+                   ReportTone::info);
         report.row("Disabled reason",
                    learning.disabled_reason.empty() ? "none" : learning.disabled_reason,
                    learning.disabled_reason.empty() ? ReportTone::muted : ReportTone::warning);
@@ -442,6 +447,7 @@ void render_learning(const Learning& learning, bool enabled, std::ostream& out, 
         << " model_persistence_disabled_reason="
         << (learning.disabled_reason.empty() ? "none" : learning.disabled_reason)
         << " model_db=.same/model.db"
+        << " model_identity=" << learning_identity
         << " model_load_attempts=" << learning.loads.load()
         << " model_prior_hits=" << learning.hits.load()
         << " model_invalid=" << learning.invalid.load() << " model_saved_keys=" << learning.saved
