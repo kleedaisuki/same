@@ -48,8 +48,10 @@ The iGPU is admitted without waiting; forced accelerator modes remain subject to
 `.same/model.db` 独立于摘要缓存 `state.db` 和遥测日志 `telemetry.db`。设备按需初始化后，才按真实设备特征加载匹配的不可变启动快照；身份键还包含特征版本和工作线程数。驱动、实现或相关参数变化导致独立状态，而不是静默混用。
 The model database is independent of digest and telemetry databases. Lazy device initialization resolves the exact identity before loading priors.
 
-启动先验在运行边界乘以 0.9；每个工作线程单独累加本轮增量。成功扫描收尾按身份键**只合并一次先验**，再加各线程增量，避免工作线程数倍增历史证据。衰减针对统计权重，不意味着原始样本计数按比例减少，也不是按墙钟时间遗忘。存储故障形成诊断，不改变哈希与分组正确性。
-At run boundaries, prior statistical weight decays by 0.9. Finalization merges one prior per key plus worker deltas, rather than multiplying history by worker count. Raw counts are not effective decayed weight.
+启动先验在运行边界乘以 0.9；每个工作线程单独累加本轮增量。成功扫描收尾只汇总各线程的本轮增量；模型库存储各来源的贡献，将衰减应用到被本轮触及的每份贡献，再把本地增量写入当前工作区贡献，重新物化总量。这既避免把先验按线程数重复计入，也允许再次合并已继续训练的来源时按版本替换，而非重复累加。衰减针对统计权重，不意味着原始样本计数按比例减少，也不是按墙钟时间遗忘。存储故障形成诊断，不改变哈希与分组正确性。
+At run boundaries, touched provenance contributions decay by 0.9. Finalization combines only current worker deltas, updates the local contribution, and rematerializes the aggregate. This avoids multiplying a prior by worker count and permits revision-based replacement on remerge. Raw counts are not effective decayed weight.
+
+当前实现只保存本轮有新观测的设备键。因此某设备本轮没有新样本时，数据库中的旧统计量不会被改写；下轮加载时仍只对同一份旧值乘一次 0.9。这里的“每轮衰减”不应理解为无观测运行也会逐轮累计老化，这可能让长期未使用设备的先验保持陈旧。 / The current implementation saves only keys with new observations in this run. A backend with no new sample keeps its stored statistics unchanged; the next load applies one 0.9 factor to the same stored value, not cumulative aging across unobserved runs. This is a stale-prior limitation, not elapsed-time forgetting.
 
 | 开关 / Switch | 学习与 model.db / Learning | telemetry.db |
 |---|---|---|
@@ -80,8 +82,8 @@ Prioritize controlled interleaved comparisons and ablations over utilization alo
 
 ## 冷启动准入 / Cold-start admission
 
-设备探测（probe）与激活（activation）分离：探测建立设备身份与能力，激活才创建执行资源、编译内核并检查正确性。探测本身仍可能调用驱动、产生耗时，不能称为免费。初始化历史独立于稳态服务模型，保存在模型库 schema 2；不能把初始化时间作为每个 payload 的哈希服务标签。
-Probing identifies capabilities; activation creates executable resources and checks correctness. Probe costs are not necessarily zero. Schema 2 stores setup history separately from steady-state service statistics.
+设备探测（probe）与激活（activation）分离：探测建立设备身份与能力，激活才创建执行资源、编译内核并检查正确性。探测本身仍可能调用驱动、产生耗时，不能称为免费。初始化历史独立于稳态服务模型，保存在模型库当前 schema 4；不能把初始化时间作为每个 payload 的哈希服务标签。
+Probing identifies capabilities; activation creates executable resources and checks correctness. Probe costs are not necessarily zero. Current schema 4 stores setup history separately from steady-state service statistics and includes a provenance ledger.
 
 自动且启用 PGO 时，只有临时决策实际请求某设备，才执行其冷启动预检（preflight）。共享非阻塞门槛要求：当前 CPU 任务的已知保守成本至少覆盖 bootstrap 估计，或本轮探索信用覆盖该估计，才允许 OpenCL ICD 探测或 CUDA 创建。竞争失败直接继续 CPU，不等待；静态 no-PGO 决策为 CPU 时不探测设备。首次未知且很短的扫描因此有意保持 CPU。`cuda_bootstrap_ms=100.0` 是 CUDA 的独立默认估计。
 Automatic PGO preflights only a provisionally requested device, before ICD discovery or CUDA creation. A shared nonblocking gate requires known CPU-task potential or funded credit; unknown short scans intentionally remain CPU. This is not guaranteed optimal under unknown cold costs.

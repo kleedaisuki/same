@@ -18,6 +18,13 @@ import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
+TEMP_ROOT = ROOT / ".temp"
+
+
+def temporary_workspace(prefix):
+    """将发布测试文件限制在仓库内。 / Keep release-test files inside the repository."""
+    TEMP_ROOT.mkdir(exist_ok=True)
+    return tempfile.TemporaryDirectory(prefix=prefix, dir=TEMP_ROOT)
 
 
 def version():
@@ -46,7 +53,7 @@ def smoke(binary, expected_version):
     """检查发布二进制的版本和精确分组；无需 GPU。 / Check packaged version and exact groups without a GPU."""
     if run([str(binary), "--version"]).strip() != "same " + expected_version:
         raise RuntimeError("binary/version mismatch")
-    with tempfile.TemporaryDirectory(prefix="same-package-smoke-") as directory:
+    with temporary_workspace("same-package-smoke-") as directory:
         root = Path(directory).resolve()
         (root / "a").write_bytes(b"same release smoke\n")
         (root / "b").write_bytes(b"same release smoke\n")
@@ -86,7 +93,7 @@ def package(args):
     name = f"same-v{version()}-{args.platform}-{args.flavor}"
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="same-package-") as directory:
+    with temporary_workspace("same-package-") as directory:
         stage = Path(directory) / name
         (stage / "bin").mkdir(parents=True)
         shutil.copy2(binary, stage / "bin" / exe)

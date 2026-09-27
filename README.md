@@ -68,6 +68,13 @@ same scan --igpu --rehash        # 请求核显，仍允许安全回退 / reques
 same scan -r --no-pgo            # 关闭运行时路由分析器 / disable runtime routing analyzer
 same scan -r --no-telemetry      # 本轮不写遥测库 / disable telemetry persistence for this run
 same scan -r --summary           # 显示汇总、数据库与性能统计 / show all statistics
+same train                       # 显式训练三后端；默认读取当前目录 / opt-in three-backend training
+same train --summary             # 展示训练结果、阶段耗时、模型与遥测 / training report
+same train ../samples ../more --summary # 多目录共用选样预算 / multiple corpora
+same train --corpus=../samples   # 兼容旧写法 / compatible corpus alias
+same train --no-telemetry        # 训练模型但不写本轮遥测库 / train without a telemetry run
+same merge ../other --summary    # 合并另一个工作区 / merge another workspace
+same merge . -r --move --summary # 合并后代工作区后移除其 .same / move descendant state
 same new                        # 生成标准配置与推荐忽略规则 / deploy defaults and ignore
 same clean                      # 删除当前 .same / remove this directory's .same
 same clean -r                   # 也删除子目录中的 .same / remove descendant states too
@@ -79,7 +86,29 @@ same --version
 
 `same` dispatches to `same scan`; implicit scan options such as `same -r --cpu` remain valid. Scans are **nonrecursive by default**; `-r` / `--recursive` enables descent. CPU overrides the backend; rehash bypasses this run's digest cache. Commands use the current directory, without a directory argument. A shallow scan prunes unseen descendant cache records from an earlier recursive scan; a later recursive scan rebuilds them rather than leaking stale results.
 
-### 初始化与清理 / Initialize and clean
+### 显式训练 / Explicit training
+
+`same train [dirs...] [--max-files=N] [--max-bytes=N] [--summary] [--no-telemetry]` 是独立的选择性训练命令。未指定目录时语料为当前工作目录；可列出多个目录，统一按大小分层并共用文件数/字节预算，重叠目录会被拒绝。旧 `--corpus=DIR` 仍可作为目录别名；始终递归读取普通文件，并遵守**语料目录**的 `.same/ignore`，不跟随链接。训练结果保存到**当前工作目录**的 `.same/model.db`；此后在**同一工作目录**运行的普通自动扫描直接加载并继续更新这个模型，而不是使用另一套训练专用模型。`--corpus` 只决定读取哪些训练文件，不改变模型归属；若训练时切换到临时目录、扫描时又切回原目录，扫描就不会看到该模型。训练不会写语料文件、正常扫描的 `state.db` 或重复文件结果。默认按文件大小区间有界选取最多 128 个文件、合计最多 2 GiB 的文件输入；上限可用参数调大，文件数至多 4096。零长度文件不训练；若选中语料没有达到 `gpu_min_bytes` 的文件，命令会拒绝启动设备。语料应有多个代表性的大小和真实 I/O 特性。
+
+每个选中文件在自动模式的**相同缓冲预算**下由 CPU、CUDA dGPU、OpenCL iGPU 各计算一次完整摘要，并逐字节比较全部 32 字节摘要。后端顺序轮换，尽量减弱固定的冷热缓存次序偏差，但不能消除操作系统缓存与共享 I/O 混杂。训练要求三个后端都真正可用；设备缺失、失败、回退、文件变化或摘要不一致都会使本轮失败，**不把 CPU 回退记为 GPU 样本，也不保存本轮训练增量**。成功后按原有设备身份键合并到模型库；下一轮普通 `auto` 扫描可以加载匹配的历史。当前训练不会证明 GPU 在该机器上更快，也不提供统计置信区间；几乎全是小文件的语料可能不能改善默认 16 MiB 以上的路由。
+
+`same train [dirs...] [--max-files=N] [--max-bytes=N] [--summary] [--no-telemetry]` explicitly trains on a bounded, size-stratified set of real files. The corpus defaults to the current directory; multiple positional directories share one global size/byte budget and overlapping roots are rejected. The old `--corpus=DIR` spelling remains an alias. Inputs are read-only, while the model remains in the current workspace. CPU, CUDA and iGPU must each finish every selected file with matching complete digests. Unavailable devices, fallback, changing inputs and mismatches fail without publishing run deltas. No scan cache or duplicate output is modified. Default limits are 128 files and 2 GiB of logical inputs, with a 4096-file maximum. Training samples include real file I/O and contention; rotating backend submission order reduces but cannot remove cache-order bias. Subsequent automatic scans reuse only matching device/configuration identities.
+
+训练默认在当前工作区的 `.same/telemetry.db` 写入 `command=train` 运行：成功与失败状态、选样/初始化/测量/保存/输出阶段、每个 CPU/CUDA/iGPU 尝试，以及完整的终态样本数、读字节、模型保存和启动耗时。终态指标不依赖可能丢弃的逐任务跨度；`--summary` 在 stderr 展示运行 ID、事件丢弃/错误与含遥测排空的总时间；未请求汇总时不打印这些统计。`--no-telemetry` 只关闭本轮遥测，**不关闭训练或模型持久化**。语料绝对路径进入运行配置，可能敏感；逐任务跨度不记录文件内容或路径。[遥测字段与查询](docs/telemetry.md) / Training writes a `command=train` run to `.same/telemetry.db` by default, including lifecycle status, five stage spans, per-backend attempts, and complete final counters. Per-attempt spans may be dropped; final metrics and loss counters remain separate. `--no-telemetry` disables only the diagnostic run, not training or model persistence. The corpus path in run configuration can be sensitive; task spans contain no file path or content.
+
+`--summary` 与扫描遵循相同约定：默认不输出完整报告；加上后在 stderr 输出 Results、Storage and I/O、Performance、Online routing model、Model persistence 与 Telemetry 分区。交互终端使用可读单位和彩色状态，重定向时默认使用机器可解析的 `key=value`；也可指定 `--format=pretty|tsv` 与 `--color=auto|always|never`。成功训练默认不输出统计或结果行，只有警告与失败仍显示。遥测的 `dropped` 指丢失逐次诊断事件，不代表训练样本未保存。 / `--summary` follows scan conventions: a sectioned, human-readable stderr report on a terminal and machine-readable key=value after redirection, with explicit format and color overrides. Successful training is quiet without `--summary`; warnings and failures remain visible. Dropped telemetry events are not dropped model samples.
+
+`--max-files` 是上限而不是保证：每个四倍大小区间最多保留 64 个候选，训练前仍需遍历整个语料的元数据。CUDA 启动耗时输出为各工作线程之和，不应直接加到进程墙钟时间上；核显发现与启动时间单独列出。 / `--max-files` is a ceiling, not a promised count: at most 64 candidates are retained per factor-four size band, and metadata for the entire corpus is still walked. CUDA setup output is a sum over workers, not additive to wall time; iGPU discovery and setup are reported separately.
+
+`--max-bytes` 限制的是**被选文件的逻辑字节总和**；三个后端各读一次，因此应用层累计读取约为该值的三倍，实际磁盘 I/O 还受系统缓存影响。训练会占用设备和 I/O，宜在空闲时对有代表性的语料运行。 / `--max-bytes` limits selected logical bytes; three backends each read them once, so application-level reads are roughly three times that limit, while physical disk I/O depends on OS caching. Use a representative corpus and run when the machine is otherwise idle.
+
+### 工作区合并 / Workspace merge
+
+`same merge [dir] [-r] [--move] [--summary]` 将源工作区的模型来源贡献、绝对路径摘要缓存和按运行 ID 去重的遥测导入当前工作区；`dir` 默认当前目录，`-r` 查找后代 `.same`（自身不合并自身）。目的工作区的 `.same/config.toml` 永不覆盖；源 `.same/ignore` 中目标尚无的规则会逐条追加：子工作区规则被限定到对应子路径；外部工作区规则没有可推断的子路径，会按目标根语义追加并显示警告。`--move` 仅在全部导入完成后，确认源 `.same` 自导入以来未改变，才删除源状态；源目录中的普通文件不删除。成功默认安静，`--summary` 在 stderr 显示来源、模型、缓存、设置与遥测计数。跨数据库不构成单个原子事务，但每个导入步骤可重试且按来源版本/运行 ID 去重；失败时不会执行 `--move`。绝对路径缓存保留外部目录知识，普通 `scan` 的重复结果仍只包含本轮扫描范围，缓存复用前必须匹配完整文件戳。模型来源再次训练后重合并会替换该来源旧贡献，不会重复累加；模型身份仍须匹配设备与配置才会用于自动路由。遥测仍受目标后续运行的保留策略影响。
+
+`merge` imports provenance-keyed model contributions, absolute-path digest cache entries, and telemetry deduplicated by run ID. The destination configuration is preserved; missing ignore rules are appended, with descendant rules scoped to their relative subtree; external rules apply at the target root with a warning. Recursive mode discovers descendant workspaces, and guarded `--move` deletes source state only after successful import and an unchanged-state check. Ordinary source files remain untouched. Cross-database import is retryable rather than one atomic transaction. External cache records remain outside the current scan result set and require an exact current file stamp before reuse. Later source updates replace prior contributions by revision; telemetry retention still follows the destination policy on future runs.
+
+## 初始化与清理 / Initialize and clean
 
 `same new` 创建 `.same/config.toml`（写全本机实际默认值）与 `.same/ignore`（推荐规则），**保留已有文件，不覆盖用户设置**。推荐规则排除版本控制元数据与操作系统目录元数据；`build/`、`node_modules/`、`.venv/` 仅以注释提供，不默认隐藏可能需要去重的内容。无需先运行 `new` 才能扫描：缺少配置时扫描使用内建默认值。
 
@@ -127,6 +156,8 @@ same --summary > matches.tsv 2> profile.log # 结果与统计分离 / separate r
 ```
 
 Summary 分区报告及下文所有性能字段均须 `--summary` 才输出；该开关不隐藏警告或错误。 / The sectioned Summary report and all statistics below require `--summary`; warnings and errors remain independent.
+
+`same --help` 也使用相同的颜色策略：交互终端用颜色区分标题、命令与选项；重定向、`NO_COLOR` 或 `--color=never` 保持纯文本。可用 `same --color=always --help` 显式输出带 ANSI 颜色的帮助。 / Help uses the same color policy: colored hierarchy on terminals, plain text when redirected or disabled, with `--color=always` as an explicit override.
 
 `--format=auto|pretty|tsv` 与 `--color=auto|always|never` 相互独立，均为命令行选项，不写入 TOML。自动颜色遵循非空 `NO_COLOR`、`TERM=dumb` 和各标准流是否连接终端；重定向默认无色并保留原 TSV。Windows 自动尝试启用虚拟终端（Virtual Terminal, VT）处理，不支持时降级无色，退出时恢复控制台模式。显式 `always` 会覆盖环境提示，即使重定向也输出 ANSI 控制码；`never` 始终无色。stdout 与 stderr 独立检测：自动模式下，重定向结果不影响终端中的 Profile，重定向统计也不会带入颜色。`--format=tsv` 始终保留原始统计字段；`--format=pretty` 显式选择可读报告与智能单位，重定向时默认仍无色。
 

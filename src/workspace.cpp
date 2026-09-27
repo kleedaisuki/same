@@ -1,6 +1,8 @@
 #include "same/workspace.hpp"
 #include "same/config.hpp"
+#include "same/files.hpp"
 #include "same/run_lock.hpp"
+#include <algorithm>
 #include <cerrno>
 #include <fstream>
 #include <memory>
@@ -222,9 +224,54 @@ void remove_child(Node& parent, const fs::path& name) {
         throw std::system_error(errno, std::generic_category(), "remove cleanup child");
 #endif
 }
+/// 先后两次扫描文件版本，内容摘要防止粗粒度时间戳漏检同尺寸更改。
+/// Hash content and check stamps twice so coarse timestamps cannot hide same-size changes.
+WorkspaceStateFile snapshot_file(const fs::path& path) {
+    FileReader reader(path);
+    const auto stamp = reader.stamp();
+    auto hasher = make_cpu_compute()->hasher();
+    std::vector<std::byte> block(64 * 1024);
+    std::uint64_t bytes = 0;
+    for (;;) {
+        const auto count = reader.read(block);
+        if (!count)
+            break;
+        if (count > stamp.size - bytes)
+            throw std::runtime_error("state file grew during --move verification");
+        hasher->update(std::span(block).first(count));
+        bytes += count;
+    }
+    if (bytes != stamp.size || reader.stamp() != stamp || stamp_path(path) != stamp)
+        throw std::runtime_error("state file changed during --move verification");
+    const auto utf8 = path.filename().generic_u8string();
+    return {std::string(reinterpret_cast<const char*>(utf8.data()), utf8.size()), stamp,
+            hasher->finish()};
+}
+/// 只采集普通直系文件；不认识的目录或链接使 --move 安全失败。
+/// Snapshot only ordinary direct files; unknown directories/links make --move fail safely.
+WorkspaceStateSnapshot state_snapshot(const fs::path& state) {
+    WorkspaceStateSnapshot result;
+    for (const auto& entry : fs::directory_iterator(state)) {
+        const auto name = entry.path().filename();
+        if (name == "run.lock")
+            continue;
+        if (!entry.is_regular_file() || linked(entry.path()))
+            throw std::runtime_error("cannot move workspace with non-regular state entries");
+        result.push_back(snapshot_file(entry.path()));
+    }
+    std::sort(result.begin(), result.end(),
+              [](const auto& a, const auto& b) { return a.name < b.name; });
+    return result;
+}
+/// 在已获取运行锁后比较所有状态项。 / Compare all state entries after acquiring the run lock.
+void check_snapshot(const fs::path& state, const WorkspaceStateSnapshot& expected) {
+    if (state_snapshot(state) != expected)
+        throw std::runtime_error("source workspace changed after merge; refusing --move");
+}
 /// 在同一能力下发现和清除状态；递归时祖先对象不离开作用域。
 /// Discover and clean under the same capability; DFS retains every ancestor in scope.
-std::size_t clean_directory(Node& directory, bool recursive) {
+std::size_t clean_directory(Node& directory, bool recursive,
+                            const WorkspaceStateSnapshot* expected = nullptr) {
     std::size_t count = 0;
     for (const auto& name : directory.names()) {
         if (name != ".same")
@@ -235,6 +282,8 @@ std::size_t clean_directory(Node& directory, bool recursive) {
             throw std::runtime_error(".same must be a non-link directory");
         {
             RunLock lock(state.path / "run.lock");
+            if (expected)
+                check_snapshot(state.path, *expected);
             for (const auto& child : state.names())
                 if (child != "run.lock")
                     remove_child(state, child);
@@ -250,6 +299,8 @@ std::size_t clean_directory(Node& directory, bool recursive) {
             throw std::system_error(errno, std::generic_category(), "workspace lifecycle lock");
         Node state(directory.fd, name, directory.path / name);
         RunLock lock(state.fd, "run.lock");
+        if (expected)
+            check_snapshot(state.path, *expected);
         for (const auto& child : state.names())
             remove_child(state, child);
         if (unlinkat(directory.fd, ".same", AT_REMOVEDIR) != 0)
@@ -285,19 +336,8 @@ std::size_t clean_directory(Node& directory, bool recursive) {
     }
     return count;
 }
-} // namespace
-void initialize_workspace(const fs::path& root) {
-    const auto resolved = checked_root(root);
-    WorkspaceLock lifecycle(resolved);
-    const auto state = resolved / ".same";
-    if (!state_exists(state))
-        fs::create_directory(state);
-    RunLock lock(state / "run.lock");
-    write_missing(state / "config.toml", default_config());
-    write_missing(state / "ignore", default_ignore);
-}
-std::size_t clean_workspace(const fs::path& root, bool recursive) {
-    const auto absolute = checked_root(root);
+/// 破坏性操作使用同一套根到叶目录能力。 / Share root-to-leaf directory capabilities.
+std::vector<std::unique_ptr<Node>> cleanup_ancestors(const fs::path& absolute) {
     std::vector<std::unique_ptr<Node>> ancestors;
 #ifdef _WIN32
     ancestors.push_back(std::make_unique<Node>(absolute.root_path(), false));
@@ -314,6 +354,35 @@ std::size_t clean_workspace(const fs::path& root, bool recursive) {
         ancestors.push_back(
             std::make_unique<Node>(ancestors.back()->fd, part, ancestors.back()->path / part));
 #endif
+    return ancestors;
+}
+} // namespace
+void initialize_workspace(const fs::path& root) {
+    const auto resolved = checked_root(root);
+    WorkspaceLock lifecycle(resolved);
+    const auto state = resolved / ".same";
+    if (!state_exists(state))
+        fs::create_directory(state);
+    RunLock lock(state / "run.lock");
+    write_missing(state / "config.toml", default_config());
+    write_missing(state / "ignore", default_ignore);
+}
+std::size_t clean_workspace(const fs::path& root, bool recursive) {
+    const auto absolute = checked_root(root);
+    auto ancestors = cleanup_ancestors(absolute);
     return clean_directory(*ancestors.back(), recursive);
+}
+WorkspaceStateSnapshot snapshot_workspace_state(const fs::path& root) {
+    const auto absolute = checked_root(root);
+    const auto state = absolute / ".same";
+    if (!state_exists(state))
+        throw std::runtime_error("source .same vanished before move snapshot");
+    return state_snapshot(state);
+}
+void clean_workspace_if_unchanged(const fs::path& root, const WorkspaceStateSnapshot& expected) {
+    const auto absolute = checked_root(root);
+    auto ancestors = cleanup_ancestors(absolute);
+    if (clean_directory(*ancestors.back(), false, &expected) != 1)
+        throw std::runtime_error("source .same vanished before --move");
 }
 } // namespace same

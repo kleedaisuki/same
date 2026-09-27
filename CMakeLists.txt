@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(same VERSION 0.5.1 LANGUAGES C CXX)
+project(same VERSION 0.6.0 LANGUAGES C CXX)
 
 # Native language/target metadata is shared by builds and IDE code models.
 # 原生语言及目标元数据同时服务构建与 IDE 代码模型。
@@ -15,6 +15,7 @@ include(cmake/Dependencies.cmake)
 add_library(same_core
   src/config.cpp src/files.cpp src/store.cpp src/compute_cpu.cpp
   src/resources.cpp src/application.cpp src/run_lock.cpp src/terminal.cpp src/walk.cpp src/dispatch.cpp src/online_model.cpp src/model_store.cpp src/telemetry.cpp src/workspace.cpp)
+target_sources(same_core PRIVATE src/merge.cpp)
 # Propagate the public C++ contract without changing CUDA's separate standard.
 # 传播公开 C++ 契约，不改变 CUDA 独立语言标准；头文件集提供 IDE 元数据。
 target_compile_features(same_core PUBLIC cxx_std_23)
@@ -37,6 +38,7 @@ target_sources(same_core PUBLIC FILE_SET HEADERS BASE_DIRS include FILES
   include/same/store.hpp include/same/terminal.hpp include/same/detail/windows_metadata.hpp
   include/same/detail/windows_path.hpp include/same/walk.hpp include/same/detail/completion_jobs.hpp
   include/same/detail/dispatch.hpp include/same/detail/online_model.hpp include/same/model_store.hpp include/same/telemetry.hpp include/same/workspace.hpp)
+target_sources(same_core PUBLIC FILE_SET HEADERS FILES include/same/merge.hpp)
 target_link_libraries(same_core PUBLIC sqlite3 BLAKE3::blake3 tomlplusplus::tomlplusplus Threads::Threads)
 if(WIN32)
   # Include the opt-in in every executable, including tests, for CRT/STL long paths.
@@ -102,12 +104,15 @@ add_executable(contextual_model_benchmark EXCLUDE_FROM_ALL tools/contextual_mode
 target_link_libraries(contextual_model_benchmark PRIVATE same_core)
 
 if(BUILD_TESTING)
-  foreach(test igpu_compute igpu_routing compute files config store resources adaptive_routing async_scan run_lock terminal walk completion hash_retry dispatch online_model contextual_model model_store online_resources unified_cuda telemetry workspace)
+  foreach(test igpu_compute igpu_routing compute files config store resources adaptive_routing async_scan run_lock terminal walk completion hash_retry dispatch online_model contextual_model model_store online_resources unified_cuda telemetry workspace training merge)
     add_executable(${test}_tests tests/${test}_tests.cpp)
     target_link_libraries(${test}_tests PRIVATE same_core)
     add_test(NAME ${test} COMMAND ${test}_tests)
     set_tests_properties(${test} PROPERTIES TIMEOUT 120)
   endforeach()
+  target_compile_definitions(training_tests PRIVATE SAME_TEST_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+  target_compile_definitions(merge_tests PRIVATE SAME_TEST_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+  target_compile_definitions(model_store_tests PRIVATE SAME_TEST_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
   add_test(NAME build_policy COMMAND "${CMAKE_COMMAND}"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/build_policy.cmake")
   add_executable(integration_tests tests/integration_tests.cpp)

@@ -163,16 +163,20 @@ struct Store::Impl {
     /// 是否拥有尚未完成、需要回滚保护的扫描事务。 / Whether an unfinished scan transaction needs
     /// rollback protection.
     bool scanning{};
+    /// 与扫描互斥的归档导入事务。 / Archive import transaction excludes scans.
+    bool importing{};
     /// 本轮已见标记，仅在扫描事务中写入。 / This scan's seen marker, written within its
     /// transaction.
     sqlite3_int64 generation{};
     /// 固定热路径语句，数量不随文件数增长。 / Fixed hot-path statements, independent of file count.
     std::unique_ptr<Statement> lookup;
+    std::unique_ptr<Statement> absolute_lookup;
     /// 缓存命中仅修改非索引列。 / Cache hits update only the non-indexed generation.
     std::unique_ptr<Statement> seen;
     /// 一次主键查找完成文件戳验证和已见写入。 / Validate and mark seen with one primary-key lookup.
     std::unique_ptr<Statement> unchanged;
     std::unique_ptr<Statement> upsert;
+    std::unique_ptr<Statement> absolute_upsert;
     std::unique_ptr<Statement> representative;
     std::unique_ptr<Statement> match;
     /// Store 构造失败时同样关闭已打开的连接。 / Close the connection even if Store construction
@@ -181,7 +185,9 @@ struct Store::Impl {
         match.reset();
         representative.reset();
         upsert.reset();
+        absolute_upsert.reset();
         lookup.reset();
+        absolute_lookup.reset();
         seen.reset();
         unchanged.reset();
         if (db)
@@ -204,8 +210,31 @@ Store::Store(const std::filesystem::path& path, std::size_t cache_bytes)
         if (!version.step())
             throw std::runtime_error("Missing SQLite schema version");
         const auto schema = version.integer(0);
-        if (schema != 0 && schema != 1)
+        if (schema != 0 && schema != 1 && schema != 2)
             throw std::runtime_error("Unsupported state database schema version");
+        Statement owner(db, "PRAGMA application_id");
+        if (!owner.step())
+            throw std::runtime_error("Missing state database owner");
+        const auto application = owner.integer(0);
+        if ((schema == 0 && application != 0) || (schema == 1 && application != 0) ||
+            (schema == 2 && application != 1396788563))
+            throw std::runtime_error("Foreign state database");
+        if (schema == 0) {
+            Statement existing(db, "SELECT count(*) FROM sqlite_schema "
+                                   "WHERE name NOT LIKE 'sqlite_%'");
+            if (!existing.step() || existing.integer(0) != 0)
+                throw std::runtime_error("Nonempty unowned state database");
+        }
+        if (schema == 1) {
+            Statement shape(db, "SELECT "
+                                "(SELECT count(*) FROM pragma_table_info('files') WHERE name IN "
+                                "('path','size','identity','modified','changed','digest',"
+                                "'generation')) + "
+                                "(SELECT count(*) FROM pragma_table_info('scan_state') "
+                                "WHERE name IN ('id','generation'))");
+            if (!shape.step() || shape.integer(0) != 9)
+                throw std::runtime_error("Unrecognized legacy state database");
+        }
     }
     exec(db, "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA temp_store=FILE; PRAGMA "
              "mmap_size=0;");
@@ -223,7 +252,12 @@ Store::Store(const std::filesystem::path& path, std::size_t cache_bytes)
                  "CREATE INDEX IF NOT EXISTS files_content ON files(size,digest,path);"
                  "CREATE TABLE IF NOT EXISTS scan_state(id INTEGER PRIMARY KEY "
                  "CHECK(id=1),generation INTEGER NOT NULL);"
-                 "INSERT OR IGNORE INTO scan_state VALUES(1,0); PRAGMA user_version=1; COMMIT;");
+                 "INSERT OR IGNORE INTO scan_state VALUES(1,0);"
+                 "CREATE TABLE IF NOT EXISTS absolute_cache("
+                 "path BLOB PRIMARY KEY NOT NULL,size BLOB NOT NULL CHECK(length(size)=8),"
+                 "identity BLOB NOT NULL,modified BLOB NOT NULL,changed BLOB NOT NULL,"
+                 "digest BLOB NOT NULL CHECK(length(digest)=32)) WITHOUT ROWID;"
+                 "PRAGMA user_version=2; PRAGMA application_id=1396788563; COMMIT;");
     } catch (...) {
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
         throw;
@@ -239,6 +273,9 @@ Store::Store(const std::filesystem::path& path, std::size_t cache_bytes)
     impl_->lookup = std::make_unique<Statement>(
         db, "SELECT path,size,identity,modified,changed,digest FROM files WHERE path=?1",
         SQLITE_PREPARE_PERSISTENT);
+    impl_->absolute_lookup = std::make_unique<Statement>(
+        db, "SELECT path,size,identity,modified,changed,digest FROM absolute_cache WHERE path=?1",
+        SQLITE_PREPARE_PERSISTENT);
     impl_->seen = std::make_unique<Statement>(db, "UPDATE files SET generation=?2 WHERE path=?1",
                                               SQLITE_PREPARE_PERSISTENT);
     impl_->unchanged = std::make_unique<Statement>(
@@ -253,6 +290,13 @@ Store::Store(const std::filesystem::path& path, std::size_t cache_bytes)
         "size=excluded.size,identity=excluded.identity,modified=excluded.modified,"
         "changed=excluded.changed,digest=excluded.digest,generation=excluded.generation",
         SQLITE_PREPARE_PERSISTENT);
+    impl_->absolute_upsert = std::make_unique<Statement>(
+        db,
+        "INSERT INTO absolute_cache(path,size,identity,modified,changed,digest)"
+        " VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(path) DO UPDATE SET "
+        "size=excluded.size,identity=excluded.identity,modified=excluded.modified,"
+        "changed=excluded.changed,digest=excluded.digest",
+        SQLITE_PREPARE_PERSISTENT);
     impl_->representative = std::make_unique<Statement>(
         db, "INSERT INTO representatives VALUES(?1,?2,?3,?4,?5,?6)", SQLITE_PREPARE_PERSISTENT);
     impl_->match = std::make_unique<Statement>(db, "INSERT OR IGNORE INTO matches VALUES(?1,?2)",
@@ -260,10 +304,11 @@ Store::Store(const std::filesystem::path& path, std::size_t cache_bytes)
 }
 Store::~Store() {
     rollback_scan();
+    rollback_import();
 }
 void Store::begin_scan() {
-    if (impl_->scanning)
-        throw std::logic_error("Scan already active");
+    if (impl_->scanning || impl_->importing)
+        throw std::logic_error("State transaction already active");
     exec(impl_->db, "BEGIN IMMEDIATE");
     impl_->scanning = true;
     try {
@@ -346,6 +391,55 @@ void Store::rollback_scan() noexcept {
         return;
     sqlite3_exec(impl_->db, "ROLLBACK", nullptr, nullptr, nullptr);
     impl_->scanning = false;
+}
+std::optional<FileRecord> Store::cached_absolute(std::string_view path) {
+    auto& query = *impl_->absolute_lookup;
+    StatementUse use(query);
+    query.string(1, path);
+    std::optional<FileRecord> result;
+    if (query.step())
+        result = query.record();
+    use.finish();
+    return result;
+}
+void Store::save_absolute(const FileRecord& record) {
+    if (!impl_->scanning && !impl_->importing)
+        throw std::logic_error("No active state transaction");
+    auto& insert = *impl_->absolute_upsert;
+    StatementUse use(insert);
+    insert.bind_record(record);
+    insert.step();
+    use.finish();
+}
+void Store::begin_import() {
+    if (impl_->scanning || impl_->importing)
+        throw std::logic_error("State transaction already active");
+    exec(impl_->db, "BEGIN IMMEDIATE");
+    impl_->importing = true;
+}
+void Store::end_import() {
+    if (!impl_->importing)
+        throw std::logic_error("No active state import");
+    exec(impl_->db, "COMMIT");
+    impl_->importing = false;
+}
+void Store::rollback_import() noexcept {
+    if (!impl_->importing)
+        return;
+    sqlite3_exec(impl_->db, "ROLLBACK", nullptr, nullptr, nullptr);
+    impl_->importing = false;
+}
+void Store::visit_files(const std::function<void(const FileRecord&)>& visitor) {
+    Statement query(impl_->db,
+                    "SELECT path,size,identity,modified,changed,digest FROM files ORDER BY path");
+    while (query.step())
+        visitor(query.record());
+}
+void Store::visit_absolute(const std::function<void(const FileRecord&)>& visitor) {
+    Statement query(impl_->db, "SELECT path,size,identity,modified,changed,digest "
+                               "FROM absolute_cache ORDER BY path");
+    while (query.step())
+        visitor(query.record());
 }
 void Store::visit_candidates(const std::function<void(const FileRecord&)>& visitor) {
     if (impl_->scanning)

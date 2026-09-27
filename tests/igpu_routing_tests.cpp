@@ -61,6 +61,37 @@ same::Config config() {
     c.queue_capacity = 8;
     return c;
 }
+/// 训练请求绕过大小偏好和冷启动信用，但只由指定后端生成标签。
+/// Explicit training bypasses size preference and cold credit without relabeling fallbacks.
+void training_override() {
+    auto c = config();
+    c.backend = "auto";
+    c.workers = 1;
+    c.gpu_min_bytes = 1024 * 1024;
+    c.cuda_bootstrap_ms = 1000000;
+    c.igpu_bootstrap_ms = 1000000;
+    same::Resources pool(
+        c, [](auto, auto) { return std::make_unique<Device>(same::BackendKind::cuda); },
+        [](auto, auto) { return std::make_unique<Device>(same::BackendKind::igpu); });
+    for (const auto kind :
+         {same::BackendKind::cpu, same::BackendKind::cuda, same::BackendKind::igpu}) {
+        const auto actual =
+            pool.submit_training_hash(
+                    [kind](same::Worker& worker) {
+                        require(worker.compute->kind() == kind,
+                                "training selected the wrong backend");
+                        worker.sample = {2048, 1, kind == same::BackendKind::cuda, true, kind};
+                        return worker.compute->kind();
+                    },
+                    2048, kind)
+                .get();
+        require(actual == kind, "training backend request was ignored");
+    }
+    pool.wait_idle();
+    const auto snapshot = pool.profile_snapshot();
+    require(snapshot.cpu_samples == 1 && snapshot.gpu_samples == 1 && snapshot.igpu_samples == 1,
+            "training labels leaked across backends");
+}
 /// 忙设备不等待，工厂仅调用一次。 / Busy device never waits; initialize exactly once.
 void admission() {
     auto c = config();
@@ -399,6 +430,7 @@ int main() {
         short_scan_discovery(true);
         short_scan_discovery(false);
         exploration();
+        training_override();
         backend_policy();
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

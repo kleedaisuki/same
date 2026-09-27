@@ -60,6 +60,21 @@ public:
     /// 尽力回滚活动扫描；无扫描时无操作，清理期间不抛异常。
     /// Best-effort rollback of an active scan; no-op when inactive and never throws during cleanup.
     void rollback_scan() noexcept;
+    /// 外部绝对路径缓存独立于本轮 files 视图；只用完整戳命中，绝不参与跨目录结果。
+    /// Absolute archive is independent of the active files view; only exact stamps may reuse it.
+    std::optional<FileRecord> cached_absolute(std::string_view path);
+    /// 扫描事务或导入事务内保存绝对路径摘要。 / Save an absolute cache entry in scan/import.
+    void save_absolute(const FileRecord& record);
+    /// 打开独立导入事务，不推进扫描代次或清理当前结果。 / Begin import without scan pruning.
+    void begin_import();
+    /// 原子提交本数据库导入。 / Commit this database's import atomically.
+    void end_import();
+    /// 回滚未提交导入。 / Roll back an unfinished import.
+    void rollback_import() noexcept;
+    /// 流式遍历当前工作区记录。 / Stream current workspace records.
+    void visit_files(const std::function<void(const FileRecord&)>& visitor);
+    /// 流式遍历全局绝对路径记录。 / Stream absolute archive records.
+    void visit_absolute(const std::function<void(const FileRecord&)>& visitor);
     /// 扫描提交后访问至少两个文件的大小/摘要桶，按大小、摘要、路径排序。
     /// After scan commit, visit size/digest buckets of at least two files, ordered by
     /// size/digest/path.

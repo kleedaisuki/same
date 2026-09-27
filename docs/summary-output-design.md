@@ -83,3 +83,14 @@ Tests should establish all three layers independently:
 Visual checks should cover a normal run, hidden unique files, disabled PGO/telemetry, a warm cache,
 and a writer error. Timing values are nondeterministic and must be validated by names, units, and
 accounting invariants rather than golden snapshots.
+
+## CLI help hierarchy
+
+The help page uses the existing stdout `TerminalColor` policy rather than a separate color
+implementation. Magenta marks the product identity, cyan marks section headings, and green marks
+command/option labels; indentation and literal headings preserve the full hierarchy when ANSI is
+disabled. Usage, commands, scan-only options, train-only options, shared options, and notes are
+separate groups. Auto color remains TTY/`NO_COLOR` aware, while an explicit `--color=always` may
+color redirected help for inspection. The CLI accepts this override before or after `--help`.
+Help does not load configuration or create workspace state. A redirected integration test checks
+both forced-color orderings and the `--color=never` plain-text path.
